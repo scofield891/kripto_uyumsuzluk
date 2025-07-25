@@ -2,4 +2,7 @@ ccxt==4.3.63
 python-telegram-bot==21.4
 numpy==2.0.1
 python-dotenv==1.0.1
+<<<<<<< HEAD
 scipy==1.13.1
+=======
+>>>>>>> d4f55e762b851b30f2c9ad5083d19e910b9184e6
