@@ -114,11 +114,12 @@ async def check_divergence(symbol, timeframe):
         last_signal = signal_cache.get(key, (False, False))
 
         if (bullish, bearish) != last_signal:
+            rsi_str = f"{rsi_ema[-1]:.2f}".replace('.', '\\.')
             if bullish:
-                message = rf"\*{symbol} {timeframe}\*: \nPozitif Uyumsuzluk: {bullish} 🚀 \(Price LL, EMA HL\)\nRSI_EMA: {rsi_ema[-1]:.2f} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
+                message = rf"\*{symbol} {timeframe}\*: \nPozitif Uyumsuzluk: {bullish} 🚀 \(Price LL, EMA HL\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
             if bearish:
-                message = rf"\*{symbol} {timeframe}\*: \nNegatif Uyumsuzluk: {bearish} 📉 \(Price HH, EMA LH\)\nRSI_EMA: {rsi_ema[-1]:.2f} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
+                message = rf"\*{symbol} {timeframe}\*: \nNegatif Uyumsuzluk: {bearish} 📉 \(Price HH, EMA LH\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
             signal_cache[key] = (bullish, bearish)
 
