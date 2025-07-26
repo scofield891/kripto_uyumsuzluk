@@ -73,8 +73,8 @@ async def check_divergence(symbol, timeframe):
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        min_lookback = 8
-        max_lookback = 35
+        min_lookback = 10
+        max_lookback = 40
         lookback = min(max_lookback, len(closes))
         if lookback < min_lookback:
             return
@@ -88,7 +88,7 @@ async def check_divergence(symbol, timeframe):
         bullish = False  # Pozitif: Fiyat LL yaparken EMA HL yaparsa
         bearish = False  # Negatif: Fiyat HH yaparken EMA LH yaparsa
 
-        # Bullish (pozitif) uyumsuzluk - en az 2 dip, >=3 ise trend kontrol (zorunlu değil)
+        # Bullish - en az 2 dip, >=3 ise trend kontrol (daha fazla sinyal)
         if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
             prev_low = price_lows[-2]
@@ -98,13 +98,13 @@ async def check_divergence(symbol, timeframe):
             if len(price_lows) >= 3 and len(ema_lows) >= 3:
                 prev_prev_low = price_lows[-3]
                 if price_slice[prev_low] < price_slice[prev_prev_low]:
-                    bullish = core_bullish  # Trend kontrol varsa uygula
+                    bullish = core_bullish
                 else:
-                    bullish = core_bullish  # Zorunlu değil, core varsa sinyal
+                    bullish = core_bullish  # Zorunlu değil
             else:
                 bullish = core_bullish
 
-        # Bearish (negatif) uyumsuzluk - en az 2 tepe, >=3 ise trend kontrol (zorunlu değil)
+        # Bearish - en az 2 tepe, >=3 ise trend kontrol (daha fazla sinyal)
         if len(price_highs) >= 2 and len(ema_highs) >= 2:
             last_high = price_highs[-1]
             prev_high = price_highs[-2]
@@ -114,9 +114,9 @@ async def check_divergence(symbol, timeframe):
             if len(price_highs) >= 3 and len(ema_highs) >= 3:
                 prev_prev_high = price_highs[-3]
                 if price_slice[prev_high] > price_slice[prev_prev_high]:
-                    bearish = core_bearish  # Trend kontrol varsa uygula
+                    bearish = core_bearish
                 else:
-                    bearish = core_bearish  # Zorunlu değil, core varsa sinyal
+                    bearish = core_bearish  # Zorunlu değil
             else:
                 bearish = core_bearish
 
@@ -126,13 +126,13 @@ async def check_divergence(symbol, timeframe):
         last_signal = signal_cache.get(key, (False, False))
 
         if (bullish, bearish) != last_signal and (rsi_ema[-1] < 35 or rsi_ema[-1] > 65):
-            rsi_str = f"{rsi_ema[-1]:.2f}"
+            rsi_str = f"{rsi_ema[-1]:.2f}".replace('.', '\\.')
             if bullish:
-                message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+                message = rf"\*{symbol} {timeframe}\*: \nPozitif Uyumsuzluk: {bullish} 🚀 \(Price LL, EMA HL\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)"
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
             if bearish:
-                message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+                message = rf"\*{symbol} {timeframe}\*: \nNegatif Uyumsuzluk: {bearish} 📉 \(Price HH, EMA LH\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)"
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
             signal_cache[key] = (bullish, bearish)
 
     except Exception as e:
