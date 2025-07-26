@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=4):  # Order=4, daha katı
+def find_local_extrema(arr, order=3):
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -65,7 +65,7 @@ def find_local_extrema(arr, order=4):  # Order=4, daha katı
 
 async def check_divergence(symbol, timeframe):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)  # Buffer 100, kıyaslama 10-40
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
         closes = np.array([x[4] for x in ohlcv])
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
@@ -73,8 +73,8 @@ async def check_divergence(symbol, timeframe):
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        min_lookback = 10  # 10 mum min
-        max_lookback = 40  # 40 mum max
+        min_lookback = 8
+        max_lookback = 35
         lookback = min(max_lookback, len(closes))
         if lookback < min_lookback:
             return
@@ -82,41 +82,47 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
-        price_highs, price_lows = find_local_extrema(price_slice, order=4)
-        ema_highs, ema_lows = find_local_extrema(ema_slice, order=4)
+        price_highs, price_lows = find_local_extrema(price_slice, order=3)
+        ema_highs, ema_lows = find_local_extrema(ema_slice, order=3)
 
         bullish = False  # Pozitif: Fiyat LL yaparken EMA HL yaparsa
         bearish = False  # Negatif: Fiyat HH yaparken EMA LH yaparsa
 
-        if len(price_lows) >= 3 and len(ema_lows) >= 3:
+        # Bullish (pozitif) uyumsuzluk - en az 2 dip, 3 varsa trend kontrol
+        if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
             prev_low = price_lows[-2]
-            prev_prev_low = price_lows[-3]
             last_ema_low = ema_lows[-1]
             prev_ema_low = ema_lows[-2]
-            if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_ema_low] > ema_slice[prev_ema_low] and price_slice[prev_low] < price_slice[prev_prev_low]:
-                bullish = True
+            bullish = price_slice[last_low] < price_slice[prev_low] and ema_slice[last_ema_low] > ema_slice[prev_ema_low]
+            if len(price_lows) >= 3 and len(ema_lows) >= 3:
+                prev_prev_low = price_lows[-3]
+                if price_slice[prev_low] >= price_slice[prev_prev_low]:
+                    bullish = False  # Trend doğrulama: önceki dip daha düşük olmalı
 
-        if len(price_highs) >= 3 and len(ema_highs) >= 3:
+        # Bearish (negatif) uyumsuzluk - en az 2 tepe, 3 varsa trend kontrol
+        if len(price_highs) >= 2 and len(ema_highs) >= 2:
             last_high = price_highs[-1]
             prev_high = price_highs[-2]
-            prev_prev_high = price_highs[-3]
             last_ema_high = ema_highs[-1]
             prev_ema_high = ema_highs[-2]
-            if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_ema_high] < ema_slice[prev_ema_high] and price_slice[prev_high] > price_slice[prev_prev_high]:
-                bearish = True
+            bearish = price_slice[last_high] > price_slice[prev_high] and ema_slice[last_ema_high] < ema_slice[prev_ema_high]
+            if len(price_highs) >= 3 and len(ema_highs) >= 3:
+                prev_prev_high = price_highs[-3]
+                if price_slice[prev_high] <= price_slice[prev_prev_high]:
+                    bearish = False  # Trend doğrulama: önceki tepe daha yüksek olmalı
 
         print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
 
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        if (bullish, bearish) != last_signal:
+        if (bullish, bearish) != last_signal and (rsi_ema[-1] < 35 or rsi_ema[-1] > 65):
             rsi_str = f"{rsi_ema[-1]:.2f}"
-            if bullish and rsi_ema[-1] > 65:
+            if bullish:
                 message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-            if bearish and rsi_ema[-1] < 35:
+            if bearish:
                 message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
             signal_cache[key] = (bullish, bearish)
