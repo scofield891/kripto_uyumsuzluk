@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=2):
+def find_local_extrema(arr, order=1):  # Order 1, daha fazla sinyal için
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -65,17 +65,15 @@ def find_local_extrema(arr, order=2):
 
 async def check_divergence(symbol, timeframe):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=50)  # Son 50 mum (35+ buffer)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=50)
         closes = np.array([x[4] for x in ohlcv])
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
-        rsi_ema2 = np.roll(rsi_ema, 2)  # EMA[2]
+        rsi_ema2 = np.roll(rsi_ema, 2)
 
-        # EMA crossover and gray zone
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
         in_gray_zone = 48 <= rsi_ema[-1] <= 52
 
-        # Divergence for EMA (son 8-35 mum aralığı, manuel extrema ile)
         min_lookback = 8
         max_lookback = 35
         lookback = min(max_lookback, len(closes))
@@ -85,12 +83,11 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
-        # Local highs/lows (manuel fonksiyon)
-        price_highs, price_lows = find_local_extrema(price_slice, order=2)
-        ema_highs, ema_lows = find_local_extrema(ema_slice, order=2)
+        price_highs, price_lows = find_local_extrema(price_slice, order=1)
+        ema_highs, ema_lows = find_local_extrema(ema_slice, order=1)
 
-        bullish = False  # Pozitif: Price LL, EMA HL
-        bearish = False  # Negatif: Price HH, EMA LH
+        bullish = False
+        bearish = False
 
         if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
@@ -114,13 +111,13 @@ async def check_divergence(symbol, timeframe):
         last_signal = signal_cache.get(key, (False, False))
 
         if (bullish, bearish) != last_signal:
-            rsi_str = f"{rsi_ema[-1]:.2f}".replace('.', '\\.')
+            rsi_str = f"{rsi_ema[-1]:.2f}"
             if bullish:
-                message = rf"\*{symbol} {timeframe}\*: \nPozitif Uyumsuzluk: {bullish} 🚀 \(Price LL, EMA HL\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
+                message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
             if bearish:
-                message = rf"\*{symbol} {timeframe}\*: \nNegatif Uyumsuzluk: {bearish} 📉 \(Price HH, EMA LH\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)\nGray Zone: {in_gray_zone}"
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='MarkdownV2')
+                message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
             signal_cache[key] = (bullish, bearish)
 
     except Exception as e:
@@ -130,7 +127,8 @@ async def main():
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + time.strftime('%H:%M:%S'))
     timeframes = ['30m', '1h', '2h', '4h']
     symbols = [
-        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT', 'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT', 'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT', 'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT', 'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT'
+        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT', 'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT', 'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT', 'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT', 'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
+        'MATICUSDT', 'FILUSDT', 'EOSUSDT', 'STXUSDT', 'MNTUSDT', 'FTMUSDT', 'ATOMUSDT', 'VETUSDT', 'GRTUSDT', 'MKRUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT'
     ]
 
     while True:
