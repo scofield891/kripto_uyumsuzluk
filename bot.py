@@ -88,29 +88,37 @@ async def check_divergence(symbol, timeframe):
         bullish = False  # Pozitif: Fiyat LL yaparken EMA HL yaparsa
         bearish = False  # Negatif: Fiyat HH yaparken EMA LH yaparsa
 
-        # Bullish (pozitif) uyumsuzluk - en az 2 dip, 3 varsa trend kontrol
+        # Bullish (pozitif) uyumsuzluk - en az 2 dip, >=3 ise trend kontrol (zorunlu değil)
         if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
             prev_low = price_lows[-2]
             last_ema_low = ema_lows[-1]
             prev_ema_low = ema_lows[-2]
-            bullish = price_slice[last_low] < price_slice[prev_low] and ema_slice[last_ema_low] > ema_slice[prev_ema_low]
+            core_bullish = price_slice[last_low] < price_slice[prev_low] and ema_slice[last_ema_low] > ema_slice[prev_ema_low]
             if len(price_lows) >= 3 and len(ema_lows) >= 3:
                 prev_prev_low = price_lows[-3]
-                if price_slice[prev_low] >= price_slice[prev_prev_low]:
-                    bullish = False  # Trend doğrulama: önceki dip daha düşük olmalı
+                if price_slice[prev_low] < price_slice[prev_prev_low]:
+                    bullish = core_bullish  # Trend kontrol varsa uygula
+                else:
+                    bullish = core_bullish  # Zorunlu değil, core varsa sinyal
+            else:
+                bullish = core_bullish
 
-        # Bearish (negatif) uyumsuzluk - en az 2 tepe, 3 varsa trend kontrol
+        # Bearish (negatif) uyumsuzluk - en az 2 tepe, >=3 ise trend kontrol (zorunlu değil)
         if len(price_highs) >= 2 and len(ema_highs) >= 2:
             last_high = price_highs[-1]
             prev_high = price_highs[-2]
             last_ema_high = ema_highs[-1]
             prev_ema_high = ema_highs[-2]
-            bearish = price_slice[last_high] > price_slice[prev_high] and ema_slice[last_ema_high] < ema_slice[prev_ema_high]
+            core_bearish = price_slice[last_high] > price_slice[prev_high] and ema_slice[last_ema_high] < ema_slice[prev_ema_high]
             if len(price_highs) >= 3 and len(ema_highs) >= 3:
                 prev_prev_high = price_highs[-3]
-                if price_slice[prev_high] <= price_slice[prev_prev_high]:
-                    bearish = False  # Trend doğrulama: önceki tepe daha yüksek olmalı
+                if price_slice[prev_high] > price_slice[prev_prev_high]:
+                    bearish = core_bearish  # Trend kontrol varsa uygula
+                else:
+                    bearish = core_bearish  # Zorunlu değil, core varsa sinyal
+            else:
+                bearish = core_bearish
 
         print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
 
