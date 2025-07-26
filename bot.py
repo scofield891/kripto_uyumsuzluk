@@ -19,7 +19,7 @@ signal_cache = {}  # Duplicate önleme
 
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
-        return np.zeros(len(closes))
+        return np.zeros(len(closes))  # Yetersiz veri
     deltas = np.diff(closes)
     seed = deltas[:period]
     up = seed[seed >= 0].sum() / period
@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=2):
+def find_local_extrema(arr, order=3):
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -65,17 +65,14 @@ def find_local_extrema(arr, order=2):
 
 async def check_divergence(symbol, timeframe):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=50)  # Son 50 mum (35+ buffer)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)  # 100 mum buffer, kıyaslama 8-35 mumda
         closes = np.array([x[4] for x in ohlcv])
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
-        rsi_ema2 = np.roll(rsi_ema, 2)  # EMA[2]
+        rsi_ema2 = np.roll(rsi_ema, 2)
 
-        # EMA crossover and gray zone
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
-        in_gray_zone = 48 <= rsi_ema[-1] <= 52
 
-        # Divergence for EMA (son 8-35 mum aralığı, manuel extrema ile)
         min_lookback = 8
         max_lookback = 35
         lookback = min(max_lookback, len(closes))
@@ -85,12 +82,11 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
-        # Local highs/lows (manuel fonksiyon)
-        price_highs, price_lows = find_local_extrema(price_slice, order=2)
-        ema_highs, ema_lows = find_local_extrema(ema_slice, order=2)
+        price_highs, price_lows = find_local_extrema(price_slice, order=3)
+        ema_highs, ema_lows = find_local_extrema(ema_slice, order=3)
 
-        bullish = False  # Pozitif: Price LL, EMA HL
-        bearish = False  # Negatif: Price HH, EMA LH
+        bullish = False  # Pozitif: Fiyat LL yaparken EMA HL yaparsa (ikili dip kıyaslama)
+        bearish = False  # Negatif: Fiyat HH yaparken EMA LH yaparsa (ikili tepe kıyaslama)
 
         if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
@@ -108,18 +104,18 @@ async def check_divergence(symbol, timeframe):
             if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_ema_high] < ema_slice[prev_ema_high]:
                 bearish = True
 
-        print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}, Gray Zone: {in_gray_zone}")
+        print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
 
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        if (bullish, bearish) != last_signal:
+        if (bullish, bearish) != last_signal and (rsi_ema[-1] < 40 or rsi_ema[-1] > 60):  # 40-60 arası gönderme
             rsi_str = f"{rsi_ema[-1]:.2f}"
             if bullish:
-                message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
+                message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
             if bearish:
-                message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
+                message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
             signal_cache[key] = (bullish, bearish)
 
