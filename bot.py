@@ -73,8 +73,8 @@ async def check_divergence(symbol, timeframe):
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        min_lookback = 10
-        max_lookback = 40
+        min_lookback = 8
+        max_lookback = 35
         lookback = min(max_lookback, len(closes))
         if lookback < min_lookback:
             return
