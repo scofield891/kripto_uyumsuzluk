@@ -65,15 +65,17 @@ def find_local_extrema(arr, order=2):
 
 async def check_divergence(symbol, timeframe):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=50)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=50)  # Son 50 mum (35+ buffer)
         closes = np.array([x[4] for x in ohlcv])
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
-        rsi_ema2 = np.roll(rsi_ema, 2)
+        rsi_ema2 = np.roll(rsi_ema, 2)  # EMA[2]
 
+        # EMA crossover and gray zone
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
         in_gray_zone = 48 <= rsi_ema[-1] <= 52
 
+        # Divergence for EMA (son 8-35 mum aralığı, manuel extrema ile)
         min_lookback = 8
         max_lookback = 35
         lookback = min(max_lookback, len(closes))
@@ -83,11 +85,12 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
+        # Local highs/lows (manuel fonksiyon)
         price_highs, price_lows = find_local_extrema(price_slice, order=2)
         ema_highs, ema_lows = find_local_extrema(ema_slice, order=2)
 
-        bullish = False
-        bearish = False
+        bullish = False  # Pozitif: Price LL, EMA HL
+        bearish = False  # Negatif: Price HH, EMA LH
 
         if len(price_lows) >= 2 and len(ema_lows) >= 2:
             last_low = price_lows[-1]
@@ -110,19 +113,15 @@ async def check_divergence(symbol, timeframe):
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        if (bullish, bearish) != last_signal and not in_gray_zone:
+        if (bullish, bearish) != last_signal:
             rsi_str = f"{rsi_ema[-1]:.2f}"
-            is_sent = False
-            if bullish and rsi_ema[-1] > 60:
+            if bullish:
                 message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-                is_sent = True
-            if bearish and rsi_ema[-1] < 40:
+            if bearish:
                 message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-                is_sent = True
-            if is_sent:
-                signal_cache[key] = (bullish, bearish)
+            signal_cache[key] = (bullish, bearish)
 
     except Exception as e:
         print(f"Hata ({symbol} {timeframe}): {str(e)}")
