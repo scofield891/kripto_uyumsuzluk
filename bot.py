@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=1):  # Order 1, daha fazla sinyal için
+def find_local_extrema(arr, order=2):
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -83,8 +83,8 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
-        price_highs, price_lows = find_local_extrema(price_slice, order=1)
-        ema_highs, ema_lows = find_local_extrema(ema_slice, order=1)
+        price_highs, price_lows = find_local_extrema(price_slice, order=2)
+        ema_highs, ema_lows = find_local_extrema(ema_slice, order=2)
 
         bullish = False
         bearish = False
@@ -107,18 +107,22 @@ async def check_divergence(symbol, timeframe):
 
         print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}, Gray Zone: {in_gray_zone}")
 
-        key = f"{symbol}_{timeframe}"
+        key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        if (bullish, bearish) != last_signal:
+        if (bullish, bearish) != last_signal and not in_gray_zone:
             rsi_str = f"{rsi_ema[-1]:.2f}"
-            if bullish:
+            is_sent = False
+            if bullish and rsi_ema[-1] > 60:
                 message = f"<b>{symbol} {timeframe}</b>: \nPozitif Uyumsuzluk: {bullish} &#128640; (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-            if bearish:
+                is_sent = True
+            if bearish and rsi_ema[-1] < 40:
                 message = f"<b>{symbol} {timeframe}</b>: \nNegatif Uyumsuzluk: {bearish} &#128309; (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nGray Zone: {in_gray_zone}"
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
-            signal_cache[key] = (bullish, bearish)
+                is_sent = True
+            if is_sent:
+                signal_cache[key] = (bullish, bearish)
 
     except Exception as e:
         print(f"Hata ({symbol} {timeframe}): {str(e)}")
@@ -135,7 +139,7 @@ async def main():
         for timeframe in timeframes:
             for symbol in symbols:
                 await check_divergence(symbol, timeframe)
-                await asyncio.sleep(1)  # Rate limit
+                await asyncio.sleep(1)
         print("Tüm taramalar tamamlandı, 5 dakika bekleniyor...")
         await asyncio.sleep(300)
 
