@@ -73,8 +73,8 @@ async def check_divergence(symbol, timeframe):
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        min_lookback = 8
-        max_lookback = 35
+        min_lookback = 10
+        max_lookback = 40
         lookback = min(max_lookback, len(closes))
         if lookback < min_lookback:
             return
@@ -125,7 +125,7 @@ async def check_divergence(symbol, timeframe):
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        if (bullish, bearish) != last_signal and (rsi_ema[-1] < 35 or rsi_ema[-1] > 65):
+        if (bullish, bearish) != last_signal and (rsi_ema[-1] < 40 or rsi_ema[-1] > 60):
             rsi_str = f"{rsi_ema[-1]:.2f}".replace('.', '\\.')
             if bullish:
                 message = rf"\*{symbol} {timeframe}\*: \nPozitif Uyumsuzluk: {bullish} 🚀 \(Price LL, EMA HL\)\nRSI_EMA: {rsi_str} \({ema_color.upper()}\)"
