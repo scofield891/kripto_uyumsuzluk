@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=4):  # Order=4'e çıkardım
+def find_local_extrema(arr, order=4):
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -73,7 +73,7 @@ async def check_divergence(symbol, timeframe):
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        lookback = 30  # Sabit 30 bar
+        lookback = 40  # 40'a çıkardım
         if len(closes) < lookback:
             return
 
@@ -85,42 +85,31 @@ async def check_divergence(symbol, timeframe):
         bullish = False
         bearish = False
 
-        min_distance = 5  # Extrema arası min bar
+        min_distance = 5
 
-        # Bullish: Price LL, EMA HL (price low idx'lerde, 30 bar içinde)
+        # Bullish: Only son 2 low karşılaştır
         if len(price_lows) >= 2:
-            for i_idx in range(len(price_lows) - 1, 0, -1):
-                i = price_lows[i_idx]
-                for j_idx in range(i_idx - 1, -1, -1):
-                    j = price_lows[j_idx]
-                    if (i - j) >= min_distance and (i - j) <= lookback:
-                        if price_slice[i] < price_slice[j] and ema_slice[i] > ema_slice[j]:
-                            bullish = True
-                            break
-                if bullish:
-                    break
+            last_low = price_lows[-1]
+            prev_low = price_lows[-2]
+            if (last_low - prev_low) >= min_distance:
+                if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_low] > ema_slice[prev_low]:
+                    bullish = True
 
-        # Bearish: Price HH, EMA LH (price high idx'lerde, 30 bar içinde)
+        # Bearish: Only son 2 high karşılaştır
         if len(price_highs) >= 2:
-            for i_idx in range(len(price_highs) - 1, 0, -1):
-                i = price_highs[i_idx]
-                for j_idx in range(i_idx - 1, -1, -1):
-                    j = price_highs[j_idx]
-                    if (i - j) >= min_distance and (i - j) <= lookback:
-                        if price_slice[i] > price_slice[j] and ema_slice[i] < ema_slice[j]:
-                            bearish = True
-                            break
-                if bearish:
-                    break
+            last_high = price_highs[-1]
+            prev_high = price_highs[-2]
+            if (last_high - prev_high) >= min_distance:
+                if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < ema_slice[prev_high]:
+                    bearish = True
 
         print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
 
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        # Şartlar: Bullish <35, Bearish >65 (sıkılaştırdım)
         if (bullish or bearish) and (bullish, bearish) != last_signal:
-            if (bullish and rsi_ema[-1] < 35) or (bearish and rsi_ema[-1] > 65):
+            if (bullish and rsi_ema[-1] < 35 and ema_color == 'red') or (bearish and rsi_ema[-1] > 65 and ema_color == 'lime'):
                 rsi_str = f"{rsi_ema[-1]:.2f}"
                 if bullish:
                     message = f"{symbol} {timeframe}\nPozitif Uyumsuzluk: {bullish} 🚀 (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
