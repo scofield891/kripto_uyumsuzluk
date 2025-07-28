@@ -53,7 +53,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
 
-def find_local_extrema(arr, order=3):
+def find_local_extrema(arr, order=4):  # Order=4'e çıkardım
     highs = []
     lows = []
     for i in range(order, len(arr) - order):
@@ -80,10 +80,12 @@ async def check_divergence(symbol, timeframe):
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
 
-        price_highs, price_lows = find_local_extrema(price_slice, order=3)
+        price_highs, price_lows = find_local_extrema(price_slice)
 
         bullish = False
         bearish = False
+
+        min_distance = 5  # Extrema arası min bar
 
         # Bullish: Price LL, EMA HL (price low idx'lerde, 30 bar içinde)
         if len(price_lows) >= 2:
@@ -91,7 +93,7 @@ async def check_divergence(symbol, timeframe):
                 i = price_lows[i_idx]
                 for j_idx in range(i_idx - 1, -1, -1):
                     j = price_lows[j_idx]
-                    if (i - j) <= lookback:
+                    if (i - j) >= min_distance and (i - j) <= lookback:
                         if price_slice[i] < price_slice[j] and ema_slice[i] > ema_slice[j]:
                             bullish = True
                             break
@@ -104,7 +106,7 @@ async def check_divergence(symbol, timeframe):
                 i = price_highs[i_idx]
                 for j_idx in range(i_idx - 1, -1, -1):
                     j = price_highs[j_idx]
-                    if (i - j) <= lookback:
+                    if (i - j) >= min_distance and (i - j) <= lookback:
                         if price_slice[i] > price_slice[j] and ema_slice[i] < ema_slice[j]:
                             bearish = True
                             break
@@ -116,9 +118,9 @@ async def check_divergence(symbol, timeframe):
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
-        # Şartlar: Bullish <40, Bearish >60
+        # Şartlar: Bullish <35, Bearish >65 (sıkılaştırdım)
         if (bullish or bearish) and (bullish, bearish) != last_signal:
-            if (bullish and rsi_ema[-1] < 40) or (bearish and rsi_ema[-1] > 60):
+            if (bullish and rsi_ema[-1] < 35) or (bearish and rsi_ema[-1] > 65):
                 rsi_str = f"{rsi_ema[-1]:.2f}"
                 if bullish:
                     message = f"{symbol} {timeframe}\nPozitif Uyumsuzluk: {bullish} 🚀 (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
