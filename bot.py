@@ -157,18 +157,10 @@ async def main():
         'ENSUSDT', 'JUPUSDT', 'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT', 'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT', 'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
 
-    # Symbol filtreleme düzeltildi
-    if not TEST_MODE:
-        exchange.load_markets()
-        valid_symbols = [s for s in symbols if s in exchange.markets and exchange.markets[s]['active']]
-        logging.info(f"Valid symbols: {len(valid_symbols)} / {len(symbols)} - List: {valid_symbols}")
-    else:
-        valid_symbols = symbols
-
     while True:
         tasks = []
         for timeframe in timeframes:
-            for symbol in valid_symbols:
+            for symbol in symbols:
                 tasks.append(check_divergence(symbol, timeframe))
         batch_size = 20
         for i in range(0, len(tasks), batch_size):
