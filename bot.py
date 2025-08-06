@@ -6,6 +6,7 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 import logging  # Logging ekledim
+import sys  # StreamHandler için
 
 load_dotenv()
 
@@ -15,8 +16,20 @@ RSI_LOW = float(os.getenv('RSI_LOW', 35))  # .env'den çek, default 35
 RSI_HIGH = float(os.getenv('RSI_HIGH', 65))  # default 65
 TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'  # Test modu flag
 
-# Logging setup
-logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging setup: Hem dosya hem console
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)  # Daha detaylı log
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# File handler
+file_handler = logging.FileHandler('bot.log')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}})
 
@@ -117,7 +130,7 @@ async def check_divergence(symbol, timeframe):
                 if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < (ema_slice[prev_high] - ema_threshold):
                     bearish = True
 
-        logging.info(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")  # Print yerine logging
+        logging.info(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
 
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
