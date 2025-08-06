@@ -29,7 +29,7 @@ file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'verbose': False})  # Verbose=False ekledim, garip output'ları keser
+exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'verbose': False})
 
 telegram_bot = Bot(token=BOT_TOKEN)
 
@@ -160,11 +160,7 @@ async def main():
     # Symbol filtreleme düzeltildi
     if not TEST_MODE:
         exchange.load_markets()
-        valid_symbols = []
-        for s in symbols:
-            market_key = s + '/USDT:USDT'  # Bybit linear format
-            if market_key in exchange.markets:
-                valid_symbols.append(s)
+        valid_symbols = [s for s in symbols if exchange.markets.get(s + '/USDT')]
         logging.info(f"Valid symbols: {len(valid_symbols)} / {len(symbols)} - List: {valid_symbols}")
     else:
         valid_symbols = symbols
