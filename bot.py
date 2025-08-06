@@ -18,7 +18,7 @@ TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 
 # Logging setup: Hem dosya hem console
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)  # DEBUG yerine INFO, fazla detay kes
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
 console_handler = logging.StreamHandler(sys.stdout)
