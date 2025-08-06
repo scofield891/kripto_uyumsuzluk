@@ -160,7 +160,7 @@ async def main():
     # Symbol filtreleme düzeltildi
     if not TEST_MODE:
         exchange.load_markets()
-        valid_symbols = [s for s in symbols if exchange.markets.get(s + '/USDT')]
+        valid_symbols = [s for s in symbols if s in exchange.markets and exchange.markets[s]['active']]
         logging.info(f"Valid symbols: {len(valid_symbols)} / {len(symbols)} - List: {valid_symbols}")
     else:
         valid_symbols = symbols
