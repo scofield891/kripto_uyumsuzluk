@@ -12,13 +12,13 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
-RSI_LOW = float(os.getenv('RSI_LOW', 35))
-RSI_HIGH = float(os.getenv('RSI_HIGH', 65))
+RSI_LOW = float(os.getenv('RSI_LOW', 40))  # Default 40'a değiştirdim
+RSI_HIGH = float(os.getenv('RSI_HIGH', 60))  # Default 60'a değiştirdim
 TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 
 # Logging setup: Hem dosya hem console
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)  # DEBUG yerine INFO, fazla detay kes
+logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
 console_handler = logging.StreamHandler(sys.stdout)
