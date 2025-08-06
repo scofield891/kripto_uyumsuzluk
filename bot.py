@@ -5,11 +5,18 @@ from telegram import Bot
 import numpy as np
 from dotenv import load_dotenv
 import os
+import logging  # Logging ekledim
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
+RSI_LOW = float(os.getenv('RSI_LOW', 35))  # .env'den çek, default 35
+RSI_HIGH = float(os.getenv('RSI_HIGH', 65))  # default 65
+TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'  # Test modu flag
+
+# Logging setup
+logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}})
 
@@ -65,15 +72,21 @@ def find_local_extrema(arr, order=4):
 
 async def check_divergence(symbol, timeframe):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        closes = np.array([x[4] for x in ohlcv])
+        if TEST_MODE:
+            # Dummy data için test modu
+            closes = np.random.rand(100) * 100  # Rastgele simüle veri
+            logging.info(f"Test modu: {symbol} {timeframe} için dummy data kullanıldı")
+        else:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+            closes = np.array([x[4] for x in ohlcv])
+
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
         rsi_ema2 = np.roll(rsi_ema, 1)
 
         ema_color = 'lime' if rsi_ema[-1] > rsi_ema2[-1] else 'red'
 
-        lookback = 40  # 40'a çıkardım
+        lookback = 50
         if len(closes) < lookback:
             return
 
@@ -86,13 +99,14 @@ async def check_divergence(symbol, timeframe):
         bearish = False
 
         min_distance = 5
+        ema_threshold = 0.5
 
         # Bullish: Only son 2 low karşılaştır
         if len(price_lows) >= 2:
             last_low = price_lows[-1]
             prev_low = price_lows[-2]
             if (last_low - prev_low) >= min_distance:
-                if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_low] > ema_slice[prev_low]:
+                if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_low] > (ema_slice[prev_low] + ema_threshold):
                     bullish = True
 
         # Bearish: Only son 2 high karşılaştır
@@ -100,27 +114,31 @@ async def check_divergence(symbol, timeframe):
             last_high = price_highs[-1]
             prev_high = price_highs[-2]
             if (last_high - prev_high) >= min_distance:
-                if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < ema_slice[prev_high]:
+                if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < (ema_slice[prev_high] - ema_threshold):
                     bearish = True
 
-        print(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
+        logging.info(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")  # Print yerine logging
 
         key = f"{symbol} {timeframe}"
         last_signal = signal_cache.get(key, (False, False))
 
         if (bullish or bearish) and (bullish, bearish) != last_signal:
-            if (bullish and rsi_ema[-1] < 35 and ema_color == 'red') or (bearish and rsi_ema[-1] > 65 and ema_color == 'lime'):
+            if (bullish and rsi_ema[-1] < RSI_LOW and ema_color == 'red') or (bearish and rsi_ema[-1] > RSI_HIGH and ema_color == 'lime'):
                 rsi_str = f"{rsi_ema[-1]:.2f}"
+                current_price = f"{closes[-1]:.2f}"  # Son fiyat ekle
+                timestamp = time.strftime('%H:%M:%S')  # Timestamp ekle
                 if bullish:
-                    message = f"{symbol} {timeframe}\nPozitif Uyumsuzluk: {bullish} 🚀 (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
+                    message = f"{symbol} {timeframe}\nPozitif Uyumsuzluk: {bullish} 🚀 (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nCurrent Price: {current_price} USDT\nSaat: {timestamp}"
                     await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                    logging.info(f"Sinyal gönderildi: {message}")
                 if bearish:
-                    message = f"{symbol} {timeframe}\nNegatif Uyumsuzluk: {bearish} 📉 (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})"
+                    message = f"{symbol} {timeframe}\nNegatif Uyumsuzluk: {bearish} 📉 (Price HH, EMA LH)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nCurrent Price: {current_price} USDT\nSaat: {timestamp}"
                     await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                    logging.info(f"Sinyal gönderildi: {message}")
                 signal_cache[key] = (bullish, bearish)
 
     except Exception as e:
-        print(f"Hata ({symbol} {timeframe}): {str(e)}")
+        logging.error(f"Hata ({symbol} {timeframe}): {str(e)}")  # Hata logging
 
 async def main():
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + time.strftime('%H:%M:%S'))
@@ -128,15 +146,28 @@ async def main():
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT', 'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT', 'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT', 'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT', 'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
         'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT',
-        'GALAUSDT', 'ENSUSDT', 'JUPUSDT', 'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT', 'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT', 'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
-    ]
+        'ENSUSDT', 'JUPUSDT', 'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT', 'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT', 'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
+    ]  # GALAUSDT duplicate'ı çıkardım
+
+    # Symbol filtreleme
+    if not TEST_MODE:
+        exchange.load_markets()
+        valid_symbols = [s for s in symbols if s + '/USDT:USDT' in exchange.markets]  # Bybit linear format
+        logging.info(f"Valid symbols: {len(valid_symbols)} / {len(symbols)}")
+    else:
+        valid_symbols = symbols  # Testte hepsini kullan
 
     while True:
+        tasks = []
         for timeframe in timeframes:
-            for symbol in symbols:
-                await check_divergence(symbol, timeframe)
-                await asyncio.sleep(1)
-        print("Tüm taramalar tamamlandı, 5 dakika bekleniyor...")
+            for symbol in valid_symbols:
+                tasks.append(check_divergence(symbol, timeframe))
+        # Parallel gather, ama gruplara böl (rate limit için, 20'lik)
+        batch_size = 20
+        for i in range(0, len(tasks), batch_size):
+            await asyncio.gather(*tasks[i:i+batch_size])
+            await asyncio.sleep(1)  # Grup arası sleep
+        logging.info("Tüm taramalar tamamlandı, 5 dakika bekleniyor...")
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
