@@ -8,7 +8,7 @@ import os
 import logging
 import sys
 from datetime import datetime
-import pytz  # Saat için timezone kütüphanesi ekledim
+import pytz
 
 load_dotenv()
 
@@ -47,6 +47,7 @@ def calculate_rsi(closes, period=14):
     rs = up / down if down != 0 else 0
     rsi = np.zeros_like(closes)
     rsi[:period] = 100. - 100. / (1. + rs)
+
     for i in range(period, len(closes)):
         delta = deltas[i-1]
         if delta > 0:
@@ -55,10 +56,12 @@ def calculate_rsi(closes, period=14):
         else:
             upval = 0.
             downval = -delta
+
         up = (up * (period - 1) + upval) / period
         down = (down * (period - 1) + downval) / period
         rs = up / down if down != 0 else 0
         rsi[i] = 100. - 100. / (1. + rs)
+
     return rsi
 
 def calculate_rsi_ema(rsi, ema_length=14):
@@ -133,7 +136,7 @@ async def check_divergence(symbol, timeframe):
             if (bullish and rsi_ema[-1] < RSI_LOW and ema_color == 'red') or (bearish and rsi_ema[-1] > RSI_HIGH and ema_color == 'lime'):
                 rsi_str = f"{rsi_ema[-1]:.2f}"
                 current_price = f"{closes[-1]:.2f}"
-                tz = pytz.timezone('Europe/Istanbul')  # Türkiye timezone (UTC+3)
+                tz = pytz.timezone('Europe/Istanbul')
                 timestamp = datetime.now(tz).strftime('%H:%M:%S')
                 if bullish:
                     message = f"{symbol} {timeframe}\nPozitif Uyumsuzluk: {bullish} 🚀 (Price LL, EMA HL)\nRSI_EMA: {rsi_str} ({ema_color.upper()})\nCurrent Price: {current_price} USDT\nSaat: {timestamp}"
@@ -149,12 +152,13 @@ async def check_divergence(symbol, timeframe):
         logging.error(f"Hata ({symbol} {timeframe}): {str(e)}")
 
 async def main():
-    await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S'))
+    tz = pytz.timezone('Europe/Istanbul')
+    await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
     timeframes = ['30m', '1h', '2h', '4h']
     symbols = [
-        'ETHUSDT.P', 'BTCUSDT.P', 'SOLUSDT.P', 'XRPUSDT.P', 'DOGEUSDT.P', 'FARTCOINUSDT.P', '1000PEPEUSDT.P', 'ADAUSDT.P', 'SUIUSDT.P', 'WIFUSDT.P', 'ENAUSDT.P', 'PENGUUSDT.P', '1000BONKUSDT.P', 'HYPEUSDT.P', 'AVAXUSDT.P', 'MOODENGUSDT.P', 'LINKUSDT.P', 'PUMPFUNUSDT.P', 'LTCUSDT.P', 'TRUMPUSDT.P', 'AAVEUSDT.P', 'ARBUSDT.P', 'NEARUSDT.P', 'ONDOUSDT.P', 'POPCATUSDT.P', 'TONUSDT.P', 'OPUSDT.P', '1000FLOKIUSDT.P', 'SEIUSDT.P', 'HBARUSDT.P', 'WLDUSDT.P', 'BNBUSDT.P', 'UNIUSDT.P', 'XLMUSDT.P', 'CRVUSDT.P', 'VIRTUALUSDT.P', 'AI16ZUSDT.P', 'TIAUSDT.P', 'TAOUSDT.P', 'APTUSDT.P', 'DOTUSDT.P', 'SPXUSDT.P', 'ETCUSDT.P', 'LDOUSDT.P', 'BCHUSDT.P', 'INJUSDT.P', 'KASUSDT.P', 'ALGOUSDT.P', 'TRXUSDT.P', 'IPUSDT.P',
-        'FILUSDT.P', 'STXUSDT.P', 'ATOMUSDT.P', 'RUNEUSDT.P', 'THETAUSDT.P', 'FETUSDT.P', 'AXSUSDT.P', 'SANDUSDT.P', 'MANAUSDT.P', 'CHZUSDT.P', 'APEUSDT.P', 'GALAUSDT.P', 'IMXUSDT.P', 'DYDXUSDT.P', 'GMTUSDT.P', 'EGLDUSDT.P', 'ZKUSDT.P', 'NOTUSDT.P',
-        'ENSUSDT.P', 'JUPUSDT.P', 'ATHUSDT.P', 'ICPUSDT.P', 'STRKUSDT.P', 'ORDIUSDT.P', 'PENDLEUSDT.P', 'PNUTUSDT.P', 'RENDERUSDT.P', 'OMUSDT.P', 'ZORAUSDT.P', 'SUSDT.P', 'GRASSUSDT.P', 'TRBUSDT.P', 'MOVEUSDT.P', 'XAUTUSDT.P', 'POLUSDT.P', 'CVXUSDT.P', 'BRETTUSDT.P', 'SAROSUSDT.P', 'GOATUSDT.P', 'AEROUSDT.P', 'JTOUSDT.P', 'HYPERUSDT.P', 'ETHFIUSDT.P', 'BERAUSDT.P'
+        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT', 'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT', 'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT', 'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT', 'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
+        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT',
+        'ENSUSDT', 'JUPUSDT', 'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT', 'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT', 'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
 
     while True:
