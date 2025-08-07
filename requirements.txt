@@ -2,3 +2,4 @@ ccxt==4.3.63
 python-telegram-bot==21.4
 numpy==1.26.4
 python-dotenv==1.0.1
+pytz==2024.1  # Saat için ekledik
