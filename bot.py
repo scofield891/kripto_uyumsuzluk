@@ -17,6 +17,9 @@ CHAT_ID = os.getenv('CHAT_ID')
 RSI_LOW = float(os.getenv('RSI_LOW', 40))
 RSI_HIGH = float(os.getenv('RSI_HIGH', 60))
 TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
+VOLUME_FILTER = os.getenv('VOLUME_FILTER', 'False').lower() == 'true'
+VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', 1.2))  # Default 1.2 (yumuşak)
+EMA_THRESHOLD = float(os.getenv('EMA_THRESHOLD', 1.0))  # Default 1.0 (sıkı filtre)
 
 # Logging setup: Hem dosya hem console
 logger = logging.getLogger()
@@ -47,7 +50,6 @@ def calculate_rsi(closes, period=14):
     rs = up / down if down != 0 else 0
     rsi = np.zeros_like(closes)
     rsi[:period] = 100. - 100. / (1. + rs)
-
     for i in range(period, len(closes)):
         delta = deltas[i-1]
         if delta > 0:
@@ -56,12 +58,10 @@ def calculate_rsi(closes, period=14):
         else:
             upval = 0.
             downval = -delta
-
         up = (up * (period - 1) + upval) / period
         down = (down * (period - 1) + downval) / period
         rs = up / down if down != 0 else 0
         rsi[i] = 100. - 100. / (1. + rs)
-
     return rsi
 
 def calculate_rsi_ema(rsi, ema_length=14):
@@ -83,14 +83,23 @@ def find_local_extrema(arr, order=4):
             lows.append(i)
     return np.array(highs), np.array(lows)
 
+def volume_filter_check(volumes):
+    if len(volumes) < 20:
+        return True
+    avg_volume = np.mean(volumes[-20:])
+    current_volume = volumes[-1]
+    return current_volume > avg_volume * VOLUME_MULTIPLIER
+
 async def check_divergence(symbol, timeframe):
     try:
         if TEST_MODE:
             closes = np.random.rand(100) * 100
+            volumes = np.random.rand(100) * 10000
             logging.info(f"Test modu: {symbol} {timeframe} için dummy data kullanıldı")
         else:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
             closes = np.array([x[4] for x in ohlcv])
+            volumes = np.array([x[5] for x in ohlcv])
 
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
@@ -104,6 +113,7 @@ async def check_divergence(symbol, timeframe):
 
         price_slice = closes[-lookback:]
         ema_slice = rsi_ema[-lookback:]
+        volume_slice = volumes[-lookback:]
 
         price_highs, price_lows = find_local_extrema(price_slice)
 
@@ -111,20 +121,19 @@ async def check_divergence(symbol, timeframe):
         bearish = False
 
         min_distance = 5
-        ema_threshold = 0.5
 
         if len(price_lows) >= 2:
             last_low = price_lows[-1]
             prev_low = price_lows[-2]
             if (last_low - prev_low) >= min_distance:
-                if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_low] > (ema_slice[prev_low] + ema_threshold):
+                if price_slice[last_low] < price_slice[prev_low] and ema_slice[last_low] > (ema_slice[prev_low] + EMA_THRESHOLD):
                     bullish = True
 
         if len(price_highs) >= 2:
             last_high = price_highs[-1]
             prev_high = price_highs[-2]
             if (last_high - prev_high) >= min_distance:
-                if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < (ema_slice[prev_high] - ema_threshold):
+                if price_slice[last_high] > price_slice[prev_high] and ema_slice[last_high] < (ema_slice[prev_high] - EMA_THRESHOLD):
                     bearish = True
 
         logging.info(f"{symbol} {timeframe}: Pozitif: {bullish}, Negatif: {bearish}, RSI_EMA: {rsi_ema[-1]:.2f}, Color: {ema_color}")
@@ -134,6 +143,9 @@ async def check_divergence(symbol, timeframe):
 
         if (bullish or bearish) and (bullish, bearish) != last_signal:
             if (bullish and rsi_ema[-1] < RSI_LOW and ema_color == 'red') or (bearish and rsi_ema[-1] > RSI_HIGH and ema_color == 'lime'):
+                if VOLUME_FILTER and not volume_filter_check(volume_slice):
+                    logging.info(f"{symbol} {timeframe}: Hacim düşük, sinyal filtrelandı")
+                    return
                 rsi_str = f"{rsi_ema[-1]:.2f}"
                 current_price = f"{closes[-1]:.2f}"
                 tz = pytz.timezone('Europe/Istanbul')
