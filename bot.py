@@ -13,16 +13,17 @@ import pytz
 # Telegram logging'i sustur (sadece ERROR ve üstü göster)
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)  # Eğer httpx kullanıyorsa
-
 load_dotenv()
+
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 RSI_LOW = float(os.getenv('RSI_LOW', 40))
 RSI_HIGH = float(os.getenv('RSI_HIGH', 60))
 TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 VOLUME_FILTER = os.getenv('VOLUME_FILTER', 'False').lower() == 'true'
-VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', 1.2)) # Default 1.2 (yumuşak)
-EMA_THRESHOLD = float(os.getenv('EMA_THRESHOLD', 1.0)) # Default 1.0 (sıkı filtre)
+VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', 1.2))  # Default 1.2 (yumuşak)
+EMA_THRESHOLD = float(os.getenv('EMA_THRESHOLD', 1.0))  # Default 1.0 (sıkı filtre)
+
 # Logging setup: Hem dosya hem console
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -33,14 +34,17 @@ logger.addHandler(console_handler)
 file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+
 exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'linear'},
     'verbose': False,
     'timeout': 60000  # Timeout'ı 60sn'ye çıkardım (default 30sn)
 })
+
 telegram_bot = Bot(token=BOT_TOKEN)
 signal_cache = {}
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return np.zeros(len(closes))
@@ -70,6 +74,7 @@ def calculate_rsi(closes, period=14):
             rs = up / down
         rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
     return rsi
+
 def calculate_rsi_ema(rsi, ema_length=14):
     ema = np.zeros_like(rsi)
     if len(rsi) < ema_length:
@@ -78,6 +83,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
     for i in range(ema_length, len(rsi)):
         ema[i] = (rsi[i] * (2 / (ema_length + 1))) + (ema[i-1] * (1 - (2 / (ema_length + 1))))
     return ema
+
 def find_local_extrema(arr, order=4):
     highs = []
     lows = []
@@ -89,12 +95,14 @@ def find_local_extrema(arr, order=4):
         if arr[i] < np.min(np.concatenate((left, right))):
             lows.append(i)
     return np.array(highs), np.array(lows)
+
 def volume_filter_check(volumes):
     if len(volumes) < 20:
         return True
     avg_volume = np.mean(volumes[-20:])
     current_volume = volumes[-1]
     return current_volume > avg_volume * VOLUME_MULTIPLIER
+
 async def check_divergence(symbol, timeframe):
     try:
         if TEST_MODE:
@@ -116,7 +124,6 @@ async def check_divergence(symbol, timeframe):
                     await asyncio.sleep(5)  # 5sn bekle
                 except Exception as e:
                     raise  # Diğer hatalarda direkt raise
-
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
         rsi_ema2 = np.roll(rsi_ema, 1)
@@ -166,10 +173,11 @@ async def check_divergence(symbol, timeframe):
                 signal_cache[key] = (bullish, bearish)
     except Exception as e:
         logging.error(f"Hata ({symbol} {timeframe}): {str(e)}")
+
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    timeframes = ['30m', '1h', '2h', '4h']
+    timeframes = ['1h', '2h', '4h']  # 30m kaldırıldı
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT', 'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT', 'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT', 'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT', 'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
         'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT', 'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT',
@@ -186,5 +194,6 @@ async def main():
             await asyncio.sleep(1)
         logging.info("Tüm taramalar tamamlandı, 5 dakika bekleniyor...")
         await asyncio.sleep(300)
+
 if __name__ == "__main__":
     asyncio.run(main())
