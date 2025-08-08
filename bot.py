@@ -9,6 +9,11 @@ import logging
 import sys
 from datetime import datetime
 import pytz
+
+# Telegram logging'i sustur (sadece ERROR ve üstü göster)
+logging.getLogger('telegram').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.ERROR)  # Eğer httpx kullanıyorsa
+
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
@@ -28,7 +33,12 @@ logger.addHandler(console_handler)
 file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
-exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'verbose': False})
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'linear'},
+    'verbose': False,
+    'timeout': 60000  # Timeout'ı 60sn'ye çıkardım (default 30sn)
+})
 telegram_bot = Bot(token=BOT_TOKEN)
 signal_cache = {}
 def calculate_rsi(closes, period=14):
@@ -92,9 +102,21 @@ async def check_divergence(symbol, timeframe):
             volumes = np.random.rand(100) * 10000
             logging.info(f"Test modu: {symbol} {timeframe} için dummy data kullanıldı")
         else:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-            closes = np.array([x[4] for x in ohlcv])
-            volumes = np.array([x[5] for x in ohlcv])
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+                    closes = np.array([x[4] for x in ohlcv])
+                    volumes = np.array([x[5] for x in ohlcv])
+                    break  # Başarılıysa çık
+                except ccxt.RequestTimeout as e:
+                    logging.warning(f"Timeout ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
+                    if attempt == max_retries - 1:
+                        raise  # Son retry'de hata ver
+                    await asyncio.sleep(5)  # 5sn bekle
+                except Exception as e:
+                    raise  # Diğer hatalarda direkt raise
+
         rsi = calculate_rsi(closes, 14)
         rsi_ema = calculate_rsi_ema(rsi, 14)
         rsi_ema2 = np.roll(rsi_ema, 1)
