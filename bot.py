@@ -1,7 +1,7 @@
 import ccxt
 import numpy as np
 import pandas as pd
-import telegram  # Hata sınıfları için
+import telegram
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -615,11 +615,6 @@ async def main():
         'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
         'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
-    # Backtest için
-    for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:  # Test için 3 symbol
-        winrate, total = await backtest(symbol, '4h', limit=2190)
-        await telegram_bot.send_message(chat_id=CHAT_ID, text=f"Backtest {symbol} 4h: Winrate {winrate:.2f}%, Total Trades {total}")
-    # Canlı mod
     while True:
         tasks = []
         for timeframe in timeframes:
