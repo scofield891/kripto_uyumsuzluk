@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 import pytz
 import sys
 # ================== Sabit Değerler ==================
-BOT_TOKEN = "7608720362:AAHp10_7CVfEYoBtPWlQPxH37rrn40NbIuY"
-CHAT_ID = '-1002755412514'
+BOT_TOKEN = "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ"
+CHAT_ID = '-1002878297025'
 TEST_MODE = False
 RSI_LOW = 40
 RSI_HIGH = 60
