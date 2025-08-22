@@ -46,8 +46,32 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
-telegram_bot = telegram.Bot(token=BOT_TOKEN)
+telegram_bot = telegram.Bot(
+    token=BOT_TOKEN,
+    request=telegram.request.HTTPXRequest(
+        connection_pool_size=20,
+        pool_timeout=30.0
+    )
+)
 signal_cache = {}
+message_queue = asyncio.Queue()
+
+# ================== Mesaj Gönderici ==================
+async def message_sender():
+    while True:
+        message = await message_queue.get()
+        try:
+            await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+            await asyncio.sleep(1)
+        except telegram.error.RetryAfter as e:
+            logger.warning(f"RetryAfter: {e.retry_after} saniye bekle")
+            await asyncio.sleep(e.retry_after)
+            await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+        except telegram.error.TimedOut:
+            logger.warning("TimedOut: Connection pool doldu, 5 saniye bekle")
+            await asyncio.sleep(5)
+            await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+        message_queue.task_done()
 
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
@@ -284,9 +308,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Reversal Close: {message}")
+                await message_queue.put(message)
+                logger.info(f"Reversal Close kuyruğa eklendi: {message}")
                 # Reset state
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -304,16 +327,14 @@ async def check_signals(symbol, timeframe, df=None):
         if buy_condition and current_pos['signal'] != 'buy':
             if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'buy' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
                 message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                await message_queue.put(message)
                 logger.info(message)
             else:
                 entry_price = float(closed_candle['close'])
                 sl_price = entry_price - (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
                 if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
                     message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
-                    await asyncio.sleep(1)
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                    await message_queue.put(message)
                     logger.info(message)
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
@@ -346,22 +367,19 @@ async def check_signals(symbol, timeframe, df=None):
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
-                    await asyncio.sleep(1)
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                    logger.info(f"Sinyal: {message}")
+                    await message_queue.put(message)
+                    logger.info(f"Sinyal kuyruğa eklendi: {message}")
         elif sell_condition and current_pos['signal'] != 'sell':
             if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'sell' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
                 message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                await message_queue.put(message)
                 logger.info(message)
             else:
                 entry_price = float(closed_candle['close'])
                 sl_price = entry_price + (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
                 if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
                     message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
-                    await asyncio.sleep(1)
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+                    await message_queue.put(message)
                     logger.info(message)
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
@@ -394,9 +412,8 @@ async def check_signals(symbol, timeframe, df=None):
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
-                    await asyncio.sleep(1)
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                    logger.info(f"Sinyal: {message}")
+                    await message_queue.put(message)
+                    logger.info(f"Sinyal kuyruğa eklendi: {message}")
         # Pozisyon yönetimi
         if current_pos['signal'] == 'buy':
             atr_value, _ = get_atr_values(df, LOOKBACK_ATR)
@@ -420,9 +437,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"TSL Distance: {td}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Trailing Activated: {message}")
+                await message_queue.put(message)
+                logger.info(f"Trailing Activated kuyruğa eklendi: {message}")
             if current_pos['trailing_activated']:
                 trailing_sl = current_pos['highest_price'] - (td * atr_value)
                 current_pos['sl_price'] = max(current_pos['sl_price'], trailing_sl)
@@ -440,9 +456,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP1 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP1 Hit kuyruğa eklendi: {message}")
             elif not current_pos['tp2_hit'] and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100
                 current_pos['remaining_ratio'] -= 0.4
@@ -455,9 +470,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"%40 satıldı, kalan %30 trailing\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP2 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP2 Hit kuyruğa eklendi: {message}")
             if current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100
                 if profit_percent > 0:
@@ -478,9 +492,8 @@ async def check_signals(symbol, timeframe, df=None):
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Exit: {message}")
+                await message_queue.put(message)
+                logger.info(f"Exit kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None,
@@ -516,9 +529,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"TSL Distance: {td}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Trailing Activated: {message}")
+                await message_queue.put(message)
+                logger.info(f"Trailing Activated kuyruğa eklendi: {message}")
             if current_pos['trailing_activated']:
                 trailing_sl = current_pos['lowest_price'] + (td * atr_value)
                 current_pos['sl_price'] = min(current_pos['sl_price'], trailing_sl)
@@ -536,9 +548,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP1 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP1 Hit kuyruğa eklendi: {message}")
             elif not current_pos['tp2_hit'] and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100
                 current_pos['remaining_ratio'] -= 0.4
@@ -551,9 +562,8 @@ async def check_signals(symbol, timeframe, df=None):
                     f"%40 satıldı, kalan %30 trailing\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP2 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP2 Hit kuyruğa eklendi: {message}")
             if current_price >= current_pos['sl_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100
                 if profit_percent > 0:
@@ -574,9 +584,8 @@ async def check_signals(symbol, timeframe, df=None):
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
-                await asyncio.sleep(1)
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Exit: {message}")
+                await message_queue.put(message)
+                logger.info(f"Exit kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None,
@@ -593,7 +602,13 @@ async def check_signals(symbol, timeframe, df=None):
     except telegram.error.RetryAfter as e:
         logger.warning(f"Telegram flood kontrolü, {e.retry_after} saniye bekle: {symbol} {timeframe}")
         await asyncio.sleep(e.retry_after)
-        await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+        await message_queue.put(message)
+        logger.info(f"RetryAfter sonrası kuyruğa eklendi: {message}")
+    except telegram.error.TimedOut:
+        logger.warning(f"TimedOut: Connection pool doldu, 5 saniye bekle: {symbol} {timeframe}")
+        await asyncio.sleep(5)
+        await message_queue.put(message)
+        logger.info(f"TimedOut sonrası kuyruğa eklendi: {message}")
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
         return
@@ -602,6 +617,7 @@ async def check_signals(symbol, timeframe, df=None):
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
+    asyncio.create_task(message_sender())  # Mesaj göndericiyi başlat
     timeframes = ['4h']
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
