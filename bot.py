@@ -1,7 +1,7 @@
 import ccxt
 import numpy as np
 import pandas as pd
-from telegram import Bot
+import telegram  # Hata sınıfları için
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -29,7 +29,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-USE_STOCH = True  # Stochastic teyit filtresi aktif (kaliteli sinyaller)
+USE_STOCH = True  # Stochastic teyit aktif
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -46,7 +46,7 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
-telegram_bot = Bot(token=BOT_TOKEN)
+telegram_bot = telegram.Bot(token=BOT_TOKEN)
 signal_cache = {}
 
 # ================== İndikatör Fonksiyonları ==================
@@ -144,6 +144,7 @@ def get_atr_values(df, lookback_atr=18):
     return atr_value, avg_atr_ratio
 
 def calculate_indicators(df, timeframe):
+    df = df.copy()  # SettingWithCopyWarning'i önle
     if len(df) < 80:
         logger.warning("DF çok kısa, indikatör hesaplanamadı.")
         return None
@@ -156,52 +157,6 @@ def calculate_indicators(df, timeframe):
     df['stoch_k'], df['stoch_d'] = calculate_stoch(df['high'], df['low'], df['close'])
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
     return df
-
-# ================== Backtest Fonksiyonu ==================
-async def backtest(symbol, timeframe, limit=2190):  # ~1 yıl 4h veri (365*6)
-    wins = 0
-    total = 0
-    try:
-        if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(limit))) * 0.05 + 0.3
-            highs = closes + np.random.rand(limit) * 0.02 * closes
-            lows = closes - np.random.rand(limit) * 0.02 * closes
-            volumes = np.random.rand(limit) * 10000
-            ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(limit)]
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        else:
-            since = int((datetime.now() - timedelta(days=365)).timestamp() * 1000)
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        
-        for i in range(80, len(df)):
-            temp_df = df.iloc[:i+1]
-            key = f"{symbol}_{timeframe}"
-            prev_pos = signal_cache.get(key, {
-                'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
-                'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
-                'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
-                'tp1_hit': False, 'tp2_hit': False
-            })
-            await check_signals(symbol, timeframe, df=temp_df)
-            pos = signal_cache.get(key, prev_pos)
-            if pos.get('signal'):
-                current_price = float(temp_df.iloc[-1]['close'])
-                if pos.get('tp1_hit') or pos.get('tp2_hit'):
-                    wins += 1
-                    total += 1
-                    signal_cache[key] = prev_pos  # Pozisyonu sıfırla
-                elif (pos['signal'] == 'buy' and current_price <= pos['sl_price']) or \
-                     (pos['signal'] == 'sell' and current_price >= pos['sl_price']):
-                    total += 1
-                    signal_cache[key] = prev_pos
-        winrate = (wins / total * 100) if total > 0 else 0
-        logger.info(f"Backtest {symbol} {timeframe}: Winrate {winrate:.2f}%, Total Trades {total}")
-        return winrate, total
-    except Exception as e:
-        logger.exception(f"Backtest Hata ({symbol} {timeframe}): {str(e)}")
-        return 0, 0
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe, df=None):
