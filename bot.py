@@ -7,9 +7,11 @@ import asyncio
 from datetime import datetime, timedelta
 import pytz
 import sys
+import os
+
 # ================== Sabit Değerler ==================
-BOT_TOKEN = "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ"
-CHAT_ID = '-1002878297025'
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
+CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
 TEST_MODE = False
 RSI_LOW = 40
 RSI_HIGH = 60
@@ -27,7 +29,8 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-USE_STOCH = False  # Stochastic teyit filtresi (True yaparsan devreye girer)
+USE_STOCH = True  # Stochastic teyit filtresi aktif (kaliteli sinyaller)
+
 # ================== Logging ==================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -40,10 +43,12 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
+
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
 telegram_bot = Bot(token=BOT_TOKEN)
 signal_cache = {}
+
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
@@ -52,6 +57,7 @@ def calculate_ema(closes, span):
     for i in range(1, len(closes)):
         ema[i] = (closes[i] * k) + (ema[i-1] * (1 - k))
     return ema
+
 def calculate_sma(closes, period):
     sma = np.zeros_like(closes, dtype=np.float64)
     for i in range(len(closes)):
@@ -60,6 +66,7 @@ def calculate_sma(closes, period):
         else:
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return np.zeros(len(closes), dtype=np.float64)
@@ -79,6 +86,7 @@ def calculate_rsi(closes, period=14):
         rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
         rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
     return rsi
+
 def calculate_rsi_ema(rsi, ema_length=14):
     ema = np.zeros_like(rsi, dtype=np.float64)
     if len(rsi) < ema_length:
@@ -88,6 +96,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
     for i in range(ema_length, len(rsi)):
         ema[i] = (rsi[i] * alpha) + (ema[i-1] * (1 - alpha))
     return ema
+
 def calculate_macd(closes, timeframe):
     if timeframe == '1h':
         fast, slow, signal = 8, 17, 9
@@ -106,12 +115,14 @@ def calculate_macd(closes, timeframe):
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
 def calculate_stoch(high, low, close, k=14, d=3):
     ll = pd.Series(low).rolling(k).min()
     hh = pd.Series(high).rolling(k).max()
     k_raw = 100 * (close - ll) / (hh - ll + 1e-9)
     d_line = k_raw.rolling(d).mean()
     return k_raw, d_line
+
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
@@ -121,6 +132,7 @@ def ensure_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=period).mean()
     return df
+
 def get_atr_values(df, lookback_atr=18):
     df = ensure_atr(df, period=14)
     if len(df) < lookback_atr + 2:
@@ -130,6 +142,7 @@ def get_atr_values(df, lookback_atr=18):
     atr_series = df['atr'].iloc[-(lookback_atr+1):-1]
     avg_atr_ratio = float(atr_series.mean() / close_last) if len(atr_series) else np.nan
     return atr_value, avg_atr_ratio
+
 def calculate_indicators(df, timeframe):
     if len(df) < 80:
         logger.warning("DF çok kısa, indikatör hesaplanamadı.")
@@ -143,36 +156,83 @@ def calculate_indicators(df, timeframe):
     df['stoch_k'], df['stoch_d'] = calculate_stoch(df['high'], df['low'], df['close'])
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
     return df
+
+# ================== Backtest Fonksiyonu ==================
+async def backtest(symbol, timeframe, limit=2190):  # ~1 yıl 4h veri (365*6)
+    wins = 0
+    total = 0
+    try:
+        if TEST_MODE:
+            closes = np.abs(np.cumsum(np.random.randn(limit))) * 0.05 + 0.3
+            highs = closes + np.random.rand(limit) * 0.02 * closes
+            lows = closes - np.random.rand(limit) * 0.02 * closes
+            volumes = np.random.rand(limit) * 10000
+            ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(limit)]
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        else:
+            since = int((datetime.now() - timedelta(days=365)).timestamp() * 1000)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        
+        for i in range(80, len(df)):
+            temp_df = df.iloc[:i+1]
+            key = f"{symbol}_{timeframe}"
+            prev_pos = signal_cache.get(key, {
+                'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
+                'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
+                'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
+                'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
+                'tp1_hit': False, 'tp2_hit': False
+            })
+            await check_signals(symbol, timeframe, df=temp_df)
+            pos = signal_cache.get(key, prev_pos)
+            if pos.get('signal'):
+                current_price = float(temp_df.iloc[-1]['close'])
+                if pos.get('tp1_hit') or pos.get('tp2_hit'):
+                    wins += 1
+                    total += 1
+                    signal_cache[key] = prev_pos  # Pozisyonu sıfırla
+                elif (pos['signal'] == 'buy' and current_price <= pos['sl_price']) or \
+                     (pos['signal'] == 'sell' and current_price >= pos['sl_price']):
+                    total += 1
+                    signal_cache[key] = prev_pos
+        winrate = (wins / total * 100) if total > 0 else 0
+        logger.info(f"Backtest {symbol} {timeframe}: Winrate {winrate:.2f}%, Total Trades {total}")
+        return winrate, total
+    except Exception as e:
+        logger.exception(f"Backtest Hata ({symbol} {timeframe}): {str(e)}")
+        return 0, 0
+
 # ================== Sinyal Döngüsü ==================
-async def check_signals(symbol, timeframe):
+async def check_signals(symbol, timeframe, df=None):
     try:
         # Veri
-        if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
-            highs = closes + np.random.rand(200) * 0.02 * closes
-            lows = closes - np.random.rand(200) * 0.02 * closes
-            volumes = np.random.rand(200) * 10000
-            ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-            logger.info(f"Test modu: {symbol} {timeframe}")
-        else:
-            max_retries = 3
-            df = None
-            for attempt in range(max_retries):
-                try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
-                    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                    break
-                except (ccxt.RequestTimeout, ccxt.NetworkError):
-                    logger.warning(f"Timeout/Network ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
-                    if attempt == max_retries - 1:
-                        raise
-                    await asyncio.sleep(5)
-                except (ccxt.BadSymbol, ccxt.BadRequest) as e:
-                    logger.warning(f"Skip {symbol} {timeframe}: {e.__class__.__name__} - {e}")
+        if df is None:
+            if TEST_MODE:
+                closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
+                highs = closes + np.random.rand(200) * 0.02 * closes
+                lows = closes - np.random.rand(200) * 0.02 * closes
+                volumes = np.random.rand(200) * 10000
+                ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
+                df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                logger.info(f"Test modu: {symbol} {timeframe}")
+            else:
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
+                        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                        break
+                    except (ccxt.RequestTimeout, ccxt.NetworkError):
+                        logger.warning(f"Timeout/Network ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
+                        if attempt == max_retries - 1:
+                            raise
+                        await asyncio.sleep(5)
+                    except (ccxt.BadSymbol, ccxt.BadRequest) as e:
+                        logger.warning(f"Skip {symbol} {timeframe}: {e.__class__.__name__} - {e}")
+                        return
+                if df is None or df.empty:
                     return
-            if df is None or df.empty:
-                return
         # İndikatörler
         df = calculate_indicators(df, timeframe)
         if df is None:
@@ -208,8 +268,8 @@ async def check_signals(symbol, timeframe):
         # RSI-EMA Zone Bounce
         zone_cross_up = (df['rsi_ema'].iloc[-2] < 50 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
         zone_cross_down = (df['rsi_ema'].iloc[-2] > 50 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
-        # Pullback kontrolü (son 10 bar)
-        recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]  # Len=10
+        # Pullback kontrolü
+        recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
         pullback_long = (recent['close'] < recent['ema13']).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
         pullback_short = (recent['close'] > recent['ema13']).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
         # Stochastic teyit
@@ -269,6 +329,7 @@ async def check_signals(symbol, timeframe):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"Reversal Close: {message}")
                 # Reset state
@@ -288,12 +349,16 @@ async def check_signals(symbol, timeframe):
         if buy_condition and current_pos['signal'] != 'buy':
             if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'buy' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
                 message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
+                await asyncio.sleep(1)
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(message)
             else:
                 entry_price = float(closed_candle['close'])
                 sl_price = entry_price - (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
                 if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
                     message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                    await asyncio.sleep(1)
+                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                     logger.info(message)
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
@@ -326,17 +391,22 @@ async def check_signals(symbol, timeframe):
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
+                    await asyncio.sleep(1)
                     await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                     logger.info(f"Sinyal: {message}")
         elif sell_condition and current_pos['signal'] != 'sell':
             if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'sell' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
                 message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
+                await asyncio.sleep(1)
+                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(message)
             else:
                 entry_price = float(closed_candle['close'])
                 sl_price = entry_price + (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
                 if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
                     message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                    await asyncio.sleep(1)
+                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                     logger.info(message)
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
@@ -369,6 +439,7 @@ async def check_signals(symbol, timeframe):
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
+                    await asyncio.sleep(1)
                     await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                     logger.info(f"Sinyal: {message}")
         # Pozisyon yönetimi
@@ -394,6 +465,7 @@ async def check_signals(symbol, timeframe):
                     f"TSL Distance: {td}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"Trailing Activated: {message}")
             if current_pos['trailing_activated']:
@@ -413,6 +485,7 @@ async def check_signals(symbol, timeframe):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"TP1 Hit: {message}")
             elif not current_pos['tp2_hit'] and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
@@ -427,6 +500,7 @@ async def check_signals(symbol, timeframe):
                     f"%40 satıldı, kalan %30 trailing\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"TP2 Hit: {message}")
             if current_price <= current_pos['sl_price']:
@@ -449,13 +523,17 @@ async def check_signals(symbol, timeframe):
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"Exit: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
-                    'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
-                    'last_signal_time': current_pos['last_signal_time'], 'last_signal_type': current_pos['last_signal_type'],
+                    'highest_price': None, 'lowest_price': None,
+                    'trailing_activated': False,
+                    'avg_atr_ratio': None, 'trailing_distance': None,
+                    'remaining_ratio': 1.0,
+                    'last_signal_time': current_pos['last_signal_time'],
+                    'last_signal_type': current_pos['last_signal_type'],
                     'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False
                 }
@@ -483,6 +561,7 @@ async def check_signals(symbol, timeframe):
                     f"TSL Distance: {td}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"Trailing Activated: {message}")
             if current_pos['trailing_activated']:
@@ -502,6 +581,7 @@ async def check_signals(symbol, timeframe):
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"TP1 Hit: {message}")
             elif not current_pos['tp2_hit'] and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
@@ -516,6 +596,7 @@ async def check_signals(symbol, timeframe):
                     f"%40 satıldı, kalan %30 trailing\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"TP2 Hit: {message}")
             if current_price >= current_pos['sl_price']:
@@ -538,21 +619,30 @@ async def check_signals(symbol, timeframe):
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
+                await asyncio.sleep(1)
                 await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
                 logger.info(f"Exit: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
-                    'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
-                    'last_signal_time': current_pos['last_signal_time'], 'last_signal_type': current_pos['last_signal_type'],
+                    'highest_price': None, 'lowest_price': None,
+                    'trailing_activated': False,
+                    'avg_atr_ratio': None, 'trailing_distance': None,
+                    'remaining_ratio': 1.0,
+                    'last_signal_time': current_pos['last_signal_time'],
+                    'last_signal_type': current_pos['last_signal_type'],
                     'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False
                 }
                 return
             signal_cache[key] = current_pos
+    except telegram.error.RetryAfter as e:
+        logger.warning(f"Telegram flood kontrolü, {e.retry_after} saniye bekle: {symbol} {timeframe}")
+        await asyncio.sleep(e.retry_after)
+        await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
         return
+
 # ================== Main ==================
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
@@ -570,6 +660,11 @@ async def main():
         'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
         'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
+    # Backtest için
+    for symbol in ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']:  # Test için 3 symbol
+        winrate, total = await backtest(symbol, '4h', limit=2190)
+        await telegram_bot.send_message(chat_id=CHAT_ID, text=f"Backtest {symbol} 4h: Winrate {winrate:.2f}%, Total Trades {total}")
+    # Canlı mod
     while True:
         tasks = []
         for timeframe in timeframes:
@@ -581,5 +676,6 @@ async def main():
             await asyncio.sleep(3)
         logger.info("Taramalar tamam, 5 dk bekle...")
         await asyncio.sleep(300)
+
 if __name__ == "__main__":
     asyncio.run(main())
