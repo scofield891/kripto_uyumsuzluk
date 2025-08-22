@@ -29,7 +29,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-USE_STOCH = True  # Stochastic teyit aktif
+USE_STOCH = True
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -65,7 +65,7 @@ async def message_sender():
             await asyncio.sleep(1)
         except telegram.error.RetryAfter as e:
             logger.warning(f"RetryAfter: {e.retry_after} saniye bekle")
-            await asyncio.sleep(e.retry_after + 2)  # Ekstra gecikme
+            await asyncio.sleep(e.retry_after + 2)
             await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
         except telegram.error.TimedOut:
             logger.warning("TimedOut: Connection pool doldu, 5 saniye bekle")
@@ -168,7 +168,7 @@ def get_atr_values(df, lookback_atr=18):
     return atr_value, avg_atr_ratio
 
 def calculate_indicators(df, timeframe):
-    df = df.copy()  # SettingWithCopyWarning'i önle
+    df = df.copy()
     if len(df) < 80:
         logger.warning("DF çok kısa, indikatör hesaplanamadı.")
         return None
@@ -617,9 +617,20 @@ async def check_signals(symbol, timeframe, df=None):
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    asyncio.create_task(message_sender())  # Mesaj göndericiyi başlat
+    asyncio.create_task(message_sender())
     timeframes = ['4h']
-    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT']
+    symbols = [
+        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
+        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
+        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
+        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
+        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
+        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
+        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
+        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
+        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
+        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
+    ]
     while True:
         tasks = []
         for timeframe in timeframes:
