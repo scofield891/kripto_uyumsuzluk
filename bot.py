@@ -65,7 +65,7 @@ async def message_sender():
             await asyncio.sleep(1)
         except telegram.error.RetryAfter as e:
             logger.warning(f"RetryAfter: {e.retry_after} saniye bekle")
-            await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(e.retry_after + 2)  # Ekstra gecikme
             await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
         except telegram.error.TimedOut:
             logger.warning("TimedOut: Connection pool doldu, 5 saniye bekle")
@@ -245,8 +245,8 @@ async def check_signals(symbol, timeframe, df=None):
                price_slice[-i] < sma34_slice[-i]:
                 ema_sma_crossover_sell = True
         # RSI-EMA Zone Bounce
-        zone_cross_up = (df['rsi_ema'].iloc[-2] < 50 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
-        zone_cross_down = (df['rsi_ema'].iloc[-2] > 50 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
+        zone_cross_up = (df['rsi_ema'].iloc[-2] < 48 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
+        zone_cross_down = (df['rsi_ema'].iloc[-2] > 52 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
         # Pullback kontrolü
         recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
         pullback_long = (recent['close'] < recent['ema13']).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
@@ -255,7 +255,7 @@ async def check_signals(symbol, timeframe, df=None):
         stoch_cross_up = (df['stoch_k'].iloc[-2] < df['stoch_d'].iloc[-2]) and (df['stoch_k'].iloc[-1] > df['stoch_d'].iloc[-1]) and (df['stoch_k'].iloc[-2] < 30)
         stoch_cross_down = (df['stoch_k'].iloc[-2] > df['stoch_d'].iloc[-2]) and (df['stoch_k'].iloc[-1] < df['stoch_d'].iloc[-1]) and (df['stoch_k'].iloc[-2] > 70)
         # Volume filtresi
-        volume_ok = closed_candle['volume'] > closed_candle['volume_sma20']
+        volume_ok = closed_candle['volume'] > 1.5 * closed_candle['volume_sma20']
         # MACD filtre
         macd_up = df['macd'].iloc[-2] > df['macd_signal'].iloc[-2]
         macd_down = df['macd'].iloc[-2] < df['macd_signal'].iloc[-2]
@@ -278,11 +278,11 @@ async def check_signals(symbol, timeframe, df=None):
             f"StochUp={stoch_cross_up}, StochDown={stoch_cross_down} | "
             f"VolumeOK={volume_ok} | "
             f"MACD_MODE={MACD_MODE} (up={macd_up}, hist_up={hist_up}) | "
-            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_cross_up and USE_STOCH)) else 'no'} | "
-            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_cross_down and USE_STOCH)) else 'no'}"
+            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy) and stoch_cross_up else 'no'} | "
+            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell) and stoch_cross_down else 'no'}"
         )
-        buy_condition = macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_cross_up and USE_STOCH))
-        sell_condition = macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_cross_down and USE_STOCH))
+        buy_condition = macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy) and stoch_cross_up
+        sell_condition = macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell) and stoch_cross_down
         # Pozisyon yönetimi (önce reversal check)
         current_pos = signal_cache.get(key, current_pos)
         current_price = float(df.iloc[-1]['close'])
@@ -601,7 +601,7 @@ async def check_signals(symbol, timeframe, df=None):
             signal_cache[key] = current_pos
     except telegram.error.RetryAfter as e:
         logger.warning(f"Telegram flood kontrolü, {e.retry_after} saniye bekle: {symbol} {timeframe}")
-        await asyncio.sleep(e.retry_after)
+        await asyncio.sleep(e.retry_after + 2)
         await message_queue.put(message)
         logger.info(f"RetryAfter sonrası kuyruğa eklendi: {message}")
     except telegram.error.TimedOut:
@@ -619,24 +619,13 @@ async def main():
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
     asyncio.create_task(message_sender())  # Mesaj göndericiyi başlat
     timeframes = ['4h']
-    symbols = [
-        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
-        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
-        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
-        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
-        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
-        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
-        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
-        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
-        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
-        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
-    ]
+    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT']
     while True:
         tasks = []
         for timeframe in timeframes:
             for symbol in symbols:
                 tasks.append(check_signals(symbol, timeframe))
-        batch_size = 20
+        batch_size = 10
         for i in range(0, len(tasks), batch_size):
             await asyncio.gather(*tasks[i:i+batch_size])
             await asyncio.sleep(3)
