@@ -29,7 +29,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-USE_STOCH = True
+USE_STOCH_RSI = True  # StochRSI opsiyonel teyit
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -140,12 +140,14 @@ def calculate_macd(closes, timeframe):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-def calculate_stoch(high, low, close, k=14, d=3):
-    ll = pd.Series(low).rolling(k).min()
-    hh = pd.Series(high).rolling(k).max()
-    k_raw = 100 * (close - ll) / (hh - ll + 1e-9)
-    d_line = k_raw.rolling(d).mean()
-    return k_raw, d_line
+def calculate_stoch_rsi(df, rsi_period=14, stoch_period=14, d_period=3):
+    rsi = calculate_rsi(df['close'].values, period=rsi_period)
+    rsi_series = pd.Series(rsi)
+    rsi_low = rsi_series.rolling(stoch_period).min()
+    rsi_high = rsi_series.rolling(stoch_period).max()
+    stoch_rsi = 100 * (rsi_series - rsi_low) / (rsi_high - rsi_low + 1e-9)
+    d_line = stoch_rsi.rolling(d_period).mean()
+    return stoch_rsi, d_line
 
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
@@ -178,7 +180,7 @@ def calculate_indicators(df, timeframe):
     df['rsi'] = calculate_rsi(closes)
     df['rsi_ema'] = calculate_rsi_ema(df['rsi'])
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(closes, timeframe)
-    df['stoch_k'], df['stoch_d'] = calculate_stoch(df['high'], df['low'], df['close'])
+    df['stoch_rsi_k'], df['stoch_rsi_d'] = calculate_stoch_rsi(df)
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
     return df
 
@@ -245,17 +247,17 @@ async def check_signals(symbol, timeframe, df=None):
                price_slice[-i] < sma34_slice[-i]:
                 ema_sma_crossover_sell = True
         # RSI-EMA Zone Bounce
-        zone_cross_up = (df['rsi_ema'].iloc[-2] < 48 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
-        zone_cross_down = (df['rsi_ema'].iloc[-2] > 52 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
+        zone_cross_up = (df['rsi_ema'].iloc[-2] < 45 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
+        zone_cross_down = (df['rsi_ema'].iloc[-2] > 55 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
         # Pullback kontrolü
         recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
         pullback_long = (recent['close'] < recent['ema13']).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
         pullback_short = (recent['close'] > recent['ema13']).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
-        # Stochastic teyit
-        stoch_cross_up = (df['stoch_k'].iloc[-2] < df['stoch_d'].iloc[-2]) and (df['stoch_k'].iloc[-1] > df['stoch_d'].iloc[-1]) and (df['stoch_k'].iloc[-2] < 30)
-        stoch_cross_down = (df['stoch_k'].iloc[-2] > df['stoch_d'].iloc[-2]) and (df['stoch_k'].iloc[-1] < df['stoch_d'].iloc[-1]) and (df['stoch_k'].iloc[-2] > 70)
+        # StochRSI teyit
+        stoch_rsi_cross_up = (df['stoch_rsi_k'].iloc[-2] < df['stoch_rsi_d'].iloc[-2]) and (df['stoch_rsi_k'].iloc[-1] > df['stoch_rsi_d'].iloc[-1]) and (df['stoch_rsi_k'].iloc[-2] < 30)
+        stoch_rsi_cross_down = (df['stoch_rsi_k'].iloc[-2] > df['stoch_rsi_d'].iloc[-2]) and (df['stoch_rsi_k'].iloc[-1] < df['stoch_rsi_d'].iloc[-1]) and (df['stoch_rsi_k'].iloc[-2] > 70)
         # Volume filtresi
-        volume_ok = closed_candle['volume'] > 1.5 * closed_candle['volume_sma20']
+        volume_ok = closed_candle['volume'] > 1.2 * closed_candle['volume_sma20']
         # MACD filtre
         macd_up = df['macd'].iloc[-2] > df['macd_signal'].iloc[-2]
         macd_down = df['macd'].iloc[-2] < df['macd_signal'].iloc[-2]
@@ -275,14 +277,14 @@ async def check_signals(symbol, timeframe, df=None):
             f"ZoneUp={zone_cross_up}, ZoneDown={zone_cross_down} | "
             f"PullLong={pullback_long}, PullShort={pullback_short} | "
             f"CrossBuy={ema_sma_crossover_buy}, CrossSell={ema_sma_crossover_sell} | "
-            f"StochUp={stoch_cross_up}, StochDown={stoch_cross_down} | "
+            f"StochRSIUp={stoch_rsi_cross_up}, StochRSIDown={stoch_rsi_cross_down} | "
             f"VolumeOK={volume_ok} | "
             f"MACD_MODE={MACD_MODE} (up={macd_up}, hist_up={hist_up}) | "
-            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy) and stoch_cross_up else 'no'} | "
-            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell) and stoch_cross_down else 'no'}"
+            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_rsi_cross_up and USE_STOCH_RSI)) else 'no'} | "
+            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_rsi_cross_down and USE_STOCH_RSI)) else 'no'}"
         )
-        buy_condition = macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy) and stoch_cross_up
-        sell_condition = macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell) and stoch_cross_down
+        buy_condition = macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_rsi_cross_up and USE_STOCH_RSI))
+        sell_condition = macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_rsi_cross_down and USE_STOCH_RSI))
         # Pozisyon yönetimi (önce reversal check)
         current_pos = signal_cache.get(key, current_pos)
         current_price = float(df.iloc[-1]['close'])
@@ -363,7 +365,7 @@ async def check_signals(symbol, timeframe, df=None):
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
                         f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Zone Bounce: Up\n"
-                        f"Stoch Confirm: {stoch_cross_up}\n"
+                        f"StochRSI Confirm: {stoch_rsi_cross_up}\n"
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
@@ -408,7 +410,7 @@ async def check_signals(symbol, timeframe, df=None):
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
                         f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Zone Bounce: Down\n"
-                        f"Stoch Confirm: {stoch_cross_down}\n"
+                        f"StochRSI Confirm: {stoch_rsi_cross_down}\n"
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
                     )
@@ -636,7 +638,7 @@ async def main():
         for timeframe in timeframes:
             for symbol in symbols:
                 tasks.append(check_signals(symbol, timeframe))
-        batch_size = 10
+        batch_size = 20
         for i in range(0, len(tasks), batch_size):
             await asyncio.gather(*tasks[i:i+batch_size])
             await asyncio.sleep(3)
