@@ -185,7 +185,8 @@ def calculate_indicators(df, timeframe, symbol):
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(closes, timeframe)
     df['stoch_rsi_k'], df['stoch_rsi_d'] = calculate_stoch_rsi(df)
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
-    if np.any(np.isnan(df['ema13'])) or np.any(np.isnan(df['sma34'])) or np.any(np.isnan(df['stoch_rsi_k'])):
+    # NaN'leri son 80 mumda kontrol et
+    if np.any(np.isnan(df['ema13'][-80:])) or np.any(np.isnan(df['sma34'][-80:])) or np.any(np.isnan(df['stoch_rsi_k'][-80:])):
         logger.warning(f"NaN values detected in indicators for {symbol} {timeframe}")
     return df
 
@@ -209,6 +210,9 @@ async def check_signals(symbol, timeframe, df=None):
                         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
                         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         logger.info(f"Data fetched for {symbol} {timeframe}, length: {len(df)}")
+                        # İlk mumları kontrol et
+                        if df['close'].iloc[0] == 0 or df['volume'].iloc[0] == 0:
+                            logger.warning(f"Invalid initial data for {symbol} {timeframe}")
                         break
                     except (ccxt.RequestTimeout, ccxt.NetworkError):
                         logger.warning(f"Timeout/Network ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
@@ -224,6 +228,11 @@ async def check_signals(symbol, timeframe, df=None):
         # İndikatörler
         df = calculate_indicators(df, timeframe, symbol)
         if df is None:
+            return
+        # NaN'leri son 80 mumda temizle (isteğe bağlı)
+        df = df.dropna()
+        if len(df) < 80:
+            logger.warning(f"After dropping NaN, DF too short for {symbol} {timeframe}")
             return
         atr_value, avg_atr_ratio = get_atr_values(df, LOOKBACK_ATR)
         if not np.isfinite(atr_value) or not np.isfinite(avg_atr_ratio):
@@ -266,9 +275,9 @@ async def check_signals(symbol, timeframe, df=None):
         stoch_rsi_cross_up = False
         stoch_rsi_cross_down = False
         for i in range(1, LOOKBACK_STOCH + 1):
-            if stoch_rsi_k[-i-1] <= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] > stoch_rsi_d[-i] and stoch_rsi_k[-i-1] < STOCH_OVERSOLD:
+            if stoch_rsi_k[-i-1] <= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] > stoch_rsi_d[-i] and stoch_rsi_k[-i-1] < STOCH_OVERSOLD and stoch_rsi_k[-1] < STOCH_OVERSOLD:
                 stoch_rsi_cross_up = True
-            if stoch_rsi_k[-i-1] >= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] < stoch_rsi_d[-i] and stoch_rsi_k[-i-1] > STOCH_OVERBOUGHT:
+            if stoch_rsi_k[-i-1] >= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] < stoch_rsi_d[-i] and stoch_rsi_k[-i-1] > STOCH_OVERBOUGHT and stoch_rsi_k[-1] > STOCH_OVERBOUGHT:
                 stoch_rsi_cross_down = True
         logger.info(f"{symbol} {timeframe} StochRSI K: {stoch_rsi_k}, D: {stoch_rsi_d}")
         logger.info(f"{symbol} {timeframe} stoch_rsi_cross_up: {stoch_rsi_cross_up}, stoch_rsi_cross_down: {stoch_rsi_cross_down}")
