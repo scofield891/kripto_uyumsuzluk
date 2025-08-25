@@ -8,10 +8,11 @@ from datetime import datetime, timedelta
 import pytz
 import sys
 import os
+
 # ================== Sabit Değerler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
 CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
-TEST_MODE = False
+TEST_MODE = False  # Gerçek veriyle çalışsın
 RSI_LOW = 40
 RSI_HIGH = 60
 EMA_THRESHOLD = 0.5
@@ -32,6 +33,7 @@ LOOKBACK_STOCH = 10
 STOCH_OVERBOUGHT = 70
 STOCH_OVERSOLD = 30
 USE_STOCH_RSI = True
+
 # ================== Logging ==================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -44,6 +46,7 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
+
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
 telegram_bot = telegram.Bot(
@@ -55,6 +58,7 @@ telegram_bot = telegram.Bot(
 )
 signal_cache = {}
 message_queue = asyncio.Queue()
+
 # ================== Mesaj Gönderici ==================
 async def message_sender():
     while True:
@@ -71,6 +75,7 @@ async def message_sender():
             await asyncio.sleep(5)
             await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
         message_queue.task_done()
+
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
@@ -79,6 +84,7 @@ def calculate_ema(closes, span):
     for i in range(1, len(closes)):
         ema[i] = (closes[i] * k) + (ema[i-1] * (1 - k))
     return ema
+
 def calculate_sma(closes, period):
     sma = np.zeros_like(closes, dtype=np.float64)
     for i in range(len(closes)):
@@ -87,6 +93,7 @@ def calculate_sma(closes, period):
         else:
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return np.zeros(len(closes), dtype=np.float64)
@@ -106,6 +113,7 @@ def calculate_rsi(closes, period=14):
         rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
         rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
     return rsi
+
 def calculate_rsi_ema(rsi, ema_length=14):
     ema = np.zeros_like(rsi, dtype=np.float64)
     if len(rsi) < ema_length:
@@ -115,6 +123,7 @@ def calculate_rsi_ema(rsi, ema_length=14):
     for i in range(ema_length, len(rsi)):
         ema[i] = (rsi[i] * alpha) + (ema[i-1] * (1 - alpha))
     return ema
+
 def calculate_macd(closes, timeframe):
     if timeframe == '1h':
         fast, slow, signal = 8, 17, 9
@@ -133,6 +142,7 @@ def calculate_macd(closes, timeframe):
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
 def calculate_stoch_rsi(df, rsi_period=14, stoch_period=14, d_period=3):
     rsi = calculate_rsi(df['close'].values, period=rsi_period)
     rsi_series = pd.Series(rsi)
@@ -141,6 +151,7 @@ def calculate_stoch_rsi(df, rsi_period=14, stoch_period=14, d_period=3):
     stoch_rsi = 100 * (rsi_series - rsi_low) / (rsi_high - rsi_low + 1e-9)
     d_line = stoch_rsi.rolling(d_period).mean()
     return stoch_rsi, d_line
+
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
@@ -150,6 +161,7 @@ def ensure_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=period).mean()
     return df
+
 def get_atr_values(df, lookback_atr=18):
     df = ensure_atr(df, period=14)
     if len(df) < lookback_atr + 2:
@@ -159,6 +171,7 @@ def get_atr_values(df, lookback_atr=18):
     atr_series = df['atr'].iloc[-(lookback_atr+1):-1]
     avg_atr_ratio = float(atr_series.mean() / close_last) if len(atr_series) else np.nan
     return atr_value, avg_atr_ratio
+
 def calculate_indicators(df, timeframe):
     df = df.copy()
     if len(df) < 80:
@@ -175,6 +188,7 @@ def calculate_indicators(df, timeframe):
     if np.any(np.isnan(df['ema13'])) or np.any(np.isnan(df['sma34'])) or np.any(np.isnan(df['stoch_rsi_k'])):
         logger.warning(f"NaN values detected in indicators for {symbol} {timeframe}")
     return df
+
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe, df=None):
     try:
@@ -239,6 +253,7 @@ async def check_signals(symbol, timeframe, df=None):
                 ema_sma_crossover_buy = True
             if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
                 ema_sma_crossover_sell = True
+        logger.info(f"{symbol} {timeframe} EMA/SMA Slice: EMA13={ema13_slice}, SMA34={sma34_slice}, Price={price_slice}")
         logger.info(f"{symbol} {timeframe} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
         # Pullback kontrolü
         recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
@@ -535,23 +550,36 @@ async def check_signals(symbol, timeframe, df=None):
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
         return
+
 # ================== Main ==================
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
     asyncio.create_task(message_sender())
     timeframes = ['4h']
-    symbols = ['GRASSUSDT']  # Sadece GRASSUSDT
+    symbols = [
+        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
+        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
+        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
+        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
+        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
+        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
+        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
+        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
+        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
+        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
+    ]
     while True:
         tasks = []
         for timeframe in timeframes:
             for symbol in symbols:
                 tasks.append(check_signals(symbol, timeframe))
-        batch_size = 1
+        batch_size = 20
         for i in range(0, len(tasks), batch_size):
             await asyncio.gather(*tasks[i:i+batch_size])
             await asyncio.sleep(3)
         logger.info("Taramalar tamam, 5 dk bekle...")
         await asyncio.sleep(300)
+
 if __name__ == "__main__":
     asyncio.run(main())
