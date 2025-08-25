@@ -8,11 +8,10 @@ from datetime import datetime, timedelta
 import pytz
 import sys
 import os
-
 # ================== Sabit Değerler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
 CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
-TEST_MODE = False
+TEST_MODE = True  # Test için True yap
 RSI_LOW = 40
 RSI_HIGH = 60
 EMA_THRESHOLD = 0.5
@@ -29,8 +28,10 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-USE_STOCH_RSI = True  # StochRSI opsiyonel teyit
-
+LOOKBACK_STOCH = 10  # StochRSI için son 10 mum
+STOCH_OVERBOUGHT = 70  # Short kesişim için >70
+STOCH_OVERSOLD = 30   # Long kesişim için <30
+USE_STOCH_RSI = True
 # ================== Logging ==================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -43,7 +44,6 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
-
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
 telegram_bot = telegram.Bot(
@@ -55,7 +55,6 @@ telegram_bot = telegram.Bot(
 )
 signal_cache = {}
 message_queue = asyncio.Queue()
-
 # ================== Mesaj Gönderici ==================
 async def message_sender():
     while True:
@@ -72,7 +71,6 @@ async def message_sender():
             await asyncio.sleep(5)
             await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
         message_queue.task_done()
-
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
@@ -81,7 +79,6 @@ def calculate_ema(closes, span):
     for i in range(1, len(closes)):
         ema[i] = (closes[i] * k) + (ema[i-1] * (1 - k))
     return ema
-
 def calculate_sma(closes, period):
     sma = np.zeros_like(closes, dtype=np.float64)
     for i in range(len(closes)):
@@ -90,7 +87,6 @@ def calculate_sma(closes, period):
         else:
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
-
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return np.zeros(len(closes), dtype=np.float64)
@@ -110,7 +106,6 @@ def calculate_rsi(closes, period=14):
         rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
         rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
     return rsi
-
 def calculate_rsi_ema(rsi, ema_length=14):
     ema = np.zeros_like(rsi, dtype=np.float64)
     if len(rsi) < ema_length:
@@ -120,7 +115,6 @@ def calculate_rsi_ema(rsi, ema_length=14):
     for i in range(ema_length, len(rsi)):
         ema[i] = (rsi[i] * alpha) + (ema[i-1] * (1 - alpha))
     return ema
-
 def calculate_macd(closes, timeframe):
     if timeframe == '1h':
         fast, slow, signal = 8, 17, 9
@@ -139,7 +133,6 @@ def calculate_macd(closes, timeframe):
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
-
 def calculate_stoch_rsi(df, rsi_period=14, stoch_period=14, d_period=3):
     rsi = calculate_rsi(df['close'].values, period=rsi_period)
     rsi_series = pd.Series(rsi)
@@ -148,7 +141,6 @@ def calculate_stoch_rsi(df, rsi_period=14, stoch_period=14, d_period=3):
     stoch_rsi = 100 * (rsi_series - rsi_low) / (rsi_high - rsi_low + 1e-9)
     d_line = stoch_rsi.rolling(d_period).mean()
     return stoch_rsi, d_line
-
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
@@ -158,7 +150,6 @@ def ensure_atr(df, period=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=period).mean()
     return df
-
 def get_atr_values(df, lookback_atr=18):
     df = ensure_atr(df, period=14)
     if len(df) < lookback_atr + 2:
@@ -168,7 +159,6 @@ def get_atr_values(df, lookback_atr=18):
     atr_series = df['atr'].iloc[-(lookback_atr+1):-1]
     avg_atr_ratio = float(atr_series.mean() / close_last) if len(atr_series) else np.nan
     return atr_value, avg_atr_ratio
-
 def calculate_indicators(df, timeframe):
     df = df.copy()
     if len(df) < 80:
@@ -183,7 +173,6 @@ def calculate_indicators(df, timeframe):
     df['stoch_rsi_k'], df['stoch_rsi_d'] = calculate_stoch_rsi(df)
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
     return df
-
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe, df=None):
     try:
@@ -246,16 +235,20 @@ async def check_signals(symbol, timeframe, df=None):
             if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and \
                price_slice[-i] < sma34_slice[-i]:
                 ema_sma_crossover_sell = True
-        # RSI-EMA Zone Bounce
-        zone_cross_up = (df['rsi_ema'].iloc[-2] < 45 <= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] > df['rsi_ema'].iloc[-2])
-        zone_cross_down = (df['rsi_ema'].iloc[-2] > 55 >= df['rsi_ema'].iloc[-1]) and (df['rsi_ema'].iloc[-1] < df['rsi_ema'].iloc[-2])
         # Pullback kontrolü
         recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
         pullback_long = (recent['close'] < recent['ema13']).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
         pullback_short = (recent['close'] > recent['ema13']).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
-        # StochRSI teyit
-        stoch_rsi_cross_up = (df['stoch_rsi_k'].iloc[-2] < df['stoch_rsi_d'].iloc[-2]) and (df['stoch_rsi_k'].iloc[-1] > df['stoch_rsi_d'].iloc[-1]) and (df['stoch_rsi_k'].iloc[-2] < 30)
-        stoch_rsi_cross_down = (df['stoch_rsi_k'].iloc[-2] > df['stoch_rsi_d'].iloc[-2]) and (df['stoch_rsi_k'].iloc[-1] < df['stoch_rsi_d'].iloc[-1]) and (df['stoch_rsi_k'].iloc[-2] > 70)
+        # StochRSI teyit (son 10 mum taraması)
+        stoch_rsi_k = df['stoch_rsi_k'].values[-(LOOKBACK_STOCH+1):]
+        stoch_rsi_d = df['stoch_rsi_d'].values[-(LOOKBACK_STOCH+1):]
+        stoch_rsi_cross_up = False
+        stoch_rsi_cross_down = False
+        for i in range(1, LOOKBACK_STOCH + 1):
+            if stoch_rsi_k[-i-1] <= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] > stoch_rsi_d[-i] and stoch_rsi_k[-i-1] < STOCH_OVERSOLD:
+                stoch_rsi_cross_up = True
+            if stoch_rsi_k[-i-1] >= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] < stoch_rsi_d[-i] and stoch_rsi_k[-i-1] > STOCH_OVERBOUGHT:
+                stoch_rsi_cross_down = True
         # Volume filtresi
         volume_ok = closed_candle['volume'] > 1.2 * closed_candle['volume_sma20']
         # MACD filtre
@@ -274,17 +267,16 @@ async def check_signals(symbol, timeframe, df=None):
             macd_ok_short = True
         logger.info(
             f"{symbol} {timeframe} | "
-            f"ZoneUp={zone_cross_up}, ZoneDown={zone_cross_down} | "
             f"PullLong={pullback_long}, PullShort={pullback_short} | "
             f"CrossBuy={ema_sma_crossover_buy}, CrossSell={ema_sma_crossover_sell} | "
             f"StochRSIUp={stoch_rsi_cross_up}, StochRSIDown={stoch_rsi_cross_down} | "
             f"VolumeOK={volume_ok} | "
             f"MACD_MODE={MACD_MODE} (up={macd_up}, hist_up={hist_up}) | "
-            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_rsi_cross_up and USE_STOCH_RSI)) else 'no'} | "
-            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_rsi_cross_down and USE_STOCH_RSI)) else 'no'}"
+            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and ema_sma_crossover_buy and stoch_rsi_cross_up else 'no'} | "
+            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and ema_sma_crossover_sell and stoch_rsi_cross_down else 'no'}"
         )
-        buy_condition = macd_ok_long and pullback_long and volume_ok and (zone_cross_up or ema_sma_crossover_buy or (stoch_rsi_cross_up and USE_STOCH_RSI))
-        sell_condition = macd_ok_short and pullback_short and volume_ok and (zone_cross_down or ema_sma_crossover_sell or (stoch_rsi_cross_down and USE_STOCH_RSI))
+        buy_condition = macd_ok_long and pullback_long and volume_ok and ema_sma_crossover_buy and stoch_rsi_cross_up
+        sell_condition = macd_ok_short and pullback_short and volume_ok and ema_sma_crossover_sell and stoch_rsi_cross_down
         # Pozisyon yönetimi (önce reversal check)
         current_pos = signal_cache.get(key, current_pos)
         current_price = float(df.iloc[-1]['close'])
@@ -364,7 +356,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
                         f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
-                        f"Zone Bounce: Up\n"
                         f"StochRSI Confirm: {stoch_rsi_cross_up}\n"
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -409,7 +400,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
                         f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
-                        f"Zone Bounce: Down\n"
                         f"StochRSI Confirm: {stoch_rsi_cross_down}\n"
                         f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -614,7 +604,6 @@ async def check_signals(symbol, timeframe, df=None):
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
         return
-
 # ================== Main ==================
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
@@ -644,6 +633,5 @@ async def main():
             await asyncio.sleep(3)
         logger.info("Taramalar tamam, 5 dk bekle...")
         await asyncio.sleep(300)
-
 if __name__ == "__main__":
     asyncio.run(main())
