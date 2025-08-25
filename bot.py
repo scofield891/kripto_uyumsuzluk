@@ -172,7 +172,7 @@ def get_atr_values(df, lookback_atr=18):
     avg_atr_ratio = float(atr_series.mean() / close_last) if len(atr_series) else np.nan
     return atr_value, avg_atr_ratio
 
-def calculate_indicators(df, timeframe):
+def calculate_indicators(df, timeframe, symbol):
     df = df.copy()
     if len(df) < 80:
         logger.warning(f"DF çok kısa, indikatör hesaplanamadı. Length: {len(df)}")
@@ -222,7 +222,7 @@ async def check_signals(symbol, timeframe, df=None):
                     logger.error(f"No data for {symbol} {timeframe}")
                     return
         # İndikatörler
-        df = calculate_indicators(df, timeframe)
+        df = calculate_indicators(df, timeframe, symbol)
         if df is None:
             return
         atr_value, avg_atr_ratio = get_atr_values(df, LOOKBACK_ATR)
