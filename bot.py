@@ -11,7 +11,7 @@ import os
 # ================== Sabit Değerler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
 CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
-TEST_MODE = True  # Test için True yap
+TEST_MODE = False
 RSI_LOW = 40
 RSI_HIGH = 60
 EMA_THRESHOLD = 0.5
@@ -28,9 +28,9 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 MACD_MODE = "regime"
 LOOKBACK_CROSSOVER = 10
-LOOKBACK_STOCH = 10  # StochRSI için son 10 mum
-STOCH_OVERBOUGHT = 70  # Short kesişim için >70
-STOCH_OVERSOLD = 30   # Long kesişim için <30
+LOOKBACK_STOCH = 10
+STOCH_OVERBOUGHT = 70
+STOCH_OVERSOLD = 30
 USE_STOCH_RSI = True
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -162,7 +162,7 @@ def get_atr_values(df, lookback_atr=18):
 def calculate_indicators(df, timeframe):
     df = df.copy()
     if len(df) < 80:
-        logger.warning("DF çok kısa, indikatör hesaplanamadı.")
+        logger.warning(f"DF çok kısa, indikatör hesaplanamadı. Length: {len(df)}")
         return None
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, span=13)
@@ -172,6 +172,8 @@ def calculate_indicators(df, timeframe):
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(closes, timeframe)
     df['stoch_rsi_k'], df['stoch_rsi_d'] = calculate_stoch_rsi(df)
     df['volume_sma20'] = df['volume'].rolling(window=20).mean()
+    if np.any(np.isnan(df['ema13'])) or np.any(np.isnan(df['sma34'])) or np.any(np.isnan(df['stoch_rsi_k'])):
+        logger.warning(f"NaN values detected in indicators for {symbol} {timeframe}")
     return df
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe, df=None):
@@ -184,14 +186,15 @@ async def check_signals(symbol, timeframe, df=None):
                 lows = closes - np.random.rand(200) * 0.02 * closes
                 volumes = np.random.rand(200) * 10000
                 ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
-                df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 logger.info(f"Test modu: {symbol} {timeframe}")
             else:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
-                        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
+                        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        logger.info(f"Data fetched for {symbol} {timeframe}, length: {len(df)}")
                         break
                     except (ccxt.RequestTimeout, ccxt.NetworkError):
                         logger.warning(f"Timeout/Network ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
@@ -202,6 +205,7 @@ async def check_signals(symbol, timeframe, df=None):
                         logger.warning(f"Skip {symbol} {timeframe}: {e.__class__.__name__} - {e}")
                         return
                 if df is None or df.empty:
+                    logger.error(f"No data for {symbol} {timeframe}")
                     return
         # İndikatörler
         df = calculate_indicators(df, timeframe)
@@ -212,6 +216,8 @@ async def check_signals(symbol, timeframe, df=None):
             logger.warning(f"ATR NaN/Inf ({symbol} {timeframe}), skip.")
             return
         closed_candle = df.iloc[-2]
+        current_price = float(df.iloc[-1]['close'])
+        logger.info(f"{symbol} {timeframe} Closed Candle Close: {closed_candle['close']:.4f}, Current Price: {current_price:.4f}")
         key = f"{symbol}_{timeframe}"
         current_pos = signal_cache.get(key, {
             'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -229,17 +235,17 @@ async def check_signals(symbol, timeframe, df=None):
         ema_sma_crossover_buy = False
         ema_sma_crossover_sell = False
         for i in range(1, LOOKBACK_CROSSOVER + 1):
-            if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and \
-               price_slice[-i] > sma34_slice[-i]:
+            if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
                 ema_sma_crossover_buy = True
-            if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and \
-               price_slice[-i] < sma34_slice[-i]:
+            if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
                 ema_sma_crossover_sell = True
+        logger.info(f"{symbol} {timeframe} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
         # Pullback kontrolü
         recent = df.iloc[-(LOOKBACK_CROSSOVER+1):-1]
         pullback_long = (recent['close'] < recent['ema13']).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
         pullback_short = (recent['close'] > recent['ema13']).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
-        # StochRSI teyit (son 10 mum taraması)
+        logger.info(f"{symbol} {timeframe} pullback_long: {pullback_long}, pullback_short: {pullback_short}")
+        # StochRSI teyit
         stoch_rsi_k = df['stoch_rsi_k'].values[-(LOOKBACK_STOCH+1):]
         stoch_rsi_d = df['stoch_rsi_d'].values[-(LOOKBACK_STOCH+1):]
         stoch_rsi_cross_up = False
@@ -249,62 +255,85 @@ async def check_signals(symbol, timeframe, df=None):
                 stoch_rsi_cross_up = True
             if stoch_rsi_k[-i-1] >= stoch_rsi_d[-i-1] and stoch_rsi_k[-i] < stoch_rsi_d[-i] and stoch_rsi_k[-i-1] > STOCH_OVERBOUGHT:
                 stoch_rsi_cross_down = True
+        logger.info(f"{symbol} {timeframe} StochRSI K: {stoch_rsi_k}, D: {stoch_rsi_d}")
+        logger.info(f"{symbol} {timeframe} stoch_rsi_cross_up: {stoch_rsi_cross_up}, stoch_rsi_cross_down: {stoch_rsi_cross_down}")
         # Volume filtresi
         volume_ok = closed_candle['volume'] > 1.2 * closed_candle['volume_sma20']
+        logger.info(f"{symbol} {timeframe} volume_ok: {volume_ok}")
         # MACD filtre
         macd_up = df['macd'].iloc[-2] > df['macd_signal'].iloc[-2]
         macd_down = df['macd'].iloc[-2] < df['macd_signal'].iloc[-2]
-        hist_up = df['macd_hist'].iloc[-2] > 0
-        hist_down = df['macd_hist'].iloc[-2] < 0
         if MACD_MODE == "and":
-            macd_ok_long = macd_up and hist_up
-            macd_ok_short = macd_down and hist_down
+            macd_ok_long = macd_up and df['macd_hist'].iloc[-2] > 0
+            macd_ok_short = macd_down and df['macd_hist'].iloc[-2] < 0
         elif MACD_MODE == "regime":
             macd_ok_long = macd_up
             macd_ok_short = macd_down
         else:
             macd_ok_long = True
             macd_ok_short = True
-        logger.info(
-            f"{symbol} {timeframe} | "
-            f"PullLong={pullback_long}, PullShort={pullback_short} | "
-            f"CrossBuy={ema_sma_crossover_buy}, CrossSell={ema_sma_crossover_sell} | "
-            f"StochRSIUp={stoch_rsi_cross_up}, StochRSIDown={stoch_rsi_cross_down} | "
-            f"VolumeOK={volume_ok} | "
-            f"MACD_MODE={MACD_MODE} (up={macd_up}, hist_up={hist_up}) | "
-            f"BUY_OK={'YES' if macd_ok_long and pullback_long and volume_ok and ema_sma_crossover_buy and stoch_rsi_cross_up else 'no'} | "
-            f"SELL_OK={'YES' if macd_ok_short and pullback_short and volume_ok and ema_sma_crossover_sell and stoch_rsi_cross_down else 'no'}"
-        )
+        logger.info(f"{symbol} {timeframe} macd_ok_long: {macd_ok_long}, macd_ok_short: {macd_ok_short}")
         buy_condition = macd_ok_long and pullback_long and volume_ok and ema_sma_crossover_buy and stoch_rsi_cross_up
         sell_condition = macd_ok_short and pullback_short and volume_ok and ema_sma_crossover_sell and stoch_rsi_cross_down
-        # Pozisyon yönetimi (önce reversal check)
+        logger.info(f"{symbol} {timeframe} buy_condition: {buy_condition}, sell_condition: {sell_condition}")
+        # Pozisyon yönetimi
         current_pos = signal_cache.get(key, current_pos)
-        current_price = float(df.iloc[-1]['close'])
         tz = pytz.timezone('Europe/Istanbul')
         now = datetime.now(tz)
         if buy_condition or sell_condition:
             new_signal = 'buy' if buy_condition else 'sell'
-            if current_pos['signal'] is not None and current_pos['signal'] != new_signal:
-                # Reversal close
-                if current_pos['signal'] == 'buy':
-                    profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100
-                    message_type = "LONG REVERSAL CLOSE 🚀" if profit_percent > 0 else "LONG REVERSAL STOP 📉"
-                    profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
+            if current_pos['signal'] is None:
+                entry_price = float(closed_candle['close'])
+                sl_price = entry_price - (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value) if buy_condition else entry_price + (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
+                if (buy_condition and current_price <= sl_price + INSTANT_SL_BUFFER * atr_value) or \
+                   (sell_condition and current_price >= sl_price - INSTANT_SL_BUFFER * atr_value):
+                    message = f"{symbol} {timeframe}: {new_signal.upper()} sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                    await message_queue.put(message)
+                    logger.info(message)
                 else:
-                    profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100
-                    message_type = "SHORT REVERSAL CLOSE 🚀" if profit_percent > 0 else "SHORT REVERSAL STOP 📉"
-                    profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
+                    tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value) if buy_condition else entry_price - (TP_MULTIPLIER1 * atr_value)
+                    tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value) if buy_condition else entry_price - (TP_MULTIPLIER2 * atr_value)
+                    trailing_distance = TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE
+                    current_pos = {
+                        'signal': new_signal,
+                        'entry_price': entry_price,
+                        'sl_price': sl_price,
+                        'tp1_price': tp1_price,
+                        'tp2_price': tp2_price,
+                        'highest_price': entry_price if buy_condition else None,
+                        'lowest_price': None if buy_condition else entry_price,
+                        'trailing_activated': False,
+                        'avg_atr_ratio': avg_atr_ratio,
+                        'trailing_distance': trailing_distance,
+                        'remaining_ratio': 1.0,
+                        'last_signal_time': now,
+                        'last_signal_type': new_signal,
+                        'entry_time': now,
+                        'tp1_hit': False,
+                        'tp2_hit': False
+                    }
+                    signal_cache[key] = current_pos
+                    message = (
+                        f"{symbol} {timeframe}: {new_signal.upper()} ({'LONG' if buy_condition else 'SHORT'}) 🚀\n"
+                        f"StochRSI Confirm: {stoch_rsi_cross_up if buy_condition else stoch_rsi_cross_down}\n"
+                        f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
+                        f"Time: {now.strftime('%H:%M:%S')}"
+                    )
+                    await message_queue.put(message)
+                    logger.info(f"Sinyal kuyruğa eklendi: {message}")
+            elif current_pos['signal'] != new_signal:
+                profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if current_pos['signal'] == 'buy' else ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100
+                message_type = "REVERSAL CLOSE 🚀" if profit_percent > 0 else "REVERSAL STOP 📉"
+                profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
                 message = (
                     f"{symbol} {timeframe}: {message_type}\n"
                     f"Price: {current_price:.4f}\n"
-                    f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                     f"{profit_text}\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
                 await message_queue.put(message)
                 logger.info(f"Reversal Close kuyruğa eklendi: {message}")
-                # Reset state
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None,
@@ -316,96 +345,6 @@ async def check_signals(symbol, timeframe, df=None):
                     'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False
                 }
-                current_pos = signal_cache[key]
-        # Sinyal açılışı
-        if buy_condition and current_pos['signal'] != 'buy':
-            if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'buy' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
-                message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                await message_queue.put(message)
-                logger.info(message)
-            else:
-                entry_price = float(closed_candle['close'])
-                sl_price = entry_price - (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
-                if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
-                    message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
-                    await message_queue.put(message)
-                    logger.info(message)
-                else:
-                    tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
-                    trailing_distance = (TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE)
-                    current_pos = {
-                        'signal': 'buy',
-                        'entry_price': entry_price,
-                        'sl_price': sl_price,
-                        'tp1_price': tp1_price,
-                        'tp2_price': tp2_price,
-                        'highest_price': entry_price,
-                        'lowest_price': None,
-                        'trailing_activated': False,
-                        'avg_atr_ratio': avg_atr_ratio,
-                        'trailing_distance': trailing_distance,
-                        'remaining_ratio': 1.0,
-                        'last_signal_time': now,
-                        'last_signal_type': 'buy',
-                        'entry_time': now,
-                        'tp1_hit': False,
-                        'tp2_hit': False
-                    }
-                    signal_cache[key] = current_pos
-                    message = (
-                        f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
-                        f"StochRSI Confirm: {stoch_rsi_cross_up}\n"
-                        f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                    await message_queue.put(message)
-                    logger.info(f"Sinyal kuyruğa eklendi: {message}")
-        elif sell_condition and current_pos['signal'] != 'sell':
-            if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'sell' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
-                message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                await message_queue.put(message)
-                logger.info(message)
-            else:
-                entry_price = float(closed_candle['close'])
-                sl_price = entry_price + (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value)
-                if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
-                    message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
-                    await message_queue.put(message)
-                    logger.info(message)
-                else:
-                    tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
-                    trailing_distance = (TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE)
-                    current_pos = {
-                        'signal': 'sell',
-                        'entry_price': entry_price,
-                        'sl_price': sl_price,
-                        'tp1_price': tp1_price,
-                        'tp2_price': tp2_price,
-                        'highest_price': None,
-                        'lowest_price': entry_price,
-                        'trailing_activated': False,
-                        'avg_atr_ratio': avg_atr_ratio,
-                        'trailing_distance': trailing_distance,
-                        'remaining_ratio': 1.0,
-                        'last_signal_time': now,
-                        'last_signal_type': 'sell',
-                        'entry_time': now,
-                        'tp1_hit': False,
-                        'tp2_hit': False
-                    }
-                    signal_cache[key] = current_pos
-                    message = (
-                        f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
-                        f"StochRSI Confirm: {stoch_rsi_cross_down}\n"
-                        f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                    await message_queue.put(message)
-                    logger.info(f"Sinyal kuyruğa eklendi: {message}")
         # Pozisyon yönetimi
         if current_pos['signal'] == 'buy':
             atr_value, _ = get_atr_values(df, LOOKBACK_ATR)
@@ -418,15 +357,11 @@ async def check_signals(symbol, timeframe, df=None):
                 current_pos['trailing_activated'] = True
                 trailing_sl = current_pos['highest_price'] - (td * atr_value)
                 current_pos['sl_price'] = max(current_pos['sl_price'], trailing_sl)
-                profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100
                 message = (
                     f"{symbol} {timeframe}: TRAILING ACTIVE 🚧\n"
                     f"Current Price: {current_price:.4f}\n"
                     f"Entry Price: {current_pos['entry_price']:.4f}\n"
                     f"New SL: {current_pos['sl_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"Vol Ratio: {current_pos['avg_atr_ratio']:.4f}\n"
-                    f"TSL Distance: {td}\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
                 await message_queue.put(message)
@@ -470,7 +405,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: LONG 🚀\n"
                         f"Price: {current_price:.4f}\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Profit: {profit_percent:.2f}%\nPARAYI VURDUK 🚀\n"
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -479,7 +413,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: STOP LONG 📉\n"
                         f"Price: {current_price:.4f}\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Loss: {profit_percent:.2f}%\nSTOP 😞\n"
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -562,7 +495,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: SHORT 🚀\n"
                         f"Price: {current_price:.4f}\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Profit: {profit_percent:.2f}%\nPARAYI VURDUK 🚀\n"
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -571,7 +503,6 @@ async def check_signals(symbol, timeframe, df=None):
                     message = (
                         f"{symbol} {timeframe}: STOP SHORT 📉\n"
                         f"Price: {current_price:.4f}\n"
-                        f"RSI_EMA: {closed_candle['rsi_ema']:.2f}\n"
                         f"Loss: {profit_percent:.2f}%\nSTOP 😞\n"
                         f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                         f"Time: {now.strftime('%H:%M:%S')}"
@@ -610,24 +541,13 @@ async def main():
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
     asyncio.create_task(message_sender())
     timeframes = ['4h']
-    symbols = [
-        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
-        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
-        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
-        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
-        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
-        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
-        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
-        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
-        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
-        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
-    ]
+    symbols = ['GRASSUSDT']  # Sadece GRASSUSDT
     while True:
         tasks = []
         for timeframe in timeframes:
             for symbol in symbols:
                 tasks.append(check_signals(symbol, timeframe))
-        batch_size = 20
+        batch_size = 1
         for i in range(0, len(tasks), batch_size):
             await asyncio.gather(*tasks[i:i+batch_size])
             await asyncio.sleep(3)
