@@ -191,6 +191,7 @@ def calculate_indicators(df, timeframe):
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
+    tz = pytz.timezone('Europe/Istanbul')  # tz'yi burada tanımla
     try:
         if TEST_MODE:
             closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
@@ -276,7 +277,11 @@ async def check_signals(symbol, timeframe='4h'):
         smi_condition_short = smi_squeeze_off and (smi_histogram < 0 or smi_color == 'red')
         logger.info(f"{symbol} {timeframe} SMI_squeeze_off: {smi_squeeze_off}, SMI_histogram: {smi_histogram:.2f}, SMI_color: {smi_color}")
         logger.info(f"{symbol} {timeframe} SMI_long_condition: {smi_condition_long}, SMI_short_condition: {smi_condition_short}")
-        logger.info(f"{symbol} {timeframe} ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, ADX_condition: {adx_condition}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
+
+        adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
+        di_plus_value = f"{closed_candle['di_plus']:.2f}" if pd.notna(closed_candle['di_plus']) else 'NaN'
+        di_minus_value = f"{closed_candle['di_minus']:.2f}" if pd.notna(closed_candle['di_minus']) else 'NaN'
+        logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
 
         buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and di_condition_long
         sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and di_condition_short
@@ -284,7 +289,6 @@ async def check_signals(symbol, timeframe='4h'):
 
         current_pos = signal_cache.get(key, current_pos)
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-        tz = pytz.timezone('Europe/Istanbul')
         now = datetime.now(tz)
 
         if buy_condition and sell_condition:
@@ -349,7 +353,7 @@ async def check_signals(symbol, timeframe='4h'):
                         message = (
                             f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
                             f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                            f"ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, DI+: {closed_candle['di_plus']:.2f if pd.notna(closed_candle['di_plus']) else 'NaN'}, DI-: {closed_candle['di_minus']:.2f if pd.notna(closed_candle['di_minus']) else 'NaN'}\n"
+                            f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
                         )
@@ -389,7 +393,7 @@ async def check_signals(symbol, timeframe='4h'):
                         message = (
                             f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
                             f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                            f"ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, DI+: {closed_candle['di_plus']:.2f if pd.notna(closed_candle['di_plus']) else 'NaN'}, DI-: {closed_candle['di_minus']:.2f if pd.notna(closed_candle['di_minus']) else 'NaN'}\n"
+                            f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
                         )
@@ -529,14 +533,14 @@ async def check_signals(symbol, timeframe='4h'):
 
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
-        await message_queue.put(f"{symbol} {timeframe}: KRİTİK HATA ⚠️\n{str(e)}\nTime: {datetime.now(tz).strftime('%H:%M:%S')}")
+        await message_queue.put(f"{symbol} {timeframe}: KRİTİK HATA ⚠️\n{str(e)}\nTime: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
         return
 
 # ================== Main ==================
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    timeframes = ['4h'] # Backtest'e göre uyarlandı, sadece 4h
+    timeframes = ['4h']  # Backtest'e göre uyarlandı, sadece 4h
     symbols = [
         'ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'FARTCOIN/USDT', '1000PEPE/USDT', 'ADA/USDT', 'SUI/USDT', 'WIF/USDT',
         'ENA/USDT', 'PENGU/USDT', '1000BONK/USDT', 'HYPE/USDT', 'AVAX/USDT', 'MOODENG/USDT', 'LINK/USDT', 'PUMPFUN/USDT', 'LTC/USDT', 'TRUMP/USDT',
