@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import telegram
 import logging
-from logging.handlers import RotatingFileHandler  # Doğrudan import
 import asyncio
 from datetime import datetime, timedelta
 import pytz
@@ -14,7 +13,7 @@ import pandas_ta as ta
 # ================== Sabit Değerler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
 CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
-TEST_MODE = False  # Test için True, gerçek veri için False
+TEST_MODE = False
 TRAILING_ACTIVATION = 0.8
 TRAILING_DISTANCE_BASE = 1.5
 TRAILING_DISTANCE_HIGH_VOL = 2.5
@@ -38,9 +37,11 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
-file_handler = RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5)
+file_handler = logging.FileHandler('bot.log')  # Render'da çalışan FileHandler
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+logging.getLogger('telegram').setLevel(logging.ERROR)  # Gereksiz logları bastır
+logging.getLogger('httpx').setLevel(logging.ERROR)
 
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
