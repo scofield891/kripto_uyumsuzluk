@@ -120,8 +120,8 @@ def calculate_smi(df):
     kc_upper = kc_middle + 1.5 * df['atr'].values
     kc_lower = kc_middle - 1.5 * df['atr'].values
 
-    # Squeeze Durumu
-    squeeze_on = (bb_upper < kc_upper) and (bb_lower > kc_lower)
+    # Squeeze Durumu (son mum için)
+    squeeze_on = (bb_upper[-1] < kc_upper[-1]) and (bb_lower[-1] > kc_lower[-1])
     squeeze_off = not squeeze_on
 
     # Momentum Histogramı
@@ -200,7 +200,7 @@ async def check_signals(symbol):
             logger.warning(f"ATR NaN/Inf ({symbol}), skip.")
             return
         closed_candle = df.iloc[-2]
-        current_price = float(df.iloc[-1]['close'])
+        current_price = float(df['close'].iloc[-1])
         logger.info(f"{symbol} Closed Candle Close: {closed_candle['close']:.4f}, Current Price: {current_price:.4f}")
         key = f"{symbol}_4h"
         current_pos = signal_cache.get(key, {
