@@ -1,4 +1,5 @@
-pandas
-numpy
 ccxt
+numpy
+pandas
 python-telegram-bot
+pandas-ta
