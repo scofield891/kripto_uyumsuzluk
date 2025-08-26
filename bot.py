@@ -26,7 +26,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 LOOKBACK_CROSSOVER = 10
 LOOKBACK_SMI = 20
-ADX_THRESHOLD = 25
+ADX_THRESHOLD = 21
 ADX_PERIOD = 14
 
 # ================== Logging ==================
@@ -262,12 +262,6 @@ async def check_signals(symbol, timeframe='4h'):
                     ema_sma_crossover_sell = True
         logger.info(f"{symbol} {timeframe} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
 
-        recent = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
-        ema13_recent = df['ema13'].values[-LOOKBACK_CROSSOVER-1:-1]
-        pullback_long = (recent < ema13_recent).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
-        pullback_short = (recent > ema13_recent).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
-        logger.info(f"{symbol} {timeframe} pullback_long: {pullback_long}, pullback_short: {pullback_short}")
-
         volume_multiplier = 1.0 + min(avg_atr_ratio * 3, 0.2) if np.isfinite(avg_atr_ratio) else 1.0
         volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
         logger.info(f"{symbol} {timeframe} volume_ok: {volume_ok}, multiplier: {volume_multiplier:.2f}")
@@ -278,17 +272,15 @@ async def check_signals(symbol, timeframe='4h'):
         logger.info(f"{symbol} {timeframe} SMI_long_condition: {smi_condition_long}, SMI_short_condition: {smi_condition_short}")
 
         adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
-        di_plus_value = f"{closed_candle['di_plus']:.2f}" if pd.notna(closed_candle['di_plus']) else 'NaN'
-        di_minus_value = f"{closed_candle['di_minus']:.2f}" if pd.notna(closed_candle['di_minus']) else 'NaN'
         logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}")
 
         # ADX yükselme kontrolü
         adx_rising = df['adx'].iloc[-2] > df['adx'].iloc[-3] if pd.notna(df['adx'].iloc[-2]) and pd.notna(df['adx'].iloc[-3]) else False
         logger.info(f"{symbol} {timeframe} ADX_rising: {adx_rising}")
 
-        # DI+/DI- kaldırılarak sadeleştirilmiş koşullar
-        buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and adx_rising
-        sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and adx_rising
+        # Pullback kaldırıldı, EMA/SMA kesişimi ile yön
+        buy_condition = ema_sma_crossover_buy and volume_ok and smi_condition_long and adx_condition and adx_rising
+        sell_condition = ema_sma_crossover_sell and volume_ok and smi_condition_short and adx_condition and adx_rising
         logger.info(f"{symbol} {timeframe} buy_condition: {buy_condition}, sell_condition: {sell_condition}")
 
         current_pos = signal_cache.get(key, current_pos)
