@@ -201,8 +201,8 @@ async def check_signals(symbol, timeframe='4h'):
             for attempt in range(max_retries):
                 try:
                     markets = exchange.load_markets()
-                    if not markets.get(symbol, {}).get('active', False):
-                        logger.warning(f"{symbol} aktif değil, skip.")
+                    if symbol not in markets:
+                        logger.warning(f"{symbol} {timeframe}: Sembol borsada bulunamadı, skip.")
                         return
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
