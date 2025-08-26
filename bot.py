@@ -26,6 +26,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 LOOKBACK_CROSSOVER = 10
 LOOKBACK_SMI = 20
+MACD_MODE = "regime"  # Sabit net tanımlandı
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -68,7 +69,7 @@ async def message_sender():
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
     ema = np.zeros(len(closes), dtype=np.float64)
-    ema[0] = closes[0] if closes[0] != 0 else np.mean(closes[1:span+1])  # İlk değer sıfır değilse al, yoksa ortalama
+    ema[0] = closes[0] if closes[0] != 0 else np.mean(closes[1:span+1])
     for i in range(1, len(closes)):
         ema[i] = closes[i] * k + ema[i-1] * (1 - k)
     return ema
@@ -167,12 +168,12 @@ def calculate_indicators(df):
 async def check_signals(symbol):
     try:
         if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(250))) * 0.05 + 0.3  # 250 mum, ilk 50 atılacak
+            closes = np.abs(np.cumsum(np.random.randn(250))) * 0.05 + 0.3
             highs = closes + np.random.rand(250) * 0.02 * closes
             lows = closes - np.random.rand(250) * 0.02 * closes
             volumes = np.random.rand(250) * 10000
             ohlcv = [[i*3600, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(250)]
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).iloc[50:]  # İlk 50 mum at
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).iloc[50:]
             logger.info(f"Test modu: {symbol}")
         else:
             max_retries = 3
@@ -222,10 +223,11 @@ async def check_signals(symbol):
         ema_sma_crossover_buy = False
         ema_sma_crossover_sell = False
         for i in range(1, LOOKBACK_CROSSOVER + 1):
-            if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
-                ema_sma_crossover_buy = True
-            if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
-                ema_sma_crossover_sell = True
+            if 0 <= i < len(ema13_slice):  # Güvenli indeks kontrolü
+                if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
+                    ema_sma_crossover_buy = True
+                if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
+                    ema_sma_crossover_sell = True
         logger.info(f"{symbol} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
         # Pullback kontrolü
         recent = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
