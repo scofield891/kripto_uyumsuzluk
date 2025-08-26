@@ -538,6 +538,7 @@ async def check_signals(symbol, timeframe='4h'):
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
+    asyncio.create_task(message_sender())  # Mesaj göndericiyi başlat
     timeframes = ['4h']  # Backtest'e göre uyarlandı, sadece 4h
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
