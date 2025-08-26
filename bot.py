@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import telegram
 import logging
-import logging.handlers  # Yeni eklenen satır
+from logging.handlers import RotatingFileHandler  # Doğrudan import
 import asyncio
 from datetime import datetime, timedelta
 import pytz
@@ -38,7 +38,6 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
-from logging.handlers import RotatingFileHandler
 file_handler = RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
