@@ -191,10 +191,10 @@ def calculate_indicators(df, timeframe):
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
-    tz = pytz.timezone('Europe/Istanbul')  # tz'yi burada tanımla
+    tz = pytz.timezone('Europe/Istanbul')  # tz'yi fonksiyon başında tanımla
     try:
         if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
+            closes = np.abs(np.cumsum(np.random.randn(200)) ) * 0.05 + 0.3
             highs = closes + np.random.rand(200) * 0.02 * closes
             lows = closes - np.random.rand(200) * 0.02 * closes
             volumes = np.random.rand(200) * 10000
@@ -281,7 +281,7 @@ async def check_signals(symbol, timeframe='4h'):
         adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
         di_plus_value = f"{closed_candle['di_plus']:.2f}" if pd.notna(closed_candle['di_plus']) else 'NaN'
         di_minus_value = f"{closed_candle['di_minus']:.2f}" if pd.notna(closed_candle['di_minus']) else 'NaN'
-        logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
+        logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}, DI+: {di_plus_value}, DI-: {di_minus_value}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
 
         buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and di_condition_long
         sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and di_condition_short
@@ -352,7 +352,7 @@ async def check_signals(symbol, timeframe='4h'):
                         signal_cache[key] = current_pos
                         message = (
                             f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                            f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
+                            f"SMI: {smi_str}\n"
                             f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
@@ -392,7 +392,7 @@ async def check_signals(symbol, timeframe='4h'):
                         signal_cache[key] = current_pos
                         message = (
                             f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                            f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
+                            f"SMI: {smi_str}\n"
                             f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
@@ -540,18 +540,18 @@ async def check_signals(symbol, timeframe='4h'):
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    timeframes = ['4h']  # Backtest'e göre uyarlandı, sadece 4h
+    timeframes = ['4h'] # Backtest'e göre uyarlandı, sadece 4h
     symbols = [
-        'ETH/USDT', 'BTC/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'FARTCOIN/USDT', '1000PEPE/USDT', 'ADA/USDT', 'SUI/USDT', 'WIF/USDT',
-        'ENA/USDT', 'PENGU/USDT', '1000BONK/USDT', 'HYPE/USDT', 'AVAX/USDT', 'MOODENG/USDT', 'LINK/USDT', 'PUMPFUN/USDT', 'LTC/USDT', 'TRUMP/USDT',
-        'AAVE/USDT', 'ARB/USDT', 'NEAR/USDT', 'ONDO/USDT', 'POPCAT/USDT', 'TON/USDT', 'OP/USDT', '1000FLOKI/USDT', 'SEI/USDT', 'HBAR/USDT',
-        'WLD/USDT', 'BNB/USDT', 'UNI/USDT', 'XLM/USDT', 'CRV/USDT', 'VIRTUAL/USDT', 'AI16Z/USDT', 'TIA/USDT', 'TAO/USDT', 'APT/USDT',
-        'DOT/USDT', 'SPX/USDT', 'ETC/USDT', 'LDO/USDT', 'BCH/USDT', 'INJ/USDT', 'KAS/USDT', 'ALGO/USDT', 'TRX/USDT', 'IP/USDT',
-        'FIL/USDT', 'STX/USDT', 'ATOM/USDT', 'RUNE/USDT', 'THETA/USDT', 'FET/USDT', 'AXS/USDT', 'SAND/USDT', 'MANA/USDT', 'CHZ/USDT',
-        'APE/USDT', 'GALA/USDT', 'IMX/USDT', 'DYDX/USDT', 'GMT/USDT', 'EGLD/USDT', 'ZK/USDT', 'NOT/USDT', 'ENS/USDT', 'JUP/USDT',
-        'ATH/USDT', 'ICP/USDT', 'STRK/USDT', 'ORDI/USDT', 'PENDLE/USDT', 'PNUT/USDT', 'RENDER/USDT', 'OM/USDT', 'ZORA/USDT', 'S/USDT',
-        'GRASS/USDT', 'TRB/USDT', 'MOVE/USDT', 'XAUT/USDT', 'POL/USDT', 'CVX/USDT', 'BRETT/USDT', 'SAROS/USDT', 'GOAT/USDT', 'AERO/USDT',
-        'JTO/USDT', 'HYPER/USDT', 'ETHFI/USDT', 'BERA/USDT'
+        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
+        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
+        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
+        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
+        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
+        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
+        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
+        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
+        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
+        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
     while True:
         tasks = []
