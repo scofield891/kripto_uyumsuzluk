@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import telegram
 import logging
+import logging.handlers  # Yeni eklenen satır
 import asyncio
 from datetime import datetime, timedelta
 import pytz
