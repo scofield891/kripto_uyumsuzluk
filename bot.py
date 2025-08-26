@@ -68,7 +68,7 @@ async def message_sender():
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
     ema = np.zeros(len(closes), dtype=np.float64)
-    ema[0] = closes[0]
+    ema[0] = closes[0] if closes[0] != 0 else np.mean(closes[1:span+1])  # İlk değer sıfır değilse al, yoksa ortalama
     for i in range(1, len(closes)):
         ema[i] = closes[i] * k + ema[i-1] * (1 - k)
     return ema
@@ -87,7 +87,7 @@ def calculate_macd(closes):
     def ema(x, n):
         k = 2 / (n + 1)
         e = np.zeros(len(x), dtype=np.float64)
-        e[0] = x[0]
+        e[0] = x[0] if x[0] != 0 else np.mean(x[1:n+1])
         for i in range(1, len(x)):
             e[i] = x[i] * k + e[i-1] * (1 - k)
         return e
@@ -104,7 +104,7 @@ def ensure_atr(df, period=20):
         high_close = (df['high'] - df['close'].shift()).abs()
         low_close = (df['low'] - df['close'].shift()).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(window=period).mean()
+        df['atr'] = tr.rolling(window=period).mean().fillna(0)
     return df
 
 def calculate_smi(df):
@@ -158,7 +158,7 @@ def calculate_indicators(df):
     df['ema13'] = calculate_ema(closes, 13)
     df['sma34'] = calculate_sma(closes, 34)
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(closes)
-    df['volume_sma20'] = df['volume'].rolling(window=20).mean()
+    df['volume_sma20'] = df['volume'].rolling(window=20).mean().fillna(0)
     df['atr'] = ensure_atr(df)['atr']
     smi_squeeze_off, smi_histogram, smi_color = calculate_smi(df)
     return df, smi_squeeze_off, smi_histogram, smi_color
@@ -167,12 +167,12 @@ def calculate_indicators(df):
 async def check_signals(symbol):
     try:
         if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
-            highs = closes + np.random.rand(200) * 0.02 * closes
-            lows = closes - np.random.rand(200) * 0.02 * closes
-            volumes = np.random.rand(200) * 10000
-            ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            closes = np.abs(np.cumsum(np.random.randn(250))) * 0.05 + 0.3  # 250 mum, ilk 50 atılacak
+            highs = closes + np.random.rand(250) * 0.02 * closes
+            lows = closes - np.random.rand(250) * 0.02 * closes
+            volumes = np.random.rand(250) * 10000
+            ohlcv = [[i*3600, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(250)]
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).iloc[50:]  # İlk 50 mum at
             logger.info(f"Test modu: {symbol}")
         else:
             max_retries = 3
@@ -213,9 +213,12 @@ async def check_signals(symbol):
             'tp1_hit': False, 'tp2_hit': False
         })
         # EMA/SMA crossover check
-        ema13_slice = df['ema13'][-LOOKBACK_CROSSOVER-1:]
-        sma34_slice = df['sma34'][-LOOKBACK_CROSSOVER-1:]
-        price_slice = df['close'][-LOOKBACK_CROSSOVER-1:]
+        ema13_slice = df['ema13'].values[-LOOKBACK_CROSSOVER-1:]
+        sma34_slice = df['sma34'].values[-LOOKBACK_CROSSOVER-1:]
+        price_slice = df['close'].values[-LOOKBACK_CROSSOVER-1:]
+        if len(ema13_slice) <= LOOKBACK_CROSSOVER:
+            logger.warning(f"Veri yetersiz ({symbol}), skip.")
+            return
         ema_sma_crossover_buy = False
         ema_sma_crossover_sell = False
         for i in range(1, LOOKBACK_CROSSOVER + 1):
@@ -225,9 +228,10 @@ async def check_signals(symbol):
                 ema_sma_crossover_sell = True
         logger.info(f"{symbol} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
         # Pullback kontrolü
-        recent = df['close'][-LOOKBACK_CROSSOVER-1:-1]
-        pullback_long = (recent < df['ema13'][-LOOKBACK_CROSSOVER-1:-1]).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
-        pullback_short = (recent > df['ema13'][-LOOKBACK_CROSSOVER-1:-1]).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
+        recent = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
+        ema13_recent = df['ema13'].values[-LOOKBACK_CROSSOVER-1:-1]
+        pullback_long = (recent < ema13_recent).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
+        pullback_short = (recent > ema13_recent).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
         logger.info(f"{symbol} pullback_long: {pullback_long}, pullback_short: {pullback_short}")
         # Volume filtresi
         volume_ok = closed_candle['volume'] > 1.0 * closed_candle['volume_sma20']
