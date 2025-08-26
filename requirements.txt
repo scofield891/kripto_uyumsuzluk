@@ -1,5 +1,5 @@
 ccxt
-numpy
-pandas
+numpy==1.26.4
+pandas==2.2.3
 python-telegram-bot
-pandas-ta
+pandas-ta==0.3.14b0
