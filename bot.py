@@ -92,7 +92,7 @@ def calculate_sma(closes, period):
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
 
-def calculate_adx(df, period=ADX_PERIOD):
+def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['high_diff'] = df['high'] - df['high'].shift(1)
     df['low_diff'] = df['low'].shift(1) - df['low']
     df['+DM'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
@@ -114,6 +114,20 @@ def calculate_adx(df, period=ADX_PERIOD):
     logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df, adx_condition, di_condition_long, di_condition_short
 
+def calculate_indicators(df, symbol, timeframe):
+    if len(df) < 80:
+        logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
+        return None, None, None, None, None, None, None
+    closes = df['close'].values.astype(np.float64)
+    df['ema13'] = calculate_ema(closes, 13)
+    df['sma34'] = calculate_sma(closes, 34)
+    df['volume_sma20'] = df['volume'].rolling(20).mean().ffill()
+    df = calculate_bb(df)
+    df = calculate_kc(df)
+    df = calculate_squeeze(df)
+    df = calculate_smi_momentum(df)
+    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)  # symbol eklendi
+    return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 def calculate_bb(df, period=20, mult=2.0):
     df['bb_mid'] = df['close'].rolling(period).mean()
     df['bb_std'] = df['close'].rolling(period).std()
