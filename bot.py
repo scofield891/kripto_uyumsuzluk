@@ -191,10 +191,10 @@ def calculate_indicators(df, timeframe):
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
-    tz = pytz.timezone('Europe/Istanbul')  # tz'yi fonksiyon başında tanımla
+    tz = pytz.timezone('Europe/Istanbul')
     try:
         if TEST_MODE:
-            closes = np.abs(np.cumsum(np.random.randn(200)) ) * 0.05 + 0.3
+            closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
             highs = closes + np.random.rand(200) * 0.02 * closes
             lows = closes - np.random.rand(200) * 0.02 * closes
             volumes = np.random.rand(200) * 10000
@@ -205,10 +205,6 @@ async def check_signals(symbol, timeframe='4h'):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    markets = exchange.load_markets()
-                    if symbol not in markets:
-                        logger.warning(f"{symbol} {timeframe}: Sembol borsada bulunamadı, skip.")
-                        return
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     break
@@ -291,6 +287,8 @@ async def check_signals(symbol, timeframe='4h'):
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
         now = datetime.now(tz)
 
+        smi_value = f"{closed_candle['smi']:.2f}" if pd.notna(closed_candle['smi']) else 'NaN'
+
         if buy_condition and sell_condition:
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
             return
@@ -352,7 +350,7 @@ async def check_signals(symbol, timeframe='4h'):
                         signal_cache[key] = current_pos
                         message = (
                             f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                            f"SMI: {smi_str}\n"
+                            f"SMI: {smi_value}\n"
                             f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
@@ -392,7 +390,7 @@ async def check_signals(symbol, timeframe='4h'):
                         signal_cache[key] = current_pos
                         message = (
                             f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                            f"SMI: {smi_str}\n"
+                            f"SMI: {smi_value}\n"
                             f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
@@ -540,7 +538,7 @@ async def check_signals(symbol, timeframe='4h'):
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    timeframes = ['4h'] # Backtest'e göre uyarlandı, sadece 4h
+    timeframes = ['4h']  # Backtest'e göre uyarlandı, sadece 4h
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
         'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
