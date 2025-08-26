@@ -114,20 +114,6 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df, adx_condition, di_condition_long, di_condition_short
 
-def calculate_indicators(df, symbol, timeframe):
-    if len(df) < 80:
-        logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
-        return None, None, None, None, None, None, None
-    closes = df['close'].values.astype(np.float64)
-    df['ema13'] = calculate_ema(closes, 13)
-    df['sma34'] = calculate_sma(closes, 34)
-    df['volume_sma20'] = df['volume'].rolling(20).mean().ffill()
-    df = calculate_bb(df)
-    df = calculate_kc(df)
-    df = calculate_squeeze(df)
-    df = calculate_smi_momentum(df)
-    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)  # symbol eklendi
-    return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 def calculate_bb(df, period=20, mult=2.0):
     df['bb_mid'] = df['close'].rolling(period).mean()
     df['bb_std'] = df['close'].rolling(period).std()
@@ -191,7 +177,7 @@ def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
     avg_atr_ratio = float(atr_series.mean() / close_last) if len(atr_series) and pd.notna(close_last) and close_last != 0 else np.nan
     return atr_value, avg_atr_ratio
 
-def calculate_indicators(df, timeframe):
+def calculate_indicators(df, symbol, timeframe):
     if len(df) < 80:
         logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
         return None, None, None, None, None, None, None
@@ -203,7 +189,7 @@ def calculate_indicators(df, timeframe):
     df = calculate_kc(df)
     df = calculate_squeeze(df)
     df = calculate_smi_momentum(df)
-    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df)
+    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)
     return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 
 # ================== Sinyal Döngüsü ==================
@@ -237,7 +223,7 @@ async def check_signals(symbol, timeframe='4h'):
                 logger.warning(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), skip.")
                 return
 
-        df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short = calculate_indicators(df, timeframe)
+        df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short = calculate_indicators(df, symbol, timeframe)
         if df is None:
             return
 
