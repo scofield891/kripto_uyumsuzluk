@@ -1,16 +1,17 @@
 import ccxt
 import numpy as np
 import pandas as pd
-from telegram import Bot
+import telegram
 import logging
 import asyncio
 from datetime import datetime, timedelta
 import pytz
 import sys
+import os
 
 # ================== Sabit Değerler ==================
-BOT_TOKEN = "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ"
-CHAT_ID = '-1002878297025'
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
+CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
 TEST_MODE = False
 TRAILING_ACTIVATION = 0.8
 TRAILING_DISTANCE_BASE = 1.5
@@ -18,8 +19,8 @@ TRAILING_DISTANCE_HIGH_VOL = 2.5
 VOLATILITY_THRESHOLD = 0.02
 LOOKBACK_ATR = 18
 SL_MULTIPLIER = 1.8
-TP_MULTIPLIER1 = 2.0  # TP1 for 30% take profit
-TP_MULTIPLIER2 = 3.5  # TP2 for 40% take profit
+TP_MULTIPLIER1 = 2.0
+TP_MULTIPLIER2 = 3.5
 SL_BUFFER = 0.3
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
@@ -43,8 +44,31 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}, 'timeout': 60000})
-telegram_bot = Bot(token=BOT_TOKEN)
+telegram_bot = telegram.Bot(
+    token=BOT_TOKEN,
+    request=telegram.request.HTTPXRequest(
+        connection_pool_size=20,
+        pool_timeout=30.0
+    )
+)
 signal_cache = {}
+message_queue = asyncio.Queue()
+
+# ================== Mesaj Gönderici ==================
+async def message_sender():
+    while True:
+        message = await message_queue.get()
+        try:
+            await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
+            await asyncio.sleep(1)
+        except (telegram.error.RetryAfter, telegram.error.TimedOut) as e:
+            wait_time = getattr(e, 'retry_after', 5) + 2
+            logger.warning(f"Error: {type(e).__name__}, {wait_time-2} saniye bekle")
+            await asyncio.sleep(wait_time)
+            await message_queue.put(message)
+        except Exception as e:
+            logger.error(f"Telegram mesaj hatası: {str(e)}")
+        message_queue.task_done()
 
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
@@ -73,11 +97,15 @@ def calculate_adx(df, period=ADX_PERIOD):
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close = np.abs(df['low'] - df['close'].shift(1))
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
-    df['+DI'] = 100 * (df['+DM'].ewm(span=period, adjust=False).mean() / df['TR'].ewm(span=period, adjust=False).mean())
-    df['-DI'] = 100 * (df['-DM'].ewm(span=period, adjust=False).mean() / df['TR'].ewm(span=period, adjust=False).mean())
-    df['DX'] = 100 * np.abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']).replace(0, np.nan)
-    df['ADX'] = df['DX'].ewm(span=period, adjust=False).mean()
-    return df
+    tr_ema = df['TR'].ewm(span=period, adjust=False).mean()
+    df['di_plus'] = 100 * (df['+DM'].ewm(span=period, adjust=False).mean() / tr_ema.replace(0, np.nan))
+    df['di_minus'] = 100 * (df['-DM'].ewm(span=period, adjust=False).mean() / tr_ema.replace(0, np.nan))
+    df['DX'] = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan)
+    df['adx'] = df['DX'].ewm(span=period, adjust=False).mean()
+    adx_condition = df['adx'].iloc[-2] > ADX_THRESHOLD if pd.notna(df['adx'].iloc[-2]) else False
+    di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
+    di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
+    return df, adx_condition, di_condition_long, di_condition_short
 
 def calculate_bb(df, period=20, mult=2.0):
     df['bb_mid'] = df['close'].rolling(period).mean()
@@ -145,37 +173,39 @@ def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
 def calculate_indicators(df, timeframe):
     if len(df) < 80:
         logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
-        return None
+        return None, None, None, None, None, None, None
     closes = df['close'].values.astype(np.float64)
-    df['ema13'] = calculate_ema(closes, span=13)
-    df['sma34'] = calculate_sma(closes, period=34)
+    df['ema13'] = calculate_ema(closes, 13)
+    df['sma34'] = calculate_sma(closes, 34)
+    df['volume_sma20'] = df['volume'].rolling(20).mean().ffill()
     df = calculate_bb(df)
     df = calculate_kc(df)
     df = calculate_squeeze(df)
     df = calculate_smi_momentum(df)
-    df = calculate_adx(df)
-    df['volume_sma20'] = df['volume'].rolling(20).mean()
-    return df
+    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df)
+    return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 
 # ================== Sinyal Döngüsü ==================
-async def check_signals(symbol, timeframe):
+async def check_signals(symbol, timeframe='4h'):
     try:
-        # Veri
         if TEST_MODE:
             closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
             highs = closes + np.random.rand(200) * 0.02 * closes
             lows = closes - np.random.rand(200) * 0.02 * closes
             volumes = np.random.rand(200) * 10000
             ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             logger.info(f"Test modu: {symbol} {timeframe}")
         else:
             max_retries = 3
-            df = None
             for attempt in range(max_retries):
                 try:
+                    markets = exchange.load_markets()
+                    if not markets.get(symbol, {}).get('active', False):
+                        logger.warning(f"{symbol} aktif değil, skip.")
+                        return
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max(150, LOOKBACK_ATR + 80))
-                    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     break
                 except (ccxt.RequestTimeout, ccxt.NetworkError):
                     logger.warning(f"Timeout/Network ({symbol} {timeframe}), retry {attempt+1}/{max_retries}")
@@ -185,204 +215,183 @@ async def check_signals(symbol, timeframe):
                 except (ccxt.BadSymbol, ccxt.BadRequest) as e:
                     logger.warning(f"Skip {symbol} {timeframe}: {e.__class__.__name__} - {e}")
                     return
-            if df is None or df.empty:
-                logger.warning(f"Veri alınamadı: {symbol} {timeframe}")
+            if df is None or df.empty or len(df) < 80:
+                logger.warning(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), skip.")
                 return
 
-        # İndikatörler
-        df = calculate_indicators(df, timeframe)
+        df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short = calculate_indicators(df, timeframe)
         if df is None:
             return
+
         atr_value, avg_atr_ratio = get_atr_values(df, LOOKBACK_ATR)
         if not np.isfinite(atr_value) or not np.isfinite(avg_atr_ratio):
             logger.warning(f"ATR NaN/Inf ({symbol} {timeframe}), skip.")
             return
 
         closed_candle = df.iloc[-2]
+        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
+        logger.info(f"{symbol} {timeframe} Closed Candle Close: {closed_candle['close']:.4f}, Current Price: {current_price:.4f}")
+
         key = f"{symbol}_{timeframe}"
         current_pos = signal_cache.get(key, {
             'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-            'highest_price': None, 'lowest_price': None,
-            'trailing_activated': False, 'avg_atr_ratio': None, 'trailing_distance': None,
-            'remaining_ratio': 1.0,
-            'last_signal_time': None, 'last_signal_type': None,
-            'entry_time': None,
+            'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
+            'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
+            'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
             'tp1_hit': False, 'tp2_hit': False
         })
 
-        # Crossover + pullback + diğer şartlar
-        lookback_cross = LOOKBACK_CROSSOVER
-        ema13_slice = df['ema13'].values[-lookback_cross-1 : -1]
-        sma34_slice = df['sma34'].values[-lookback_cross-1 : -1]
-        price_slice = df['close'].values[-lookback_cross-1 : -1]
+        ema13_slice = df['ema13'].values[-LOOKBACK_CROSSOVER-1:-1]
+        sma34_slice = df['sma34'].values[-LOOKBACK_CROSSOVER-1:-1]
+        price_slice = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
+        if len(ema13_slice) < LOOKBACK_CROSSOVER:
+            logger.warning(f"Veri yetersiz ({symbol} {timeframe}), skip.")
+            return
+
         ema_sma_crossover_buy = False
         ema_sma_crossover_sell = False
-        for i in range(1, min(lookback_cross + 1, len(ema13_slice))):
-            if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and \
-               price_slice[-i] > sma34_slice[-i]:
-                ema_sma_crossover_buy = True
-            if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and \
-               price_slice[-i] < sma34_slice[-i]:
-                ema_sma_crossover_sell = True
-        pullback_buy = closed_candle['close'] > closed_candle['ema13'] if pd.notna(closed_candle['close']) and pd.notna(closed_candle['ema13']) else False
-        pullback_sell = closed_candle['close'] < closed_candle['ema13'] if pd.notna(closed_candle['close']) and pd.notna(closed_candle['ema13']) else False
+        for i in range(1, LOOKBACK_CROSSOVER + 1):
+            if 0 <= i < len(ema13_slice):
+                if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
+                    ema_sma_crossover_buy = True
+                if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
+                    ema_sma_crossover_sell = True
+        logger.info(f"{symbol} {timeframe} EMA/SMA crossover_buy: {ema_sma_crossover_buy}, crossover_sell: {ema_sma_crossover_sell}")
+
+        recent = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
+        ema13_recent = df['ema13'].values[-LOOKBACK_CROSSOVER-1:-1]
+        pullback_long = (recent < ema13_recent).any() and (closed_candle['close'] > closed_candle['ema13']) and (closed_candle['close'] > closed_candle['sma34'])
+        pullback_short = (recent > ema13_recent).any() and (closed_candle['close'] < closed_candle['ema13']) and (closed_candle['close'] < closed_candle['sma34'])
+        logger.info(f"{symbol} {timeframe} pullback_long: {pullback_long}, pullback_short: {pullback_short}")
+
         volume_multiplier = 1.0 + min(avg_atr_ratio * 3, 0.2) if np.isfinite(avg_atr_ratio) else 1.0
-        volume_condition = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
-        adx_ok = closed_candle['ADX'] > ADX_THRESHOLD if pd.notna(closed_candle['ADX']) else False
-        di_buy = closed_candle['+DI'] > closed_candle['-DI'] if pd.notna(closed_candle['+DI']) and pd.notna(closed_candle['-DI']) else False
-        di_sell = closed_candle['+DI'] < closed_candle['-DI'] if pd.notna(closed_candle['+DI']) and pd.notna(closed_candle['-DI']) else False
-        smi_buy = closed_candle['squeeze_off'] and closed_candle['smi'] > 0 if pd.notna(closed_candle['smi']) and pd.notna(closed_candle['squeeze_off']) else False
-        smi_sell = closed_candle['squeeze_off'] and closed_candle['smi'] < 0 if pd.notna(closed_candle['smi']) and pd.notna(closed_candle['squeeze_off']) else False
+        volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
+        logger.info(f"{symbol} {timeframe} volume_ok: {volume_ok}, multiplier: {volume_multiplier:.2f}")
 
-        logger.info(
-            f"{symbol} {timeframe} | "
-            f"CrossBuy={ema_sma_crossover_buy}, CrossSell={ema_sma_crossover_sell} | "
-            f"PullBuy={pullback_buy}, PullSell={pullback_sell} | "
-            f"VolCond={volume_condition} (mult={volume_multiplier:.2f}) | "
-            f"SMI_Buy={smi_buy} (smi={closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}), SMI_Sell={smi_sell} | "
-            f"ADX={closed_candle['ADX']:.2f if pd.notna(closed_candle['ADX']) else 'NaN'} (>25={adx_ok}) | "
-            f"DI+={closed_candle['+DI']:.2f if pd.notna(closed_candle['+DI']) else 'NaN'}, DI-={closed_candle['-DI']:.2f if pd.notna(closed_candle['-DI']) else 'NaN'} | "
-            f"BUY_OK={'YES' if (ema_sma_crossover_buy and pullback_buy and volume_condition and smi_buy and adx_ok and di_buy) else 'no'} | "
-            f"SELL_OK={'YES' if (ema_sma_crossover_sell and pullback_sell and volume_condition and smi_sell and adx_ok and di_sell) else 'no'}"
-        )
+        smi_condition_long = smi_squeeze_off and (smi_histogram > 0 or smi_color == 'green')
+        smi_condition_short = smi_squeeze_off and (smi_histogram < 0 or smi_color == 'red')
+        logger.info(f"{symbol} {timeframe} SMI_squeeze_off: {smi_squeeze_off}, SMI_histogram: {smi_histogram:.2f}, SMI_color: {smi_color}")
+        logger.info(f"{symbol} {timeframe} SMI_long_condition: {smi_condition_long}, SMI_short_condition: {smi_condition_short}")
+        logger.info(f"{symbol} {timeframe} ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, ADX_condition: {adx_condition}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
 
-        buy_condition = ema_sma_crossover_buy and pullback_buy and volume_condition and smi_buy and adx_ok and di_buy
-        sell_condition = ema_sma_crossover_sell and pullback_sell and volume_condition and smi_sell and adx_ok and di_sell
+        buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and di_condition_long
+        sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and di_condition_short
+        logger.info(f"{symbol} {timeframe} buy_condition: {buy_condition}, sell_condition: {sell_condition}")
 
-        # Pozisyon yönetimi (önce reversal check)
         current_pos = signal_cache.get(key, current_pos)
-        current_price = float(df.iloc[-1]['close']) if pd.notna(df.iloc[-1]['close']) else np.nan
+        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
         tz = pytz.timezone('Europe/Istanbul')
         now = datetime.now(tz)
+
+        if buy_condition and sell_condition:
+            logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
+            return
 
         if buy_condition or sell_condition:
             new_signal = 'buy' if buy_condition else 'sell'
             if current_pos['signal'] is not None and current_pos['signal'] != new_signal:
-                # Reversal close
-                if current_pos['signal'] == 'buy':
-                    profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                    message_type = "LONG REVERSAL CLOSE 🚀" if profit_percent > 0 else "LONG REVERSAL STOP 📉"
-                    profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
-                else:
-                    profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                    message_type = "SHORT REVERSAL CLOSE 🚀" if profit_percent > 0 else "SHORT REVERSAL STOP 📉"
-                    profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
+                profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                message_type = "REVERSAL CLOSE 🚀" if profit_percent > 0 else "REVERSAL STOP 📉"
+                profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
                 message = (
                     f"{symbol} {timeframe}: {message_type}\n"
                     f"Price: {current_price:.4f}\n"
-                    f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
                     f"{profit_text}\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Reversal Close: {message}")
-                # Reset state
+                await message_queue.put(message)
+                logger.info(f"Reversal Close kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None,
-                    'trailing_activated': False, 'avg_atr_ratio': None, 'trailing_distance': None,
-                    'remaining_ratio': 1.0,
-                    'last_signal_time': current_pos['last_signal_time'],
-                    'last_signal_type': current_pos['last_signal_type'],
-                    'entry_time': None,
+                    'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
+                    'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
+                    'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False
                 }
                 current_pos = signal_cache[key]
 
-        # Sinyal açılışı
-        if buy_condition and current_pos['signal'] != 'buy':
-            if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'buy' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
-                message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                logger.info(message)
-            else:
-                entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
-                sl_price = entry_price - (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value) if np.isfinite(atr_value) else np.nan
-                if not np.isfinite(entry_price) or not np.isfinite(sl_price):
-                    logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
-                    return
-                if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
-                    message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+            if buy_condition and current_pos['signal'] != 'buy':
+                if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'buy' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
+                    message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
+                    await message_queue.put(message)
                     logger.info(message)
                 else:
-                    tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
-                    trailing_distance = (TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE) if np.isfinite(avg_atr_ratio) else TRAILING_DISTANCE_BASE
-                    current_pos = {
-                        'signal': 'buy',
-                        'entry_price': entry_price,
-                        'sl_price': sl_price,
-                        'tp1_price': tp1_price,
-                        'tp2_price': tp2_price,
-                        'highest_price': entry_price,
-                        'lowest_price': None,
-                        'trailing_activated': False,
-                        'avg_atr_ratio': avg_atr_ratio,
-                        'trailing_distance': trailing_distance,
-                        'remaining_ratio': 1.0,
-                        'last_signal_time': now,
-                        'last_signal_type': 'buy',
-                        'entry_time': now,
-                        'tp1_hit': False,
-                        'tp2_hit': False
-                    }
-                    signal_cache[key] = current_pos
-                    message = (
-                        f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"SMI: Squeeze Off, Positive\n"
-                        f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                    logger.info(f"Sinyal: {message}")
-        elif sell_condition and current_pos['signal'] != 'sell':
-            if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'sell' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
-                message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (duplicate, cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
-                logger.info(message)
-            else:
-                entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
-                sl_price = entry_price + (SL_MULTIPLIER * atr_value + SL_BUFFER * atr_value) if np.isfinite(atr_value) else np.nan
-                if not np.isfinite(entry_price) or not np.isfinite(sl_price):
-                    logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
-                    return
-                if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
-                    message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nPotansiyel SL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                    entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
+                    sl_multiplier = SL_MULTIPLIER * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else SL_MULTIPLIER
+                    tp1_multiplier = TP_MULTIPLIER1 * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else TP_MULTIPLIER1
+                    tp2_multiplier = TP_MULTIPLIER2 * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else TP_MULTIPLIER2
+                    sl_price = entry_price - (sl_multiplier * atr_value + SL_BUFFER * atr_value) if np.isfinite(atr_value) else np.nan
+                    if not np.isfinite(entry_price) or not np.isfinite(sl_price):
+                        logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
+                        return
+                    if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
+                        message = f"{symbol} {timeframe}: BUY sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nSL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                        await message_queue.put(message)
+                        logger.info(message)
+                    else:
+                        tp1_price = entry_price + (tp1_multiplier * atr_value)
+                        tp2_price = entry_price + (tp2_multiplier * atr_value)
+                        trailing_distance = TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE
+                        current_pos = {
+                            'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
+                            'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
+                            'lowest_price': None, 'trailing_activated': False, 'avg_atr_ratio': avg_atr_ratio,
+                            'trailing_distance': trailing_distance, 'remaining_ratio': 1.0,
+                            'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': now,
+                            'tp1_hit': False, 'tp2_hit': False
+                        }
+                        signal_cache[key] = current_pos
+                        message = (
+                            f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
+                            f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
+                            f"ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, DI+: {closed_candle['di_plus']:.2f if pd.notna(closed_candle['di_plus']) else 'NaN'}, DI-: {closed_candle['di_minus']:.2f if pd.notna(closed_candle['di_minus']) else 'NaN'}\n"
+                            f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
+                            f"Time: {now.strftime('%H:%M:%S')}"
+                        )
+                        await message_queue.put(message)
+                        logger.info(f"Buy sinyali kuyruğa eklendi: {message}")
+            elif sell_condition and current_pos['signal'] != 'sell':
+                if current_pos['last_signal_time'] and current_pos['last_signal_type'] == 'sell' and (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES):
+                    message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (cooldown: {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}"
+                    await message_queue.put(message)
                     logger.info(message)
                 else:
-                    tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
-                    trailing_distance = (TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE) if np.isfinite(avg_atr_ratio) else TRAILING_DISTANCE_BASE
-                    current_pos = {
-                        'signal': 'sell',
-                        'entry_price': entry_price,
-                        'sl_price': sl_price,
-                        'tp1_price': tp1_price,
-                        'tp2_price': tp2_price,
-                        'highest_price': None,
-                        'lowest_price': entry_price,
-                        'trailing_activated': False,
-                        'avg_atr_ratio': avg_atr_ratio,
-                        'trailing_distance': trailing_distance,
-                        'remaining_ratio': 1.0,
-                        'last_signal_time': now,
-                        'last_signal_type': 'sell',
-                        'entry_time': now,
-                        'tp1_hit': False,
-                        'tp2_hit': False
-                    }
-                    signal_cache[key] = current_pos
-                    message = (
-                        f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"SMI: Squeeze Off, Negative\n"
-                        f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                    await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                    logger.info(f"Sinyal: {message}")
+                    entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
+                    sl_multiplier = SL_MULTIPLIER * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else SL_MULTIPLIER
+                    tp1_multiplier = TP_MULTIPLIER1 * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else TP_MULTIPLIER1
+                    tp2_multiplier = TP_MULTIPLIER2 * (1 + avg_atr_ratio * 0.3) if np.isfinite(avg_atr_ratio) else TP_MULTIPLIER2
+                    sl_price = entry_price + (sl_multiplier * atr_value + SL_BUFFER * atr_value) if np.isfinite(atr_value) else np.nan
+                    if not np.isfinite(entry_price) or not np.isfinite(sl_price):
+                        logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
+                        return
+                    if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
+                        message = f"{symbol} {timeframe}: SELL sinyali atlanıyor (anında SL riski) 🚫\nCurrent: {current_price:.4f}\nSL: {sl_price:.4f}\nTime: {now.strftime('%H:%M:%S')}"
+                        await message_queue.put(message)
+                        logger.info(message)
+                    else:
+                        tp1_price = entry_price - (tp1_multiplier * atr_value)
+                        tp2_price = entry_price - (tp2_multiplier * atr_value)
+                        trailing_distance = TRAILING_DISTANCE_HIGH_VOL if avg_atr_ratio > VOLATILITY_THRESHOLD else TRAILING_DISTANCE_BASE
+                        current_pos = {
+                            'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
+                            'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
+                            'lowest_price': entry_price, 'trailing_activated': False, 'avg_atr_ratio': avg_atr_ratio,
+                            'trailing_distance': trailing_distance, 'remaining_ratio': 1.0,
+                            'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': now,
+                            'tp1_hit': False, 'tp2_hit': False
+                        }
+                        signal_cache[key] = current_pos
+                        message = (
+                            f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
+                            f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
+                            f"ADX: {closed_candle['adx']:.2f if pd.notna(closed_candle['adx']) else 'NaN'}, DI+: {closed_candle['di_plus']:.2f if pd.notna(closed_candle['di_plus']) else 'NaN'}, DI-: {closed_candle['di_minus']:.2f if pd.notna(closed_candle['di_minus']) else 'NaN'}\n"
+                            f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
+                            f"Time: {now.strftime('%H:%M:%S')}"
+                        )
+                        await message_queue.put(message)
+                        logger.info(f"Sell sinyali kuyruğa eklendi: {message}")
 
-        # Pozisyon yönetimi
         if current_pos['signal'] == 'buy':
             atr_value, _ = get_atr_values(df, LOOKBACK_ATR)
             if not np.isfinite(atr_value):
@@ -391,23 +400,17 @@ async def check_signals(symbol, timeframe):
             if current_pos['highest_price'] is None or current_price > current_pos['highest_price']:
                 current_pos['highest_price'] = current_price
             td = current_pos['trailing_distance']
-            if (current_price >= current_pos['entry_price'] + (TRAILING_ACTIVATION * atr_value) and not current_pos['trailing_activated']):
+            if current_price >= current_pos['entry_price'] + (TRAILING_ACTIVATION * atr_value) and not current_pos['trailing_activated']:
                 current_pos['trailing_activated'] = True
                 trailing_sl = current_pos['highest_price'] - (td * atr_value)
                 current_pos['sl_price'] = max(current_pos['sl_price'], trailing_sl)
-                profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 message = (
                     f"{symbol} {timeframe}: TRAILING ACTIVE 🚧\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"Entry Price: {current_pos['entry_price']:.4f}\n"
-                    f"New SL: {current_pos['sl_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"Vol Ratio: {current_pos['avg_atr_ratio']:.4f if pd.notna(current_pos['avg_atr_ratio']) else 'NaN'}\n"
-                    f"TSL Distance: {td}\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"Current: {current_price:.4f}\nEntry: {current_pos['entry_price']:.4f}\n"
+                    f"New SL: {current_pos['sl_price']:.4f}\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Trailing Activated: {message}")
+                await message_queue.put(message)
+                logger.info(f"Trailing Activated kuyruğa eklendi: {message}")
             if current_pos['trailing_activated']:
                 trailing_sl = current_pos['highest_price'] - (td * atr_value)
                 current_pos['sl_price'] = max(current_pos['sl_price'], trailing_sl)
@@ -417,61 +420,40 @@ async def check_signals(symbol, timeframe):
                 current_pos['sl_price'] = current_pos['entry_price']
                 current_pos['tp1_hit'] = True
                 message = (
-                    f"{symbol} {timeframe}: TP1 Hit 🚀\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"TP1: {current_pos['tp1_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"%30 satıldı, SL entry'ye çekildi: {current_pos['sl_price']:.4f}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP1 Hit 🚀\nCurrent: {current_price:.4f}\nTP1: {current_pos['tp1_price']:.4f}\n"
+                    f"Profit: {profit_percent:.2f}%\n%30 satıldı, SL: {current_pos['sl_price']:.4f}\n"
+                    f"Kalan: %{current_pos['remaining_ratio']*100:.0f}\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP1 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP1 Hit kuyruğa eklendi: {message}")
             elif not current_pos['tp2_hit'] and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] -= 0.4
                 current_pos['tp2_hit'] = True
                 message = (
-                    f"{symbol} {timeframe}: TP2 Hit 🚀\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"TP2: {current_pos['tp2_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"%40 satıldı, kalan %30 trailing\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP2 Hit 🚀\nCurrent: {current_price:.4f}\nTP2: {current_pos['tp2_price']:.4f}\n"
+                    f"Profit: {profit_percent:.2f}%\n%40 satıldı, kalan %30 trailing\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP2 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP2 Hit kuyruğa eklendi: {message}")
             if current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                if profit_percent > 0:
-                    message = (
-                        f"{symbol} {timeframe}: LONG 🚀\n"
-                        f"Price: {current_price:.4f}\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"Profit: {profit_percent:.2f}%\nPARAYI VURDUK 🚀\n"
-                        f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                else:
-                    message = (
-                        f"{symbol} {timeframe}: STOP LONG 📉\n"
-                        f"Price: {current_price:.4f}\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"Loss: {profit_percent:.2f}%\nSTOP 😞\n"
-                        f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Exit: {message}")
+                message = (
+                    f"{symbol} {timeframe}: {'LONG 🚀' if profit_percent > 0 else 'STOP LONG 📉'}\n"
+                    f"Price: {current_price:.4f}\n"
+                    f"{'Profit: ' if profit_percent > 0 else 'Loss: '}{profit_percent:.2f}%\n"
+                    f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
+                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
+                    f"Time: {now.strftime('%H:%M:%S')}"
+                )
+                await message_queue.put(message)
+                logger.info(f"Exit kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None,
-                    'trailing_activated': False, 'avg_atr_ratio': None, 'trailing_distance': None,
-                    'remaining_ratio': 1.0,
-                    'last_signal_time': current_pos['last_signal_time'],
-                    'last_signal_type': current_pos['last_signal_type'],
-                    'entry_time': None,
-                    'tp1_hit': False, 'tp2_hit': False
+                    'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
+                    'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
+                    'last_signal_time': current_pos['last_signal_time'], 'last_signal_type': current_pos['last_signal_type'],
+                    'entry_time': None, 'tp1_hit': False, 'tp2_hit': False
                 }
                 return
             signal_cache[key] = current_pos
@@ -483,23 +465,17 @@ async def check_signals(symbol, timeframe):
             if current_pos['lowest_price'] is None or current_price < current_pos['lowest_price']:
                 current_pos['lowest_price'] = current_price
             td = current_pos['trailing_distance']
-            if (current_price <= current_pos['entry_price'] - (TRAILING_ACTIVATION * atr_value) and not current_pos['trailing_activated']):
+            if current_price <= current_pos['entry_price'] - (TRAILING_ACTIVATION * atr_value) and not current_pos['trailing_activated']:
                 current_pos['trailing_activated'] = True
                 trailing_sl = current_pos['lowest_price'] + (td * atr_value)
                 current_pos['sl_price'] = min(current_pos['sl_price'], trailing_sl)
-                profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 message = (
                     f"{symbol} {timeframe}: TRAILING ACTIVE 🚧\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"Entry Price: {current_pos['entry_price']:.4f}\n"
-                    f"New SL: {current_pos['sl_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"Vol Ratio: {current_pos['avg_atr_ratio']:.4f if pd.notna(current_pos['avg_atr_ratio']) else 'NaN'}\n"
-                    f"TSL Distance: {td}\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"Current: {current_price:.4f}\nEntry: {current_pos['entry_price']:.4f}\n"
+                    f"New SL: {current_pos['sl_price']:.4f}\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Trailing Activated: {message}")
+                await message_queue.put(message)
+                logger.info(f"Trailing Activated kuyruğa eklendi: {message}")
             if current_pos['trailing_activated']:
                 trailing_sl = current_pos['lowest_price'] + (td * atr_value)
                 current_pos['sl_price'] = min(current_pos['sl_price'], trailing_sl)
@@ -509,74 +485,54 @@ async def check_signals(symbol, timeframe):
                 current_pos['sl_price'] = current_pos['entry_price']
                 current_pos['tp1_hit'] = True
                 message = (
-                    f"{symbol} {timeframe}: TP1 Hit 🚀\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"TP1: {current_pos['tp1_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"%30 satıldı, SL entry'ye çekildi: {current_pos['sl_price']:.4f}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f}\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP1 Hit 🚀\nCurrent: {current_price:.4f}\nTP1: {current_pos['tp1_price']:.4f}\n"
+                    f"Profit: {profit_percent:.2f}%\n%30 satıldı, SL: {current_pos['sl_price']:.4f}\n"
+                    f"Kalan: %{current_pos['remaining_ratio']*100:.0f}\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP1 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP1 Hit kuyruğa eklendi: {message}")
             elif not current_pos['tp2_hit'] and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] -= 0.4
                 current_pos['tp2_hit'] = True
                 message = (
-                    f"{symbol} {timeframe}: TP2 Hit 🚀\n"
-                    f"Current Price: {current_price:.4f}\n"
-                    f"TP2: {current_pos['tp2_price']:.4f}\n"
-                    f"Profit: {profit_percent:.2f}%\n"
-                    f"%40 satıldı, kalan %30 trailing\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP2 Hit 🚀\nCurrent: {current_price:.4f}\nTP2: {current_pos['tp2_price']:.4f}\n"
+                    f"Profit: {profit_percent:.2f}%\n%40 satıldı, kalan %30 trailing\nTime: {now.strftime('%H:%M:%S')}"
                 )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"TP2 Hit: {message}")
+                await message_queue.put(message)
+                logger.info(f"TP2 Hit kuyruğa eklendi: {message}")
             if current_price >= current_pos['sl_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                if profit_percent > 0:
-                    message = (
-                        f"{symbol} {timeframe}: SHORT 🚀\n"
-                        f"Price: {current_price:.4f}\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"Profit: {profit_percent:.2f}%\nPARAYI VURDUK 🚀\n"
-                        f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                else:
-                    message = (
-                        f"{symbol} {timeframe}: STOP SHORT 📉\n"
-                        f"Price: {current_price:.4f}\n"
-                        f"SMI: {closed_candle['smi']:.2f if pd.notna(closed_candle['smi']) else 'NaN'}\n"
-                        f"Loss: {profit_percent:.2f}%\nSTOP 😞\n"
-                        f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                        f"Time: {now.strftime('%H:%M:%S')}"
-                    )
-                await telegram_bot.send_message(chat_id=CHAT_ID, text=message)
-                logger.info(f"Exit: {message}")
+                message = (
+                    f"{symbol} {timeframe}: {'SHORT 🚀' if profit_percent > 0 else 'STOP SHORT 📉'}\n"
+                    f"Price: {current_price:.4f}\n"
+                    f"{'Profit: ' if profit_percent > 0 else 'Loss: '}{profit_percent:.2f}%\n"
+                    f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
+                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
+                    f"Time: {now.strftime('%H:%M:%S')}"
+                )
+                await message_queue.put(message)
+                logger.info(f"Exit kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None,
-                    'trailing_activated': False, 'avg_atr_ratio': None, 'trailing_distance': None,
-                    'remaining_ratio': 1.0,
-                    'last_signal_time': current_pos['last_signal_time'],
-                    'last_signal_type': current_pos['last_signal_type'],
-                    'entry_time': None,
-                    'tp1_hit': False, 'tp2_hit': False
+                    'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
+                    'avg_atr_ratio': None, 'trailing_distance': None, 'remaining_ratio': 1.0,
+                    'last_signal_time': current_pos['last_signal_time'], 'last_signal_type': current_pos['last_signal_type'],
+                    'entry_time': None, 'tp1_hit': False, 'tp2_hit': False
                 }
                 return
             signal_cache[key] = current_pos
 
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
+        await message_queue.put(f"{symbol} {timeframe}: KRİTİK HATA ⚠️\n{str(e)}\nTime: {datetime.now(tz).strftime('%H:%M:%S')}")
         return
 
 # ================== Main ==================
 async def main():
     tz = pytz.timezone('Europe/Istanbul')
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
-    timeframes = ['4h']
+    asyncio.create_task(message_sender())
     symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
         'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
@@ -591,9 +547,8 @@ async def main():
     ]
     while True:
         tasks = []
-        for timeframe in timeframes:
-            for symbol in symbols:
-                tasks.append(check_signals(symbol, timeframe))
+        for symbol in symbols:
+            tasks.append(check_signals(symbol))
         batch_size = 20
         for i in range(0, len(tasks), batch_size):
             await asyncio.gather(*tasks[i:i+batch_size])
