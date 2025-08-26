@@ -12,7 +12,7 @@ import os
 # ================== Sabit Değerler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7677279035:AAHMecBYUliT7QlUl9OtB0kgXl8uyyuxbsQ")
 CHAT_ID = os.getenv("CHAT_ID", "-1002878297025")
-TEST_MODE = True  # Test için True, gerçek veri için False
+TEST_MODE = False  # Test için True, gerçek veri için False
 TRAILING_ACTIVATION = 0.8
 TRAILING_DISTANCE_BASE = 1.5
 TRAILING_DISTANCE_HIGH_VOL = 2.5
