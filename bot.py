@@ -40,7 +40,7 @@ logger.addHandler(console_handler)
 file_handler = logging.FileHandler('bot.log')  # Render'da çalışan FileHandler
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
-logging.getLogger('telegram').setLevel(logging.ERROR)  # Gereksiz logları bastır
+logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
 
 # ================== Borsa & Bot ==================
