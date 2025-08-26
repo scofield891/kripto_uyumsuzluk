@@ -1,5 +1,5 @@
-ccxt
-numpy==1.25.2
-pandas==2.2.3
-python-telegram-bot
-pandas-ta==0.3.14b0
+ccxt>=4.5.2
+numpy>=2.0.0
+pandas>=2.2.0
+python-telegram-bot>=21.4
+setuptools>=70.0.0
