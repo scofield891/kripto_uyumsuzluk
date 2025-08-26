@@ -101,15 +101,17 @@ def calculate_adx(df, period=ADX_PERIOD):
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close = np.abs(df['low'] - df['close'].shift(1))
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
-    tr_ema = df['TR'].ewm(span=period, adjust=False).mean().fillna(0)
-    df['di_plus'] = 100 * (df['+DM'].ewm(span=period, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
-    df['di_minus'] = 100 * (df['-DM'].ewm(span=period, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
+    # Wilder EMA: alpha = 1/period
+    alpha = 1.0 / period
+    tr_ema = df['TR'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
+    df['di_plus'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
+    df['di_minus'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     df['DX'] = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan).fillna(0)
-    df['adx'] = df['DX'].ewm(span=period, adjust=False).mean().fillna(0)
+    df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
     adx_condition = df['adx'].iloc[-2] > ADX_THRESHOLD if pd.notna(df['adx'].iloc[-2]) else False
     di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
-    logger.info(f"{df['adx'].iloc[-2]:.2f} ADX calculated for {df.index[-2]}")
+    logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df, adx_condition, di_condition_long, di_condition_short
 
 def calculate_bb(df, period=20, mult=2.0):
