@@ -280,10 +280,15 @@ async def check_signals(symbol, timeframe='4h'):
         adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
         di_plus_value = f"{closed_candle['di_plus']:.2f}" if pd.notna(closed_candle['di_plus']) else 'NaN'
         di_minus_value = f"{closed_candle['di_minus']:.2f}" if pd.notna(closed_candle['di_minus']) else 'NaN'
-        logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}, DI+: {di_plus_value}, DI-: {di_minus_value}, DI_long: {di_condition_long}, DI_short: {di_condition_short}")
+        logger.info(f"{symbol} {timeframe} ADX: {adx_value}, ADX_condition: {adx_condition}")
 
-        buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and di_condition_long
-        sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and di_condition_short
+        # ADX yükselme kontrolü
+        adx_rising = df['adx'].iloc[-2] > df['adx'].iloc[-3] if pd.notna(df['adx'].iloc[-2]) and pd.notna(df['adx'].iloc[-3]) else False
+        logger.info(f"{symbol} {timeframe} ADX_rising: {adx_rising}")
+
+        # DI+/DI- kaldırılarak sadeleştirilmiş koşullar
+        buy_condition = ema_sma_crossover_buy and pullback_long and volume_ok and smi_condition_long and adx_condition and adx_rising
+        sell_condition = ema_sma_crossover_sell and pullback_short and volume_ok and smi_condition_short and adx_condition and adx_rising
         logger.info(f"{symbol} {timeframe} buy_condition: {buy_condition}, sell_condition: {sell_condition}")
 
         current_pos = signal_cache.get(key, current_pos)
@@ -354,7 +359,7 @@ async def check_signals(symbol, timeframe='4h'):
                         message = (
                             f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
                             f"SMI: {smi_value}\n"
-                            f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
+                            f"ADX: {adx_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
                         )
@@ -394,7 +399,7 @@ async def check_signals(symbol, timeframe='4h'):
                         message = (
                             f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
                             f"SMI: {smi_value}\n"
-                            f"ADX: {adx_value}, DI+: {di_plus_value}, DI-: {di_minus_value}\n"
+                            f"ADX: {adx_value}\n"
                             f"Entry: {entry_price:.4f}\nSL: {sl_price:.4f}\nTP1: {tp1_price:.4f}\nTP2: {tp2_price:.4f}\n"
                             f"Time: {now.strftime('%H:%M:%S')}"
                         )
