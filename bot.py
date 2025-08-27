@@ -266,8 +266,9 @@ async def check_signals(symbol, timeframe='4h'):
         volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
         logger.info(f"{symbol} {timeframe} volume_ok: {volume_ok}, multiplier: {volume_multiplier:.2f}")
 
-        smi_condition_long = smi_squeeze_off and (smi_histogram > 0 or smi_color == 'green')
-        smi_condition_short = smi_squeeze_off and (smi_histogram < 0 or smi_color == 'red')
+        # SMI_color'u "light" ve "dark" olarak ayırma (histogram eşikle: |histogram| < 0.1 için light)
+        smi_condition_long = smi_squeeze_off and (smi_histogram > 0 and smi_color == "light green" if abs(smi_histogram) < 0.1 else smi_color == "green")
+        smi_condition_short = smi_squeeze_off and (smi_histogram < 0 and smi_color == "light red" if abs(smi_histogram) < 0.1 else smi_color == "red")
         logger.info(f"{symbol} {timeframe} SMI_squeeze_off: {smi_squeeze_off}, SMI_histogram: {smi_histogram:.2f}, SMI_color: {smi_color}")
         logger.info(f"{symbol} {timeframe} SMI_long_condition: {smi_condition_long}, SMI_short_condition: {smi_condition_short}")
 
