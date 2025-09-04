@@ -9,6 +9,9 @@ import pytz
 import sys
 import os
 import random
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
 
 # ================== Sabit Değerler ==================
@@ -36,6 +39,7 @@ INSTANT_SL_BUFFER = 0.05       # ATR x
 LOOKBACK_CROSSOVER = 30
 LOOKBACK_SMI = 20
 
+ADX_PERIOD = 14
 ADX_THRESHOLD = 18             # >= 18
 APPLY_COOLDOWN_BOTH_DIRECTIONS = True
 SMI_LIGHT_NORM_MAX = 0.5       # |SMI/ATR| < 0.5 "light"
@@ -49,6 +53,9 @@ SIGNAL_MODE = "2of3"
 MIN_SL_PCT = 0.006   # %0.6 altına düşmesin
 MAX_SL_PCT = 0.030   # %3.0 üstüne çıkmasın
 TRAIL_MIN_PCT = 0.004  # trailing mesafe en az %0.4 olsun (entry'e göre)
+
+# === İstek eşzamanlılık sınırı (connection pool uyarılarını keser) ===
+MAX_CONCURRENT_FETCHES = 10
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -74,6 +81,20 @@ exchange = ccxt.bybit({
     'timeout': 60000
 })
 
+# Bybit HTTP session'ı: havuzu büyüt + retry
+def configure_exchange_session(exchange, pool=50):
+    s = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=pool,
+        pool_maxsize=pool,
+        max_retries=Retry(total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
+    )
+    s.mount('https://', adapter)
+    s.mount('http://', adapter)
+    exchange.session = s
+
+configure_exchange_session(exchange, pool=50)
+
 telegram_bot = telegram.Bot(
     token=BOT_TOKEN,
     request=telegram.request.HTTPXRequest(connection_pool_size=20, pool_timeout=30.0)
@@ -81,6 +102,7 @@ telegram_bot = telegram.Bot(
 
 signal_cache = {}
 message_queue = asyncio.Queue(maxsize=1000)
+_fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
 async def enqueue_message(text: str):
     try:
@@ -104,9 +126,33 @@ async def message_sender():
             logger.error(f"Telegram mesaj hatası: {str(e)}")
         message_queue.task_done()
 
-# ================== Yardımcı: ccxt çağrısını thread'e at ==================
+# ================== Yardımcı: ccxt çağrısını thread'e at (semaphore ile) ==================
 async def fetch_ohlcv_async(symbol, timeframe, limit):
-    return await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
+    async with _fetch_sem:
+        return await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
+
+# ================== Sembol Normalizasyon & Filtreleme ==================
+def normalize_bybit_symbol(sym: str) -> str:
+    # "BTCUSDT" -> "BTC/USDT:USDT"
+    if sym.endswith("USDT") and "/" not in sym:
+        base = sym[:-4]
+        return f"{base}/USDT:USDT"
+    return sym
+
+async def build_symbol_list(raw_symbols):
+    markets = await asyncio.to_thread(exchange.load_markets)
+    available = []
+    missing = []
+    for s in raw_symbols:
+        ns = normalize_bybit_symbol(s)
+        if ns in markets and (markets[ns].get("active", True)):
+            available.append(ns)
+        else:
+            missing.append(s)
+    if missing:
+        logger.warning("Bybit'te bulunamadı/uyumsuz: " + ", ".join(missing[:12]) + ("..." if len(missing) > 12 else ""))
+    logger.info(f"Aktif sembol sayısı: {len(available)}")
+    return available
 
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
@@ -126,7 +172,7 @@ def calculate_sma(closes, period):
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
 
-def calculate_adx(df, symbol, period=14):
+def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['high_diff'] = df['high'] - df['high'].shift(1)
     df['low_diff'] = df['low'].shift(1) - df['low']
     df['+DM'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
@@ -604,7 +650,8 @@ async def main():
     await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı, saat: " + datetime.now(tz).strftime('%H:%M:%S'))
     asyncio.create_task(message_sender())
     timeframes = ['4h']
-    symbols = [
+
+    raw_symbols = [
         'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
         'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
         'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
@@ -616,6 +663,10 @@ async def main():
         'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
         'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
     ]
+    symbols = await build_symbol_list(raw_symbols)
+    if not symbols:
+        raise RuntimeError("Uygun sembol bulunamadı. Sembol listesini kontrol et.")
+
     while True:
         tasks = []
         for timeframe in timeframes:
