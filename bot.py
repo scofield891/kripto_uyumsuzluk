@@ -2,6 +2,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 import telegram
+from telegram.request import HTTPXRequest
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ if not BOT_TOKEN or not CHAT_ID:
 
 TEST_MODE = False
 
+# Risk / yönetim
 TRAILING_ACTIVATION = 0.8
 TRAILING_DISTANCE_BASE = 1.5   # ATR x
 TRAILING_DISTANCE_HIGH_VOL = 2.5
@@ -30,9 +32,9 @@ VOLATILITY_THRESHOLD = 0.02
 LOOKBACK_ATR = 18
 
 SL_MULTIPLIER = 1.8            # ATR x
-TP_MULTIPLIER1 = 2.0           # ATR x
-TP_MULTIPLIER2 = 3.5           # ATR x
-SL_BUFFER = 0.3                # ATR x, SL'e ilave
+TP_MULTIPLIER1 = 2.0           # ATR x  (TP1 %30)
+TP_MULTIPLIER2 = 3.5           # ATR x  (TP2 %40)
+SL_BUFFER = 0.3                # ATR x, SL’e ilave
 
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05       # ATR x
@@ -49,13 +51,18 @@ SMI_LIGHT_NORM_MAX = 0.5       # |SMI/ATR| < 0.5 "light"
 SIGNAL_MODE = "2of3"
 
 # === Hibrit ATR + yüzde sınırları ===
-# SL mesafesini ATR tabanlı hesapla, ama çok sakin/oynak günlerde aşırıya kaçmasın diye % clamp uygula
 MIN_SL_PCT = 0.006   # %0.6 altına düşmesin
 MAX_SL_PCT = 0.030   # %3.0 üstüne çıkmasın
-TRAIL_MIN_PCT = 0.004  # trailing mesafe en az %0.4 olsun (entry'e göre)
+TRAIL_MIN_PCT = 0.004  # trailing mesafe en az %0.4 (entry bazlı)
 
 # === İstek eşzamanlılık sınırı (connection pool uyarılarını keser) ===
 MAX_CONCURRENT_FETCHES = 10
+
+# === Likidite filtresi (opsiyonel) ===
+USE_LIQ_FILTER = False
+LIQ_ROLL_BARS = 60        # son 60 bar
+LIQ_QUANTILE  = 0.70      # en likit %30 dilim
+LIQ_MIN_DVOL_USD = 0      # istersen taban $ hacim, örn 2_000_000
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -77,7 +84,7 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({
     'enableRateLimit': True,
-    'options': {'defaultType': 'linear'},
+    'options': {'defaultType': 'linear'},  # sadece linear swap
     'timeout': 60000
 })
 
@@ -97,7 +104,7 @@ configure_exchange_session(exchange, pool=50)
 
 telegram_bot = telegram.Bot(
     token=BOT_TOKEN,
-    request=telegram.request.HTTPXRequest(connection_pool_size=20, pool_timeout=30.0)
+    request=HTTPXRequest(connection_pool_size=20, pool_timeout=30.0)
 )
 
 signal_cache = {}
@@ -119,40 +126,39 @@ async def message_sender():
             await asyncio.sleep(1)
         except (telegram.error.RetryAfter, telegram.error.TimedOut) as e:
             wait_time = getattr(e, 'retry_after', 5) + 2
-            logger.warning(f"Error: {type(e).__name__}, {wait_time-2} saniye bekle")
+            logger.warning(f"Telegram: {type(e).__name__}, {wait_time-2}s bekle")
             await asyncio.sleep(wait_time)
             await enqueue_message(message)
         except Exception as e:
             logger.error(f"Telegram mesaj hatası: {str(e)}")
         message_queue.task_done()
 
-# ================== Yardımcı: ccxt çağrısını thread'e at (semaphore ile) ==================
+# ================== ccxt OHLCV (async, semafor) ==================
 async def fetch_ohlcv_async(symbol, timeframe, limit):
     async with _fetch_sem:
         return await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
 
-# ================== Sembol Normalizasyon & Filtreleme ==================
-def normalize_bybit_symbol(sym: str) -> str:
-    # "BTCUSDT" -> "BTC/USDT:USDT"
-    if sym.endswith("USDT") and "/" not in sym:
-        base = sym[:-4]
-        return f"{base}/USDT:USDT"
-    return sym
-
-async def build_symbol_list(raw_symbols):
+# ================== Bybit sembollerini otomatik çek ==================
+async def fetch_all_bybit_linear_usdt_symbols(exchange, quote='USDT'):
+    """
+    Bybit markets'ten aktif USDT-linear perpetual sembolleri döndürür.
+    Ör: 'BTC/USDT:USDT'
+    """
     markets = await asyncio.to_thread(exchange.load_markets)
-    available = []
-    missing = []
-    for s in raw_symbols:
-        ns = normalize_bybit_symbol(s)
-        if ns in markets and (markets[ns].get("active", True)):
-            available.append(ns)
-        else:
-            missing.append(s)
-    if missing:
-        logger.warning("Bybit'te bulunamadı/uyumsuz: " + ", ".join(missing[:12]) + ("..." if len(missing) > 12 else ""))
-    logger.info(f"Aktif sembol sayısı: {len(available)}")
-    return available
+    syms = []
+    for s, m in markets.items():
+        if not m.get('active', True):
+            continue
+        if not m.get('swap', False):
+            continue
+        if not m.get('linear', False):
+            continue
+        if m.get('quote') != quote:
+            continue
+        syms.append(s)
+    syms = sorted(set(syms))
+    logger.info(f"Aktif {quote}-linear perpetual sembol sayısı: {len(syms)}")
+    return syms
 
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
@@ -174,23 +180,30 @@ def calculate_sma(closes, period):
 
 def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['high_diff'] = df['high'] - df['high'].shift(1)
-    df['low_diff'] = df['low'].shift(1) - df['low']
+    df['low_diff']  = df['low'].shift(1) - df['low']
     df['+DM'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
     df['-DM'] = np.where((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0), df['low_diff'], 0)
-    high_low = df['high'] - df['low']
+
+    high_low  = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift(1))
-    low_close = np.abs(df['low'] - df['close'].shift(1))
+    low_close  = np.abs(df['low']  - df['close'].shift(1))
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
+
     alpha = 1.0 / period  # Wilder
     tr_ema = df['TR'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
-    df['di_plus'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
-    df['di_minus'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
-    df['DX'] = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan).fillna(0)
+
+    di_plus  = (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
+    di_minus = (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
+    df['di_plus']  = 100 * di_plus
+    df['di_minus'] = 100 * di_minus
+
+    dx = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan)
+    df['DX']  = dx.fillna(0)
     df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
-    # >= 18
+
     adx_condition = df['adx'].iloc[-2] >= ADX_THRESHOLD if pd.notna(df['adx'].iloc[-2]) else False
-    di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
-    di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
+    di_condition_long  = df['di_plus'].iloc[-2]  > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
+    di_condition_short = df['di_plus'].iloc[-2]  < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df, adx_condition, di_condition_long, di_condition_short
 
@@ -205,7 +218,7 @@ def calculate_kc(df, period=20, atr_period=20, mult=1.5):
     df['kc_mid'] = pd.Series(calculate_ema(df['close'].values, period))
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
+    low_close  = np.abs(df['low']  - df['close'].shift())
     tr = np.maximum(high_low, np.maximum(high_close, low_close))
     df['atr_kc'] = tr.rolling(atr_period).mean()
     df['kc_upper'] = df['kc_mid'] + mult * df['atr_kc']
@@ -213,16 +226,16 @@ def calculate_kc(df, period=20, atr_period=20, mult=1.5):
     return df
 
 def calculate_squeeze(df):
-    df['squeeze_on'] = (df['bb_lower'] > df['kc_lower']) & (df['bb_upper'] < df['kc_upper'])
+    df['squeeze_on']  = (df['bb_lower'] > df['kc_lower']) & (df['bb_upper'] < df['kc_upper'])
     df['squeeze_off'] = (df['bb_lower'] < df['kc_lower']) & (df['bb_upper'] > df['kc_upper'])
     return df
 
 def calculate_smi_momentum(df, length=LOOKBACK_SMI):
     highest = df['high'].rolling(length).max()
-    lowest = df['low'].rolling(length).min()
+    lowest  = df['low'].rolling(length).min()
     avg1 = (highest + lowest) / 2
     avg2 = df['close'].rolling(length).mean()
-    avg = (avg1 + avg2) / 2
+    avg  = (avg1 + avg2) / 2
     diff = df['close'] - avg
     smi = pd.Series(np.nan, index=df.index)
     for i in range(length-1, len(df)):
@@ -240,9 +253,9 @@ def calculate_smi_momentum(df, length=LOOKBACK_SMI):
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
-    high_low = df['high'] - df['low']
+    high_low  = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
+    low_close  = (df['low']  - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=period).mean()
     return df
@@ -272,14 +285,34 @@ def calculate_indicators(df, symbol, timeframe):
     df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)
     return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 
+# ================== Likidite filtresi ==================
+def liquidity_okay(df) -> bool:
+    if not USE_LIQ_FILTER:
+        return True
+    try:
+        dv = (df['close'] * df['volume']).astype(float)
+        # son kapalı bar öncesi pencere
+        win = dv.iloc[-(LIQ_ROLL_BARS+1):-1] if len(dv) >= LIQ_ROLL_BARS+1 else dv.iloc[:-1]
+        if len(win) < max(10, LIQ_ROLL_BARS // 2):
+            return False
+        thresh = win.quantile(LIQ_QUANTILE)
+        last_dv = float(dv.iloc[-2])
+        if LIQ_MIN_DVOL_USD and last_dv < LIQ_MIN_DVOL_USD:
+            return False
+        return last_dv >= float(thresh)
+    except Exception as e:
+        logger.warning(f"Likidite filtresi hata: {e}")
+        return True  # fail-open
+
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
     tz = pytz.timezone('Europe/Istanbul')
     try:
+        # Veri
         if TEST_MODE:
             closes = np.abs(np.cumsum(np.random.randn(200))) * 0.05 + 0.3
             highs = closes + np.random.rand(200) * 0.02 * closes
-            lows = closes - np.random.rand(200) * 0.02 * closes
+            lows  = closes - np.random.rand(200) * 0.02 * closes
             volumes = np.random.rand(200) * 10000
             ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -304,6 +337,10 @@ async def check_signals(symbol, timeframe='4h'):
                 logger.warning(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), skip.")
                 return
 
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df.set_index('timestamp', inplace=True)
+
+        # İndikatörler
         df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short = calculate_indicators(df, symbol, timeframe)
         if df is None:
             return
@@ -323,7 +360,9 @@ async def check_signals(symbol, timeframe='4h'):
 
         closed_candle = df.iloc[-2]
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-        logger.info(f"{symbol} {timeframe} Closed: {closed_candle['close']:.4f}, Current: {current_price:.4f}")
+
+        # Likidite filtresi
+        liq_ok = liquidity_okay(df)
 
         key = f"{symbol}_{timeframe}"
         current_pos = signal_cache.get(key, {
@@ -334,7 +373,7 @@ async def check_signals(symbol, timeframe='4h'):
             'tp1_hit': False, 'tp2_hit': False
         })
 
-        # Crossover mantığı AYNEN; sadece LOOKBACK_CROSSOVER = 30
+        # EMA13 / SMA34 kesişimi (LOOKBACK_CROSSOVER içinde)
         ema13_slice = df['ema13'].values[-LOOKBACK_CROSSOVER-1:-1]
         sma34_slice = df['sma34'].values[-LOOKBACK_CROSSOVER-1:-1]
         price_slice = df['close'].values[-LOOKBACK_CROSSOVER-1:-1]
@@ -345,49 +384,46 @@ async def check_signals(symbol, timeframe='4h'):
         ema_sma_crossover_buy = False
         ema_sma_crossover_sell = False
         for i in range(1, LOOKBACK_CROSSOVER + 1):
-            if 0 <= i < len(ema13_slice):
-                if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
-                    ema_sma_crossover_buy = True
-                if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
-                    ema_sma_crossover_sell = True
+            if ema13_slice[-i-1] <= sma34_slice[-i-1] and ema13_slice[-i] > sma34_slice[-i] and price_slice[-i] > sma34_slice[-i]:
+                ema_sma_crossover_buy = True
+            if ema13_slice[-i-1] >= sma34_slice[-i-1] and ema13_slice[-i] < sma34_slice[-i] and price_slice[-i] < sma34_slice[-i]:
+                ema_sma_crossover_sell = True
 
-        logger.info(f"{symbol} {timeframe} EMA/SMA buy:{ema_sma_crossover_buy} sell:{ema_sma_crossover_sell}")
-
+        # Hacim filtresi
         volume_multiplier = 1.0 + min(avg_atr_ratio * 3, 0.2) if np.isfinite(avg_atr_ratio) else 1.0
         volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
 
+        # ADX/DI
         adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
-        adx_ok = adx_condition  # (>= 18)
+        adx_ok = adx_condition
         adx_rising = df['adx'].iloc[-2] > df['adx'].iloc[-3] if pd.notna(df['adx'].iloc[-3]) and pd.notna(df['adx'].iloc[-2]) else False
-        di_long = di_condition_long
+        di_long  = di_condition_long
         di_short = di_condition_short
 
-        # === ADX 2/3 kuralı ===
+        # 2/3 kuralı
         if SIGNAL_MODE == "2of3":
             dir_long_ok  = (int(adx_ok) + int(adx_rising) + int(di_long))  >= 2
             dir_short_ok = (int(adx_ok) + int(adx_rising) + int(di_short)) >= 2
             str_ok = True
         else:
-            # Güvenli varsayılan: ADX>=18 + DI, rising opsiyonel
             dir_long_ok, dir_short_ok = di_long, di_short
             str_ok = adx_ok
 
         buy_condition = (
-            ema_sma_crossover_buy and volume_ok and smi_condition_long and
-            str_ok and dir_long_ok and
+            liq_ok and volume_ok and smi_condition_long and
+            ema_sma_crossover_buy and str_ok and dir_long_ok and
             (closed_candle['close'] > closed_candle['ema13'] and closed_candle['close'] > closed_candle['sma34'])
         )
         sell_condition = (
-            ema_sma_crossover_sell and volume_ok and smi_condition_short and
-            str_ok and dir_short_ok and
+            liq_ok and volume_ok and smi_condition_short and
+            ema_sma_crossover_sell and str_ok and dir_short_ok and
             (closed_candle['close'] < closed_candle['ema13'] and closed_candle['close'] < closed_candle['sma34'])
         )
 
-        logger.info(f"{symbol} {timeframe} ADX:{adx_value} adx_ok:{adx_ok} rising:{adx_rising} di_long:{di_long} di_short:{di_short}")
+        logger.info(f"{symbol} {timeframe} | LIQ_OK={liq_ok} | ADX:{adx_value} adx_ok:{adx_ok} rising:{adx_rising} di_long:{di_long} di_short:{di_short}")
         logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition}")
 
         current_pos = signal_cache.get(key, current_pos)
-        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
         now = datetime.now(tz)
         smi_value = f"{closed_candle['smi']:.2f}" if pd.notna(closed_candle['smi']) else 'NaN'
 
@@ -395,27 +431,23 @@ async def check_signals(symbol, timeframe='4h'):
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
             return
 
+        # Reversal kontrol + Pozisyon açılışı
         if buy_condition or sell_condition:
             new_signal = 'buy' if buy_condition else 'sell'
             if current_pos['signal'] is not None and current_pos['signal'] != new_signal:
-                # Reversal PnL: long/short'a göre doğru formül
+                # Reversal PnL
                 if current_pos['signal'] == 'buy':
-                    profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 \
-                        if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                    profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 else:
-                    profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 \
-                        if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                message_type = "REVERSAL CLOSE 🚀" if profit_percent > 0 else "REVERSAL STOP 📉"
-                profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
+                    profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 message = (
-                    f"{symbol} {timeframe}: {message_type}\n"
+                    f"{symbol} {timeframe}: {'REVERSAL CLOSE 🚀' if profit_percent>0 else 'REVERSAL STOP 📉'}\n"
                     f"Price: {current_price:.4f}\n"
-                    f"{profit_text}\n"
+                    f"{'Profit' if profit_percent>0 else 'Loss'}: {profit_percent:.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
                 await enqueue_message(message)
-                logger.info(f"Reversal Close kuyruğa eklendi: {message}")
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'trailing_activated': False,
@@ -436,7 +468,6 @@ async def check_signals(symbol, timeframe='4h'):
                     await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (cooldown {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}")
                 else:
                     entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
-                    # ATR tabanlı + yüzde clamp
                     eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
                     sl_atr_abs = eff_sl_mult * atr_value
                     sl_pct = np.clip(sl_atr_abs / entry_price, MIN_SL_PCT, MAX_SL_PCT)
@@ -557,7 +588,7 @@ async def check_signals(symbol, timeframe='4h'):
                 await enqueue_message(
                     f"{symbol} {timeframe}: {'LONG 🚀' if profit_percent > 0 else 'STOP LONG 📉'}\n"
                     f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent > 0 else 'Loss:'} {profit_percent:.2f}%\n"
+                    f"{'Profit' if profit_percent > 0 else 'Loss'}: {profit_percent:.2f}%\n"
                     f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                     f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
@@ -624,7 +655,7 @@ async def check_signals(symbol, timeframe='4h'):
                 await enqueue_message(
                     f"{symbol} {timeframe}: {'SHORT 🚀' if profit_percent > 0 else 'STOP SHORT 📉'}\n"
                     f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent > 0 else 'Loss:'} {profit_percent:.2f}%\n"
+                    f"{'Profit' if profit_percent > 0 else 'Loss'}: {profit_percent:.2f}%\n"
                     f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
                     f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
@@ -651,21 +682,10 @@ async def main():
     asyncio.create_task(message_sender())
     timeframes = ['4h']
 
-    raw_symbols = [
-        'ETHUSDT', 'BTCUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'FARTCOINUSDT', '1000PEPEUSDT', 'ADAUSDT', 'SUIUSDT', 'WIFUSDT',
-        'ENAUSDT', 'PENGUUSDT', '1000BONKUSDT', 'HYPEUSDT', 'AVAXUSDT', 'MOODENGUSDT', 'LINKUSDT', 'PUMPFUNUSDT', 'LTCUSDT', 'TRUMPUSDT',
-        'AAVEUSDT', 'ARBUSDT', 'NEARUSDT', 'ONDOUSDT', 'POPCATUSDT', 'TONUSDT', 'OPUSDT', '1000FLOKIUSDT', 'SEIUSDT', 'HBARUSDT',
-        'WLDUSDT', 'BNBUSDT', 'UNIUSDT', 'XLMUSDT', 'CRVUSDT', 'VIRTUALUSDT', 'AI16ZUSDT', 'TIAUSDT', 'TAOUSDT', 'APTUSDT',
-        'DOTUSDT', 'SPXUSDT', 'ETCUSDT', 'LDOUSDT', 'BCHUSDT', 'INJUSDT', 'KASUSDT', 'ALGOUSDT', 'TRXUSDT', 'IPUSDT',
-        'FILUSDT', 'STXUSDT', 'ATOMUSDT', 'RUNEUSDT', 'THETAUSDT', 'FETUSDT', 'AXSUSDT', 'SANDUSDT', 'MANAUSDT', 'CHZUSDT',
-        'APEUSDT', 'GALAUSDT', 'IMXUSDT', 'DYDXUSDT', 'GMTUSDT', 'EGLDUSDT', 'ZKUSDT', 'NOTUSDT', 'ENSUSDT', 'JUPUSDT',
-        'ATHUSDT', 'ICPUSDT', 'STRKUSDT', 'ORDIUSDT', 'PENDLEUSDT', 'PNUTUSDT', 'RENDERUSDT', 'OMUSDT', 'ZORAUSDT', 'SUSDT',
-        'GRASSUSDT', 'TRBUSDT', 'MOVEUSDT', 'XAUTUSDT', 'POLUSDT', 'CVXUSDT', 'BRETTUSDT', 'SAROSUSDT', 'GOATUSDT', 'AEROUSDT',
-        'JTOUSDT', 'HYPERUSDT', 'ETHFIUSDT', 'BERAUSDT'
-    ]
-    symbols = await build_symbol_list(raw_symbols)
+    # ➜ Bybit’ten otomatik USDT-linear perp listesi
+    symbols = await fetch_all_bybit_linear_usdt_symbols(exchange, quote='USDT')
     if not symbols:
-        raise RuntimeError("Uygun sembol bulunamadı. Sembol listesini kontrol et.")
+        raise RuntimeError("Uygun sembol bulunamadı. (USDT linear perp)")
 
     while True:
         tasks = []
