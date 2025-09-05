@@ -437,7 +437,7 @@ async def check_signals(symbol, timeframe='4h'):
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yok.")
             return
 
-        # Reversal kapama (yeni sinyal önceki yönün tersi ise)
+        # Reversal kapama
         if (buy_condition or sell_condition) and (current_pos['signal'] is not None):
             new_sig = 'buy' if buy_condition else 'sell'
             if current_pos['signal'] != new_sig:
@@ -687,8 +687,8 @@ async def main():
     # mesaj göndericiyi başlat
     asyncio.create_task(message_sender())
 
-    # sembolleri otomatik keşfet
-    symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST))
+    # sembolleri otomatik keşfet (!!! FIX: fazla parantez kaldırıldı)
+    symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
     if not symbols:
         raise RuntimeError("Uygun sembol bulunamadı. (Bybit markets?)")
 
