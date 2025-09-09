@@ -91,6 +91,11 @@ FOLLOW_THROUGH_LOOKAHEAD   = 2      # trap'ten sonra 1-2 bar takip penceresi
 FOLLOW_THROUGH_WICK_MAX    = 0.35   # follow-through barında üst fitil tavan
 FOLLOW_THROUGH_VOL_Z_MIN   = 1.5    # follow-through için vol z-score alt limiti
 
+# ---- Bull-trap için BB/KC kapısı (opsiyonel) ----
+USE_TRAP_BBKC_GATE = True
+BB_UPPER_PROX = 0.20          # BB üst banda göre yakınlık eşiği (0→banda yapışık)
+KC_REQUIRE_ABOVE = False      # True yaparsan close >= kc_upper şartı eklenir
+
 # ================== Logging ==================
 logger = logging.getLogger()
 if not logger.handlers:
@@ -493,7 +498,26 @@ async def check_signals(symbol, timeframe='4h'):
         # 2) Breakout BYPASS: büyük gövdeyse trap sayma
         breakout_bypass = (body_r >= BODY_TO_RANGE_BREAKOUT_MIN and upper_wick_r <= (1.0 - BODY_TO_RANGE_BREAKOUT_MIN))
 
-        if USE_VOL_SPIKE_TRAP and not breakout_bypass:
+        # 2.5) BB/KC GATE (opsiyonel): tuzağı nerede arayalım?
+        gate_ok = True
+        if USE_TRAP_BBKC_GATE:
+            bb_up  = float(closed_candle.get('bb_upper', np.nan))
+            bb_mid = float(closed_candle.get('bb_mid',   np.nan))
+            kc_up  = float(closed_candle.get('kc_upper', np.nan))
+            close_ = float(closed_candle['close'])
+
+            prox_ok = False
+            if np.isfinite(bb_up) and np.isfinite(bb_mid) and (bb_up - bb_mid) > 0:
+                rel = (bb_up - close_) / (bb_up - bb_mid)  # 0 → banda yapışık
+                prox_ok = (rel <= BB_UPPER_PROX)
+
+            kc_ok = True
+            if KC_REQUIRE_ABOVE and np.isfinite(kc_up):
+                kc_ok = (close_ >= kc_up)
+
+            gate_ok = bool(prox_ok and kc_ok)
+
+        if USE_VOL_SPIKE_TRAP and gate_ok and not breakout_bypass:
             closed = closed_candle
 
             # Öncesi sürünme: PRELOW_BARS kapalı mumun öncesi
@@ -536,10 +560,10 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = pos
 
             vz = float(vol_z_val) if (pd.notna(vol_z_val) and np.isfinite(vol_z_val)) else float('nan')
-            logger.info(f"{symbol} {timeframe} | TRAP={spike_trap_buy} BYPASS={breakout_bypass} FTHRU={follow_through_ok} "
+            logger.info(f"{symbol} {timeframe} | TRAP={spike_trap_buy} BYPASS={breakout_bypass} FTHRU={follow_through_ok} GATE={gate_ok} "
                         f"(pre_ok={pre_ok}, spike_ok={spike_ok}, wick_ok={wick_ok}, vol_z={vz:.2f})")
         else:
-            logger.info(f"{symbol} {timeframe} | BYPASS breakout: body_r={body_r:.2f}, upper_wick_r={upper_wick_r:.2f}")
+            logger.info(f"{symbol} {timeframe} | TRAP SKIP (gate_ok={gate_ok}, bypass={breakout_bypass}) body={body_r:.2f} wickU={upper_wick_r:.2f}")
 
         # 4) Trap yakalandıysa state'e kaydet (follow-through için)
         if spike_trap_buy:
