@@ -833,7 +833,7 @@ async def check_signals(symbol, timeframe='4h'):
 
             # SL tetik
             if current_price >= current_pos['sl_price']:
-                profit_percent = ((current_pos['entry_price'] - current_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: STOP SHORT ⛔\n"
                     f"Price: {current_price:.2f}\n"
