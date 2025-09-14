@@ -1,4 +1,4 @@
-# bot.py
+# bot.py (Trap Scoring entegre tam sürüm)
 import ccxt
 import numpy as np
 import pandas as pd
@@ -198,6 +198,30 @@ def calculate_sma(closes, period):
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
 
+# (EKLENDİ) RSI — trap skorunda bağlam için kullanıyoruz
+def calculate_rsi(closes, period=14):
+    closes = np.asarray(closes, dtype=np.float64)
+    if len(closes) < period + 1:
+        return np.zeros(len(closes), dtype=np.float64)
+    deltas = np.diff(closes)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
+    rsi = np.zeros_like(closes, dtype=np.float64)
+    rsi[:period] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
+    alpha = 1.0 / period
+    up_avg, dn_avg = up, down
+    for i in range(period, len(closes)):
+        delta = deltas[i-1]
+        upval = max(delta, 0.)
+        dnval = max(-delta, 0.)
+        up_avg = (1 - alpha) * up_avg + alpha * upval
+        dn_avg = (1 - alpha) * dn_avg + alpha * dnval
+        rs = (up_avg / dn_avg) if dn_avg != 0 else (float('inf') if up_avg > 0 else 0)
+        rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
+    return rsi
+
 def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['high_diff'] = df['high'] - df['high'].shift(1)
     df['low_diff'] = df['low'].shift(1) - df['low']
@@ -310,6 +334,154 @@ def liquidity_ok(df: pd.DataFrame) -> bool:
     ok_q = bool(dv.iloc[-2] >= q.iloc[-2]) if pd.notna(q.iloc[-2]) else False
     ok_min = True if LIQ_MIN_DVOL_USD <= 0 else bool(dv.iloc[-2] >= LIQ_MIN_DVOL_USD)
     return ok_q and ok_min
+
+# ================== Trap Scoring – sadece bilgi amaçlı ==================
+# (Filtrelemez; 0–100 skor + etiket üretir ve mesajlara eklenir.)
+USE_TRAP_SCORING = True
+CTX_BARS = 3                 # son CTX_BARS kapalı mumla bağlam
+PCTX_WINDOW = 120            # persentil/normalize için rolling pencere
+W_NORMALIZE = True           # 0-1 normalize/persentil
+
+# Ağırlıklar (toplam ≈ 1.0)
+W_WICK      = 0.25   # fitil/morfoloji
+W_VOLUME_Z  = 0.25   # vol z + ctx
+W_BB_PROX   = 0.20   # BB proximity
+W_ATR_Z     = 0.15   # volatilite rejimi
+W_RSI       = 0.10   # aşırı alım/satım
+W_MISC_PAD  = 0.05   # küçük sabit dolgu
+
+def _risk_label(score: float) -> str:
+    if score < 20:  return "Çok düşük risk 🟢"
+    if score < 40:  return "Düşük risk 🟢"
+    if score < 60:  return "Orta ⚠️"
+    if score < 80:  return "Yüksek 🟠"
+    return "Aşırı risk 🔴"
+
+def _rolling_percentile(series: pd.Series, window: int, value: float) -> float:
+    try:
+        s = series.tail(window).dropna()
+        if len(s) < 5 or not np.isfinite(value):
+            return 0.0
+        return float((s <= value).mean())
+    except Exception:
+        return 0.0
+
+def _candle_parts(row):
+    o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
+    rng = max(h - l, 1e-12)
+    body = abs(c - o) / rng
+    up   = (h - max(o, c)) / rng
+    down = (min(o, c) - l) / rng
+    return body, up, down
+
+def _zscore(series: pd.Series, window: int, at_idx=-2) -> float:
+    s = series.iloc[:at_idx+1].tail(window).astype(float)
+    if len(s) < 10:
+        return 0.0
+    med = np.median(s)
+    mad = np.median(np.abs(s - med))
+    if mad == 0:
+        return 0.0
+    return float((s.iloc[-1] - med) / (1.4826 * mad))
+
+def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
+    """
+    side: 'long' → bull-trap (yukarı yön tuzak) riski,
+          'short' → sell/bear-trap (aşağı yön tuzak) riski.
+    return: {'score':0..100, 'label':str, 'parts':{...}}
+    """
+    try:
+        if len(df) < max(PCTX_WINDOW, CTX_BARS) + 5:
+            return {'score': 0.0, 'label': _risk_label(0.0), 'parts': {}}
+
+        # CTX penceresi (son CTX_BARS kapalı mum)
+        ctx = df.iloc[-(CTX_BARS+1):-1]
+        last = df.iloc[-2]
+
+        # Fitil/gövde CTX
+        bodies, ups, downs = [], [], []
+        for _, r in ctx.iterrows():
+            b,u,d = _candle_parts(r)
+            bodies.append(b); ups.append(u); downs.append(d)
+        wick_up_avg = float(np.mean(ups)) if ups else 0.0
+        wick_dn_avg = float(np.mean(downs)) if downs else 0.0
+        body_avg    = float(np.mean(bodies)) if bodies else 0.0
+
+        # Hacim z + ctx z
+        vol_z = _zscore(df['volume'], window=PCTX_WINDOW, at_idx=-2)
+        vol_z_ctx = float(np.mean([_zscore(df['volume'], window=PCTX_WINDOW, at_idx=-(i+2)) for i in range(CTX_BARS)]))
+
+        # ATR z
+        atr = ensure_atr(df, period=14)['atr']
+        atr_z = _zscore(atr, window=PCTX_WINDOW, at_idx=-2)
+
+        # RSI ctx
+        if 'rsi' not in df.columns:
+            df['rsi'] = calculate_rsi(df['close'].values.astype(float))
+        rsi_ctx = float(np.nanmean(df['rsi'].iloc[-(CTX_BARS+1):-1]))
+
+        # BB proximity
+        bb = calculate_bb(df.copy())
+        bb_up   = float(bb['bb_upper'].iloc[-2])
+        bb_low  = float(bb['bb_lower'].iloc[-2])
+        close   = float(df['close'].iloc[-2])
+
+        # Normalize/percentile
+        if W_NORMALIZE:
+            wick_up_norm   = _rolling_percentile(df['high'] - np.maximum(df['open'], df['close']), PCTX_WINDOW, (last['high'] - max(last['open'], last['close'])))
+            wick_dn_norm   = _rolling_percentile(np.maximum(df['open'], df['close']) - df['low'], PCTX_WINDOW, (max(last['open'], last['close']) - last['low']))
+            bb_up_prox_norm  = _rolling_percentile((bb['bb_upper'] - df['close']).abs(), PCTX_WINDOW, abs(bb_up - close))
+            bb_low_prox_norm = _rolling_percentile((df['close'] - bb['bb_lower']).abs(), PCTX_WINDOW, abs(close - bb_low))
+            atr_z_norm     = min(max((atr_z + 3)/6, 0.0), 1.0)   # -3..+3 → 0..1
+            vol_z_norm     = min(max((vol_z + 3)/6, 0.0), 1.0)
+            vol_z_ctx_norm = min(max((vol_z_ctx + 3)/6, 0.0), 1.0)
+        else:
+            wick_up_norm   = wick_up_avg
+            wick_dn_norm   = wick_dn_avg
+            span = max(abs(bb_up - bb_low), 1e-12)
+            bb_up_prox_norm  = max(min(abs(bb_up - close)/span, 1.0), 0.0)
+            bb_low_prox_norm = max(min(abs(close - bb_low)/span, 1.0), 0.0)
+            atr_z_norm     = min(max((atr_z + 3)/6, 0.0), 1.0)
+            vol_z_norm     = min(max((vol_z + 3)/6, 0.0), 1.0)
+            vol_z_ctx_norm = min(max((vol_z_ctx + 3)/6, 0.0), 1.0)
+
+        # Yön bazlı terimler
+        if side == "long":
+            wick_term = wick_up_norm
+            bb_term   = bb_up_prox_norm
+            rsi_term  = 0.0 if not np.isfinite(rsi_ctx) else float(max((rsi_ctx - 70) / 30, 0.0))  # 70→100 → 0..1
+        else:
+            wick_term = wick_dn_norm
+            bb_term   = bb_low_prox_norm
+            rsi_term  = 0.0 if not np.isfinite(rsi_ctx) else float(max((30 - rsi_ctx) / 30, 0.0))  # 30→0 → 0..1
+
+        # Volatilite yumuşatma (yüksek ATR_z → “aşırılık” normalleşir)
+        vol_softener = 1.0 - 0.15 * min(max(atr_z_norm, 0.0), 1.0)
+        wick_term   *= vol_softener
+        bb_term     *= vol_softener
+        vol_z_norm  *= vol_softener
+        vol_z_ctx_norm *= vol_softener
+
+        # Bileşen skorları
+        s_wick = 100 * W_WICK * wick_term
+        s_vol  = 100 * W_VOLUME_Z * (0.6*vol_z_norm + 0.4*vol_z_ctx_norm)
+        s_bb   = 100 * W_BB_PROX * bb_term
+        s_atr  = 100 * W_ATR_Z * atr_z_norm
+        s_rsi  = 100 * W_RSI * rsi_term
+        s_misc = 100 * W_MISC_PAD * 0.5
+
+        score = float(min(max(s_wick + s_vol + s_bb + s_atr + s_rsi + s_misc, 0.0), 100.0))
+        parts = {
+            'wick': round(s_wick, 2),
+            'volume': round(s_vol, 2),
+            'bb_prox': round(s_bb, 2),
+            'atr_z': round(s_atr, 2),
+            'rsi': round(s_rsi, 2),
+            'misc': round(s_misc, 2),
+        }
+        return {'score': score, 'label': _risk_label(score), 'parts': parts}
+    except Exception as e:
+        return {'score': 0.0, 'label': _risk_label(0.0), 'parts': {'err': str(e)}}
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
@@ -489,6 +661,11 @@ async def check_signals(symbol, timeframe='4h'):
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
+
+                    # --- Trap Skorları (bilgi amaçlı) ---
+                    bull_score = compute_trap_scores(df, side="long") if USE_TRAP_SCORING else {'score':0,'label':'','parts':{}}
+                    msg_trap = f"\nBullTrap Skor: {bull_score['score']:.1f} | {bull_score['label']}\nDetay: {bull_score['parts']}"
+
                     current_pos = {
                         'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
                         'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
@@ -500,7 +677,7 @@ async def check_signals(symbol, timeframe='4h'):
                     await enqueue_message(
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\nSMI:{smi_value}\nADX:{adx_value}\n"
                         f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}\n"
-                        f"Time:{now.strftime('%H:%M:%S')}"
+                        f"Time:{now.strftime('%H:%M:%S')}{msg_trap}"
                     )
 
         elif sell_condition and current_pos['signal'] != 'sell':
@@ -525,6 +702,11 @@ async def check_signals(symbol, timeframe='4h'):
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
+
+                    # --- Trap Skorları (bilgi amaçlı) ---
+                    bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {'score':0,'label':'','parts':{}}
+                    msg_trap = f"\nSellTrap Skor: {bear_score['score']:.1f} | {bear_score['label']}\nDetay: {bear_score['parts']}"
+
                     current_pos = {
                         'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
                         'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
@@ -536,12 +718,11 @@ async def check_signals(symbol, timeframe='4h'):
                     await enqueue_message(
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\nSMI:{smi_value}\nADX:{adx_value}\n"
                         f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}\n"
-                        f"Time:{now.strftime('%H:%M:%S')}"
+                        f"Time:{now.strftime('%H:%M:%S')}{msg_trap}"
                     )
 
         # === Pozisyon yönetimi: LONG ===
         if current_pos['signal'] == 'buy':
-            # rapor amaçlı
             if current_pos['highest_price'] is None or current_price > current_pos['highest_price']:
                 current_pos['highest_price'] = current_price
 
