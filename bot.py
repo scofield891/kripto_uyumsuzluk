@@ -1,4 +1,4 @@
-# bot.py (Trap Scoring entegre tam sürüm)
+# bot.py
 import ccxt
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ if not BOT_TOKEN or not CHAT_ID:
 
 TEST_MODE = False
 
-# ---- Sinyal / Risk Parametreleri (Sabit ATR) ----
+# ---- Sinyal / Risk Parametreleri (SİSTEM AYNI) ----
 LOOKBACK_ATR = 18
 SL_MULTIPLIER = 1.8            # SL = 1.8 x ATR
 TP_MULTIPLIER1 = 2.0           # TP1 = 2.0 x ATR  (satış %30)
@@ -45,21 +45,41 @@ SMI_LIGHT_NORM_MAX = 0.5       # |SMI/ATR| < 0.5 "light"
 SIGNAL_MODE = "2of3"
 
 # ---- Rate-limit & tarama pacing ----
-MAX_CONCURRENT_FETCHES = 4   # aynı anda en fazla 4 REST çağrısı
-RATE_LIMIT_MS = 200          # her REST çağrısı arasında en az 200ms
-N_SHARDS = 5                 # sembolleri 5 parçaya böl, her turda 1 parça tara
-BATCH_SIZE = 10              # batch başına görev sayısı
-INTER_BATCH_SLEEP = 5.0      # batch'ler arası bekleme (saniye)
+MAX_CONCURRENT_FETCHES = 4
+RATE_LIMIT_MS = 200
+N_SHARDS = 5
+BATCH_SIZE = 10
+INTER_BATCH_SLEEP = 5.0
 
-# ---- Sembol keşif ayarları ----
+# ---- Sembol keşif ----
 LINEAR_ONLY = True
-QUOTE_WHITELIST = ("USDT",)  # sadece USDT lineer perp
+QUOTE_WHITELIST = ("USDT",)
 
 # ---- (Opsiyonel) Likidite filtresi ----
-USE_LIQ_FILTER = False        # şimdilik KAPALI
-LIQ_ROLL_BARS = 60            # son 60 bar
-LIQ_QUANTILE  = 0.70          # en likit %30 dilim
-LIQ_MIN_DVOL_USD = 0          # taban $ hacim (0 = kapalı)
+USE_LIQ_FILTER = False
+LIQ_ROLL_BARS = 60
+LIQ_QUANTILE  = 0.70
+LIQ_MIN_DVOL_USD = 0
+
+# ================== TRAP SKORLAMA (YENİ) ==================
+USE_TRAP_SCORING = True           # sadece puanlama; filtre YOK
+SCORING_CTX_BARS = 3              # son 3 bar bağlam (wick/vol/RSI medyanı)
+SCORING_WIN = 120                 # persentil/z-score penceresi (bar)
+# Ağırlıklar (toplam ~100)
+W_WICK   = 25.0                   # wick/boy oranı
+W_VOL    = 25.0                   # hacim z / vol_ma oranı
+W_BBPROX = 15.0                   # BB üst/alt banda yakınlık
+W_ATRZ   = 15.0                   # ATR z-score
+W_RSI    = 15.0                   # RSI aşırılık
+W_MISC   = 5.0                    # ufak bağlam (ADX zayıf / squeeze vb.)
+
+# TT mesaj etiketleri
+def _risk_label(score: float) -> str:
+    if score < 20:  return "Çok düşük risk 🟢"
+    if score < 40:  return "Düşük risk 🟢"
+    if score < 60:  return "Orta risk ⚠️"
+    if score < 80:  return "Yüksek risk 🟠"
+    return "Aşırı risk 🔴"
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -85,7 +105,6 @@ exchange = ccxt.bybit({
     'timeout': 60000
 })
 
-# Bybit HTTP session'ı: havuzu büyüt + retry
 def configure_exchange_session(exchange, pool=50):
     s = requests.Session()
     adapter = HTTPAdapter(
@@ -112,6 +131,23 @@ _fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 _rate_lock = asyncio.Lock()
 _last_call_ts = 0.0
 
+# ================== Util ==================
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def pct_rank(series: pd.Series, value: float) -> float:
+    """0..1 arası, persentil benzeri rank. NaN güvenli."""
+    s = series.dropna()
+    if not np.isfinite(value) or s.empty:
+        return 0.0
+    return float((s < value).mean())
+
+def rolling_z(series: pd.Series, win: int) -> float:
+    s = series.tail(win).astype(float)
+    if s.size < 5 or s.std(ddof=0) == 0 or not np.isfinite(s.iloc[-1]):
+        return 0.0
+    return float((s.iloc[-1] - s.mean()) / (s.std(ddof=0) + 1e-12))
+
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str):
     try:
@@ -136,19 +172,16 @@ async def message_sender():
 
 # ================== Rate-limit Dostu Fetch ==================
 async def fetch_ohlcv_async(symbol, timeframe, limit):
-    """Bybit rate-limit dostu, retry'li OHLCV çekimi."""
     global _last_call_ts
     for attempt in range(4):
         try:
             async with _fetch_sem:
-                # GLOBAL throttle
                 async with _rate_lock:
                     now = asyncio.get_event_loop().time()
                     wait = max(0.0, (_last_call_ts + RATE_LIMIT_MS/1000.0) - now)
                     if wait > 0:
                         await asyncio.sleep(wait)
                     _last_call_ts = asyncio.get_event_loop().time()
-                # gerçek çağrı (thread'e atıyoruz)
                 return await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
             backoff = (2 ** attempt) * 1.5
@@ -158,7 +191,6 @@ async def fetch_ohlcv_async(symbol, timeframe, limit):
             backoff = 1.0 + attempt
             logger.warning(f"Network/Timeout {symbol} {timeframe}, retry in {backoff:.1f}s ({e.__class__.__name__})")
             await asyncio.sleep(backoff)
-    # tüm denemeler bitti -> bu turu pas geç
     raise ccxt.NetworkError(f"fetch_ohlcv failed after retries: {symbol} {timeframe}")
 
 # ================== Sembol Keşfi (Bybit) ==================
@@ -166,16 +198,11 @@ async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
     markets = await asyncio.to_thread(exchange.load_markets)
     syms = []
     for s, m in markets.items():
-        if not m.get('active', True):
-            continue
-        if not m.get('swap', False):
-            continue
-        if linear_only and not m.get('linear', False):
-            continue
-        if m.get('quote') not in quote_whitelist:
-            continue
-        # örn: "BTC/USDT:USDT"
-        syms.append(s)
+        if not m.get('active', True):        continue
+        if not m.get('swap', False):         continue
+        if linear_only and not m.get('linear', False): continue
+        if m.get('quote') not in quote_whitelist:      continue
+        syms.append(s)  # "BTC/USDT:USDT"
     syms = sorted(set(syms))
     logger.info(f"Keşfedilen sembol sayısı: {len(syms)} (linear={linear_only}, quotes={quote_whitelist})")
     return syms
@@ -198,9 +225,7 @@ def calculate_sma(closes, period):
             sma[i] = np.mean(closes[i-period+1:i+1])
     return sma
 
-# (EKLENDİ) RSI — trap skorunda bağlam için kullanıyoruz
 def calculate_rsi(closes, period=14):
-    closes = np.asarray(closes, dtype=np.float64)
     if len(closes) < period + 1:
         return np.zeros(len(closes), dtype=np.float64)
     deltas = np.diff(closes)
@@ -210,15 +235,13 @@ def calculate_rsi(closes, period=14):
     rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
     rsi = np.zeros_like(closes, dtype=np.float64)
     rsi[:period] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
-    alpha = 1.0 / period
-    up_avg, dn_avg = up, down
     for i in range(period, len(closes)):
         delta = deltas[i-1]
         upval = max(delta, 0.)
-        dnval = max(-delta, 0.)
-        up_avg = (1 - alpha) * up_avg + alpha * upval
-        dn_avg = (1 - alpha) * dn_avg + alpha * dnval
-        rs = (up_avg / dn_avg) if dn_avg != 0 else (float('inf') if up_avg > 0 else 0)
+        downval = max(-delta, 0.)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = (up / down) if down != 0 else (float('inf') if up > 0 else 0)
         rsi[i] = 100. - 100. / (1. + rs) if rs != float('inf') else 100.
     return rsi
 
@@ -237,7 +260,6 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['di_minus'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     df['DX'] = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan).fillna(0)
     df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
-    # koşullar
     adx_condition = df['adx'].iloc[-2] >= ADX_THRESHOLD if pd.notna(df['adx'].iloc[-2]) else False
     di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
@@ -297,6 +319,30 @@ def ensure_atr(df, period=14):
     df['atr'] = tr.rolling(window=period).mean()
     return df
 
+# --- VOL & OBV + robust z (vol_z) ---
+def calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60):
+    close = df['close'].values
+    vol = df['volume'].values
+    obv = np.zeros_like(close, dtype=float)
+    for i in range(1, len(close)):
+        if close[i] > close[i-1]:
+            obv[i] = obv[i-1] + vol[i]
+        elif close[i] < close[i-1]:
+            obv[i] = obv[i-1] - vol[i]
+        else:
+            obv[i] = obv[i-1]
+    df['obv'] = obv
+    df['vol_ma'] = pd.Series(vol, index=df.index, dtype="float64").rolling(vol_ma_window).mean()
+
+    vol_s = pd.Series(vol, index=df.index, dtype="float64")
+    df['vol_med'] = vol_s.rolling(spike_window).median()
+    df['vol_mad'] = vol_s.rolling(spike_window).apply(
+        lambda x: np.median(np.abs(x - np.median(x))), raw=True
+    )
+    denom = (1.4826 * df['vol_mad']).replace(0, np.nan)  # MAD -> sigma
+    df['vol_z'] = (vol_s - df['vol_med']) / denom
+    return df
+
 def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
     df = ensure_atr(df, period=14)
     if len(df) < lookback_atr + 2:
@@ -311,15 +357,21 @@ def calculate_indicators(df, symbol, timeframe):
     if len(df) < 80:
         logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
         return None, None, None, None, None, None, None
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
+        df.set_index('timestamp', inplace=True)
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, 13)
     df['sma34'] = calculate_sma(closes, 34)
+    df['rsi']   = calculate_rsi(closes, 14)
     df['volume_sma20'] = df['volume'].rolling(20).mean().ffill()
     df = calculate_bb(df)
     df = calculate_kc(df)
     df = calculate_squeeze(df)
     df = calculate_smi_momentum(df)
     df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)
+    df = ensure_atr(df, period=14)
+    df = calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60)
     return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 
 # ================== Likidite Filtresi ==================
@@ -328,160 +380,104 @@ def liquidity_ok(df: pd.DataFrame) -> bool:
         return True
     if len(df) < LIQ_ROLL_BARS + 2:
         return False
-    dv = (df['close'] * df['volume']).astype(float)  # yaklaşık $ hacim
+    dv = (df['close'] * df['volume']).astype(float)
     roll = dv.rolling(LIQ_ROLL_BARS, min_periods=LIQ_ROLL_BARS)
     q = roll.apply(lambda x: np.nanquantile(x, LIQ_QUANTILE), raw=True)
     ok_q = bool(dv.iloc[-2] >= q.iloc[-2]) if pd.notna(q.iloc[-2]) else False
     ok_min = True if LIQ_MIN_DVOL_USD <= 0 else bool(dv.iloc[-2] >= LIQ_MIN_DVOL_USD)
     return ok_q and ok_min
 
-# ================== Trap Scoring – sadece bilgi amaçlı ==================
-# (Filtrelemez; 0–100 skor + etiket üretir ve mesajlara eklenir.)
-USE_TRAP_SCORING = True
-CTX_BARS = 3                 # son CTX_BARS kapalı mumla bağlam
-PCTX_WINDOW = 120            # persentil/normalize için rolling pencere
-W_NORMALIZE = True           # 0-1 normalize/persentil
-
-# Ağırlıklar (toplam ≈ 1.0)
-W_WICK      = 0.25   # fitil/morfoloji
-W_VOLUME_Z  = 0.25   # vol z + ctx
-W_BB_PROX   = 0.20   # BB proximity
-W_ATR_Z     = 0.15   # volatilite rejimi
-W_RSI       = 0.10   # aşırı alım/satım
-W_MISC_PAD  = 0.05   # küçük sabit dolgu
-
-def _risk_label(score: float) -> str:
-    if score < 20:  return "Çok düşük risk 🟢"
-    if score < 40:  return "Düşük risk 🟢"
-    if score < 60:  return "Orta ⚠️"
-    if score < 80:  return "Yüksek 🟠"
-    return "Aşırı risk 🔴"
-
-def _rolling_percentile(series: pd.Series, window: int, value: float) -> float:
-    try:
-        s = series.tail(window).dropna()
-        if len(s) < 5 or not np.isfinite(value):
-            return 0.0
-        return float((s <= value).mean())
-    except Exception:
-        return 0.0
-
-def _candle_parts(row):
+# ================== TRAP SKORLAMA HESABI ==================
+def candle_body_wicks(row):
     o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
     rng = max(h - l, 1e-12)
-    body = abs(c - o) / rng
-    up   = (h - max(o, c)) / rng
-    down = (min(o, c) - l) / rng
-    return body, up, down
-
-def _zscore(series: pd.Series, window: int, at_idx=-2) -> float:
-    s = series.iloc[:at_idx+1].tail(window).astype(float)
-    if len(s) < 10:
-        return 0.0
-    med = np.median(s)
-    mad = np.median(np.abs(s - med))
-    if mad == 0:
-        return 0.0
-    return float((s.iloc[-1] - med) / (1.4826 * mad))
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    return body / rng, upper_wick / rng, lower_wick / rng
 
 def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
     """
-    side: 'long' → bull-trap (yukarı yön tuzak) riski,
-          'short' → sell/bear-trap (aşağı yön tuzak) riski.
-    return: {'score':0..100, 'label':str, 'parts':{...}}
+    side = "long" -> Bull Trap Riski (yukarı fakeout)
+    side = "short"-> Sell Trap/Bear Trap riski (aşağı fakeout)
+    Filtre YOK; sadece skor üretir.
     """
     try:
-        if len(df) < max(PCTX_WINDOW, CTX_BARS) + 5:
-            return {'score': 0.0, 'label': _risk_label(0.0), 'parts': {}}
-
-        # CTX penceresi (son CTX_BARS kapalı mum)
-        ctx = df.iloc[-(CTX_BARS+1):-1]
+        # bağlam dilimi: son kapalı mumlar
+        ctx = df.iloc[-(SCORING_CTX_BARS+1):-1]  # -2 dahil, -1 hariç
         last = df.iloc[-2]
 
-        # Fitil/gövde CTX
-        bodies, ups, downs = [], [], []
-        for _, r in ctx.iterrows():
-            b,u,d = _candle_parts(r)
-            bodies.append(b); ups.append(u); downs.append(d)
-        wick_up_avg = float(np.mean(ups)) if ups else 0.0
-        wick_dn_avg = float(np.mean(downs)) if downs else 0.0
-        body_avg    = float(np.mean(bodies)) if bodies else 0.0
+        # --- wick/body ---
+        body_u_l = ctx.apply(candle_body_wicks, axis=1, result_type='expand')
+        body_ctx = float(body_u_l[0].median()) if not body_u_l.empty else 0.0
+        upper_ctx = float(body_u_l[1].median()) if not body_u_l.empty else 0.0
+        lower_ctx = float(body_u_l[2].median()) if not body_u_l.empty else 0.0
+        wick_ctx = upper_ctx if side == "long" else lower_ctx  # bull trap'te üst fitil, bear trap'te alt fitil
 
-        # Hacim z + ctx z
-        vol_z = _zscore(df['volume'], window=PCTX_WINDOW, at_idx=-2)
-        vol_z_ctx = float(np.mean([_zscore(df['volume'], window=PCTX_WINDOW, at_idx=-(i+2)) for i in range(CTX_BARS)]))
+        # --- vol z / vol_ma oranı ---
+        vol_z_ctx = float(ctx['vol_z'].median()) if 'vol_z' in ctx else 0.0
+        vol_ma = float(last.get('vol_ma', np.nan))
+        vol_now = float(last['volume'])
+        vol_ratio = (vol_now / vol_ma) if (np.isfinite(vol_ma) and vol_ma > 0) else 1.0
+        # 0..1 skala (tanh ile yumuşat)
+        vol_sig = np.tanh(max(0.0, vol_z_ctx) / 3.0)  # spike varsa ~1'e yaklaşır
+        vol_sig = max(vol_sig, np.tanh(max(0.0, vol_ratio - 1.0)))  # 1x üzeri güç
 
-        # ATR z
-        atr = ensure_atr(df, period=14)['atr']
-        atr_z = _zscore(atr, window=PCTX_WINDOW, at_idx=-2)
-
-        # RSI ctx
-        if 'rsi' not in df.columns:
-            df['rsi'] = calculate_rsi(df['close'].values.astype(float))
-        rsi_ctx = float(np.nanmean(df['rsi'].iloc[-(CTX_BARS+1):-1]))
-
-        # BB proximity
-        bb = calculate_bb(df.copy())
-        bb_up   = float(bb['bb_upper'].iloc[-2])
-        bb_low  = float(bb['bb_lower'].iloc[-2])
-        close   = float(df['close'].iloc[-2])
-
-        # Normalize/percentile
-        if W_NORMALIZE:
-            wick_up_norm   = _rolling_percentile(df['high'] - np.maximum(df['open'], df['close']), PCTX_WINDOW, (last['high'] - max(last['open'], last['close'])))
-            wick_dn_norm   = _rolling_percentile(np.maximum(df['open'], df['close']) - df['low'], PCTX_WINDOW, (max(last['open'], last['close']) - last['low']))
-            bb_up_prox_norm  = _rolling_percentile((bb['bb_upper'] - df['close']).abs(), PCTX_WINDOW, abs(bb_up - close))
-            bb_low_prox_norm = _rolling_percentile((df['close'] - bb['bb_lower']).abs(), PCTX_WINDOW, abs(close - bb_low))
-            atr_z_norm     = min(max((atr_z + 3)/6, 0.0), 1.0)   # -3..+3 → 0..1
-            vol_z_norm     = min(max((vol_z + 3)/6, 0.0), 1.0)
-            vol_z_ctx_norm = min(max((vol_z_ctx + 3)/6, 0.0), 1.0)
-        else:
-            wick_up_norm   = wick_up_avg
-            wick_dn_norm   = wick_dn_avg
-            span = max(abs(bb_up - bb_low), 1e-12)
-            bb_up_prox_norm  = max(min(abs(bb_up - close)/span, 1.0), 0.0)
-            bb_low_prox_norm = max(min(abs(close - bb_low)/span, 1.0), 0.0)
-            atr_z_norm     = min(max((atr_z + 3)/6, 0.0), 1.0)
-            vol_z_norm     = min(max((vol_z + 3)/6, 0.0), 1.0)
-            vol_z_ctx_norm = min(max((vol_z_ctx + 3)/6, 0.0), 1.0)
-
-        # Yön bazlı terimler
+        # --- BB prox ---
         if side == "long":
-            wick_term = wick_up_norm
-            bb_term   = bb_up_prox_norm
-            rsi_term  = 0.0 if not np.isfinite(rsi_ctx) else float(max((rsi_ctx - 70) / 30, 0.0))  # 70→100 → 0..1
+            num = float(last['close'] - last['bb_mid'])
+            den = float(last['bb_upper'] - last['bb_mid'])
         else:
-            wick_term = wick_dn_norm
-            bb_term   = bb_low_prox_norm
-            rsi_term  = 0.0 if not np.isfinite(rsi_ctx) else float(max((30 - rsi_ctx) / 30, 0.0))  # 30→0 → 0..1
+            num = float(last['bb_mid'] - last['close'])
+            den = float(last['bb_mid'] - last['bb_lower'])
+        bb_prox = clamp(num / (den + 1e-12), 0.0, 1.0) if np.isfinite(num) and np.isfinite(den) else 0.0
 
-        # Volatilite yumuşatma (yüksek ATR_z → “aşırılık” normalleşir)
-        vol_softener = 1.0 - 0.15 * min(max(atr_z_norm, 0.0), 1.0)
-        wick_term   *= vol_softener
-        bb_term     *= vol_softener
-        vol_z_norm  *= vol_softener
-        vol_z_ctx_norm *= vol_softener
+        # --- ATR z-score ---
+        atr_z = rolling_z(df['atr'], SCORING_WIN) if 'atr' in df else 0.0
+        atr_sig = clamp((atr_z + 1.0) / 3.0, 0.0, 1.0)  # z~2'de ~1'e yakınlar
 
-        # Bileşen skorları
-        s_wick = 100 * W_WICK * wick_term
-        s_vol  = 100 * W_VOLUME_Z * (0.6*vol_z_norm + 0.4*vol_z_ctx_norm)
-        s_bb   = 100 * W_BB_PROX * bb_term
-        s_atr  = 100 * W_ATR_Z * atr_z_norm
-        s_rsi  = 100 * W_RSI * rsi_term
-        s_misc = 100 * W_MISC_PAD * 0.5
+        # --- RSI aşırılık ---
+        rsi_ctx = float(ctx['rsi'].median()) if 'rsi' in ctx else 50.0
+        if side == "long":
+            rsi_sig = clamp((rsi_ctx - 60.0) / 20.0, 0.0, 1.0)  # 60→0, 80→1
+        else:
+            rsi_sig = clamp((40.0 - rsi_ctx) / 20.0, 0.0, 1.0)  # 40→0, 20→1
 
-        score = float(min(max(s_wick + s_vol + s_bb + s_atr + s_rsi + s_misc, 0.0), 100.0))
-        parts = {
-            'wick': round(s_wick, 2),
-            'volume': round(s_vol, 2),
-            'bb_prox': round(s_bb, 2),
-            'atr_z': round(s_atr, 2),
-            'rsi': round(s_rsi, 2),
-            'misc': round(s_misc, 2),
-        }
-        return {'score': score, 'label': _risk_label(score), 'parts': parts}
+        # --- Misc: ADX zayıf + squeeze_on ise küçük ek risk ---
+        misc = 0.0
+        if 'adx' in last and np.isfinite(last['adx']) and last['adx'] < ADX_THRESHOLD:
+            misc += 0.5
+        if 'squeeze_on' in last and bool(last['squeeze_on']):
+            misc += 0.5
+        misc_sig = clamp(misc / 1.0, 0.0, 1.0)
+
+        # --- Wick sinyali 0..1 ---
+        wick_sig = clamp((wick_ctx - 0.25) / 0.5, 0.0, 1.0)  # ~0.25 normal, 0.75 aşırı → 1.0
+
+        # --- Persentil adaptasyonu (opsiyonel basit nudge) ---
+        # (örn: BB prox ve wick için sembole özel rank destekleyici)
+        if len(df) >= SCORING_WIN:
+            wick_ref = df.iloc[-(SCORING_WIN+1):-1].apply(candle_body_wicks, axis=1, result_type='expand')
+            if not wick_ref.empty:
+                uref = float(wick_ref[1].median()) if side == "long" else float(wick_ref[2].median())
+                if np.isfinite(uref) and uref > 0:
+                    # eğer yakın geçmişte tipik wick büyükse, güncel wick'in "görece aşırılığı"nı hafiflet
+                    wick_sig *= clamp(0.8 + 0.4 * (0.5 / (uref + 1e-9)), 0.5, 1.2)
+
+        # --- Skor (0..100) ---
+        score = (
+            W_WICK   * wick_sig +
+            W_VOL    * vol_sig  +
+            W_BBPROX * bb_prox  +
+            W_ATRZ   * atr_sig  +
+            W_RSI    * rsi_sig  +
+            W_MISC   * misc_sig
+        )
+        score = float(clamp(score, 0.0, 100.0))
+        return {"score": score, "label": _risk_label(score)}
     except Exception as e:
-        return {'score': 0.0, 'label': _risk_label(0.0), 'parts': {'err': str(e)}}
+        logger.warning(f"compute_trap_scores hata: {e}")
+        return {"score": 0.0, "label": _risk_label(0.0)}
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
@@ -561,7 +557,7 @@ async def check_signals(symbol, timeframe='4h'):
 
         # --- Yön teyidi (ADX 2/3) ---
         adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
-        adx_ok = adx_condition  # (>= 18)
+        adx_ok = adx_condition
         adx_rising = df['adx'].iloc[-2] > df['adx'].iloc[-3] if pd.notna(df['adx'].iloc[-3]) and pd.notna(df['adx'].iloc[-2]) else False
         di_long = di_condition_long
         di_short = di_condition_short
@@ -578,7 +574,7 @@ async def check_signals(symbol, timeframe='4h'):
         volume_multiplier = 1.0 + min(avg_atr_ratio * 3, 0.2) if np.isfinite(avg_atr_ratio) else 1.0
         volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
 
-        # --- Al / Sat koşulları ---
+        # --- Al / Sat koşulları (SİSTEM AYNI) ---
         buy_condition = (
             liq_ok and
             ema_sma_crossover_buy and volume_ok and smi_condition_long and
@@ -621,13 +617,13 @@ async def check_signals(symbol, timeframe='4h'):
                     profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 else:
                     profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                message_type = "REVERSAL CLOSE 🚀" if profit_percent > 0 else "REVERSAL STOP 📉"
-                profit_text = f"Profit: {profit_percent:.2f}%" if profit_percent > 0 else f"Loss: {profit_percent:.2f}%"
+                message_type = "REVERSAL CLOSE 🔁"
+                profit_text = f"P/L: {profit_percent:.2f}%"
                 await enqueue_message(
                     f"{symbol} {timeframe}: {message_type}\n"
                     f"Price: {current_price:.4f}\n"
                     f"{profit_text}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (reversal)\n"
+                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı (reversal)\n"
                     f"Time: {now.strftime('%H:%M:%S')}"
                 )
                 signal_cache[key] = {
@@ -638,7 +634,7 @@ async def check_signals(symbol, timeframe='4h'):
                 }
                 current_pos = signal_cache[key]
 
-        # === Pozisyon aç ===
+        # === Pozisyon aç — BUY ===
         if buy_condition and current_pos['signal'] != 'buy':
             cooldown_active = (
                 current_pos['last_signal_time'] and
@@ -662,9 +658,11 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
 
-                    # --- Trap Skorları (bilgi amaçlı) ---
-                    bull_score = compute_trap_scores(df, side="long") if USE_TRAP_SCORING else {'score':0,'label':'','parts':{}}
-                    msg_trap = f"\nBullTrap Skor: {bull_score['score']:.1f} | {bull_score['label']}\nDetay: {bull_score['parts']}"
+                    # --- Trap Skoru (bilgi amaçlı) ---
+                    msg_trap = ""
+                    if USE_TRAP_SCORING:
+                        bull_score = compute_trap_scores(df, side="long")
+                        msg_trap = f"\nBullTrap Skor: {bull_score['score']:.1f} | {bull_score['label']}"
 
                     current_pos = {
                         'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -676,10 +674,11 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\nSMI:{smi_value}\nADX:{adx_value}\n"
-                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}\n"
-                        f"Time:{now.strftime('%H:%M:%S')}{msg_trap}"
+                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}"
+                        f"{msg_trap}\nTime:{now.strftime('%H:%M:%S')}"
                     )
 
+        # === Pozisyon aç — SELL ===
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
                 current_pos['last_signal_time'] and
@@ -703,9 +702,11 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
 
-                    # --- Trap Skorları (bilgi amaçlı) ---
-                    bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {'score':0,'label':'','parts':{}}
-                    msg_trap = f"\nSellTrap Skor: {bear_score['score']:.1f} | {bear_score['label']}\nDetay: {bear_score['parts']}"
+                    # --- Trap Skoru (bilgi amaçlı) ---
+                    msg_trap = ""
+                    if USE_TRAP_SCORING:
+                        bear_score = compute_trap_scores(df, side="short")
+                        msg_trap = f"\nSellTrap Skor: {bear_score['score']:.1f} | {bear_score['label']}"
 
                     current_pos = {
                         'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -717,8 +718,8 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\nSMI:{smi_value}\nADX:{adx_value}\n"
-                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}\n"
-                        f"Time:{now.strftime('%H:%M:%S')}{msg_trap}"
+                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}"
+                        f"{msg_trap}\nTime:{now.strftime('%H:%M:%S')}"
                     )
 
         # === Pozisyon yönetimi: LONG ===
@@ -730,7 +731,7 @@ async def check_signals(symbol, timeframe='4h'):
             if not current_pos['tp1_hit'] and current_price >= current_pos['tp1_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] -= 0.3
-                current_pos['sl_price'] = current_pos['entry_price']  # Break-even
+                current_pos['sl_price'] = current_pos['entry_price']  # BE
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🚀\nCur:{current_price:.4f}\nTP1:{current_pos['tp1_price']:.4f}\n"
@@ -796,7 +797,7 @@ async def check_signals(symbol, timeframe='4h'):
             if not current_pos['tp1_hit'] and current_price <= current_pos['tp1_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] -= 0.3
-                current_pos['sl_price'] = current_pos['entry_price']  # Break-even
+                current_pos['sl_price'] = current_pos['entry_price']  # BE
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🚀\nCur:{current_price:.4f}\nTP1:{current_pos['tp1_price']:.4f}\n"
@@ -881,7 +882,6 @@ async def main():
 
     shard_index = 0
     while True:
-        # sembolleri parçalara böl
         shard_symbols = [s for i, s in enumerate(symbols) if (i % N_SHARDS) == shard_index]
         logger.info(f"Shard {shard_index+1}/{N_SHARDS} -> {len(shard_symbols)} sembol taranacak")
         shard_index = (shard_index + 1) % N_SHARDS
