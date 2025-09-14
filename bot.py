@@ -420,8 +420,8 @@ def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
         vol_now = float(last['volume'])
         vol_ratio = (vol_now / vol_ma) if (np.isfinite(vol_ma) and vol_ma > 0) else 1.0
         # 0..1 skala (tanh ile yumuşat)
-        vol_sig = np.tanh(max(0.0, vol_z_ctx) / 3.0)  # spike varsa ~1'e yaklaşır
-        vol_sig = max(vol_sig, np.tanh(max(0.0, vol_ratio - 1.0)))  # 1x üzeri güç
+        vol_sig = np.tanh(max(0.0, vol_z_ctx) / 3.0)
+        vol_sig = max(vol_sig, np.tanh(max(0.0, vol_ratio - 1.0)))
 
         # --- BB prox ---
         if side == "long":
@@ -434,7 +434,7 @@ def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
 
         # --- ATR z-score ---
         atr_z = rolling_z(df['atr'], SCORING_WIN) if 'atr' in df else 0.0
-        atr_sig = clamp((atr_z + 1.0) / 3.0, 0.0, 1.0)  # z~2'de ~1'e yakınlar
+        atr_sig = clamp((atr_z + 1.0) / 3.0, 0.0, 1.0)
 
         # --- RSI aşırılık ---
         rsi_ctx = float(ctx['rsi'].median()) if 'rsi' in ctx else 50.0
@@ -452,16 +452,14 @@ def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
         misc_sig = clamp(misc / 1.0, 0.0, 1.0)
 
         # --- Wick sinyali 0..1 ---
-        wick_sig = clamp((wick_ctx - 0.25) / 0.5, 0.0, 1.0)  # ~0.25 normal, 0.75 aşırı → 1.0
+        wick_sig = clamp((wick_ctx - 0.25) / 0.5, 0.0, 1.0)
 
         # --- Persentil adaptasyonu (opsiyonel basit nudge) ---
-        # (örn: BB prox ve wick için sembole özel rank destekleyici)
         if len(df) >= SCORING_WIN:
             wick_ref = df.iloc[-(SCORING_WIN+1):-1].apply(candle_body_wicks, axis=1, result_type='expand')
             if not wick_ref.empty:
                 uref = float(wick_ref[1].median()) if side == "long" else float(wick_ref[2].median())
                 if np.isfinite(uref) and uref > 0:
-                    # eğer yakın geçmişte tipik wick büyükse, güncel wick'in "görece aşırılığı"nı hafiflet
                     wick_sig *= clamp(0.8 + 0.4 * (0.5 / (uref + 1e-9)), 0.5, 1.2)
 
         # --- Skor (0..100) ---
@@ -604,9 +602,9 @@ async def check_signals(symbol, timeframe='4h'):
         ema_prev, sma_prev = df['ema13'].iloc[-3], df['sma34'].iloc[-3]
         ema_last, sma_last = df['ema13'].iloc[-2], df['sma34'].iloc[-2]
         exit_cross_long  = (pd.notna(ema_prev) and pd.notna(sma_prev) and pd.notna(ema_last) and pd.notna(sma_last)
-                            and (ema_prev >= sma_prev) and (ema_last < sma_last))   # bearish cross -> long kapat
+                            and (ema_prev >= sma_prev) and (ema_last < sma_last))
         exit_cross_short = (pd.notna(ema_prev) and pd.notna(sma_prev) and pd.notna(ema_last) and pd.notna(sma_last)
-                            and (ema_prev <= sma_prev) and (ema_last > sma_last))   # bullish cross -> short kapat
+                            and (ema_prev <= sma_prev) and (ema_last > sma_last))
         logger.info(f"{symbol} {timeframe} exit_cross_long:{exit_cross_long} exit_cross_short:{exit_cross_short}")
 
         # === Reversal kapama ===
@@ -617,14 +615,11 @@ async def check_signals(symbol, timeframe='4h'):
                     profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 else:
                     profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                message_type = "REVERSAL CLOSE 🔁"
-                profit_text = f"P/L: {profit_percent:.2f}%"
                 await enqueue_message(
-                    f"{symbol} {timeframe}: {message_type}\n"
+                    f"{symbol} {timeframe}: REVERSAL CLOSE 🔁\n"
                     f"Price: {current_price:.4f}\n"
-                    f"{profit_text}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı (reversal)\n"
-                    f"Time: {now.strftime('%H:%M:%S')}"
+                    f"P/L: {profit_percent:+.2f}%\n"
+                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -642,7 +637,7 @@ async def check_signals(symbol, timeframe='4h'):
                 (APPLY_COOLDOWN_BOTH_DIRECTIONS or current_pos['last_signal_type'] == 'buy')
             )
             if cooldown_active:
-                await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (cooldown {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}")
+                await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (cooldown {COOLDOWN_MINUTES} dk) 🚫")
             else:
                 entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
                 eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
@@ -653,16 +648,16 @@ async def check_signals(symbol, timeframe='4h'):
                     logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
                     return
                 if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
-                    await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫\nCur:{current_price:.4f}\nSL:{sl_price:.4f}\nTime:{now.strftime('%H:%M:%S')}")
+                    await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
 
-                    # --- Trap Skoru (bilgi amaçlı) ---
-                    msg_trap = ""
+                    # --- Trap Skoru (bilgi amaçlı, sade satır) ---
+                    trap_line = ""
                     if USE_TRAP_SCORING:
                         bull_score = compute_trap_scores(df, side="long")
-                        msg_trap = f"\nBullTrap Skor: {bull_score['score']:.1f} | {bull_score['label']}"
+                        trap_line = f"\nTrap Risk (Bull): {bull_score['score']:.0f}/100 → {bull_score['label']}"
 
                     current_pos = {
                         'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -673,9 +668,12 @@ async def check_signals(symbol, timeframe='4h'):
                     }
                     signal_cache[key] = current_pos
                     await enqueue_message(
-                        f"{symbol} {timeframe}: BUY (LONG) 🚀\nSMI:{smi_value}\nADX:{adx_value}\n"
-                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}"
-                        f"{msg_trap}\nTime:{now.strftime('%H:%M:%S')}"
+                        f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"SL:    {sl_price:.2f}\n"
+                        f"TP1:   {tp1_price:.2f}\n"
+                        f"TP2:   {tp2_price:.2f}"
+                        f"{trap_line}"
                     )
 
         # === Pozisyon aç — SELL ===
@@ -686,7 +684,7 @@ async def check_signals(symbol, timeframe='4h'):
                 (APPLY_COOLDOWN_BOTH_DIRECTIONS or current_pos['last_signal_type'] == 'sell')
             )
             if cooldown_active:
-                await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (cooldown {COOLDOWN_MINUTES} dk) 🚫\nTime: {now.strftime('%H:%M:%S')}")
+                await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (cooldown {COOLDOWN_MINUTES} dk) 🚫")
             else:
                 entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
                 eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
@@ -697,16 +695,15 @@ async def check_signals(symbol, timeframe='4h'):
                     logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
                     return
                 if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
-                    await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫\nCur:{current_price:.4f}\nSL:{sl_price:.4f}\nTime:{now.strftime('%H:%M:%S')}")
+                    await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
 
-                    # --- Trap Skoru (bilgi amaçlı) ---
-                    msg_trap = ""
+                    trap_line = ""
                     if USE_TRAP_SCORING:
                         bear_score = compute_trap_scores(df, side="short")
-                        msg_trap = f"\nSellTrap Skor: {bear_score['score']:.1f} | {bear_score['label']}"
+                        trap_line = f"\nTrap Risk (Bear): {bear_score['score']:.0f}/100 → {bear_score['label']}"
 
                     current_pos = {
                         'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -717,9 +714,12 @@ async def check_signals(symbol, timeframe='4h'):
                     }
                     signal_cache[key] = current_pos
                     await enqueue_message(
-                        f"{symbol} {timeframe}: SELL (SHORT) 📉\nSMI:{smi_value}\nADX:{adx_value}\n"
-                        f"Entry:{entry_price:.4f}\nSL:{sl_price:.4f}\nTP1:{tp1_price:.4f}\nTP2:{tp2_price:.4f}"
-                        f"{msg_trap}\nTime:{now.strftime('%H:%M:%S')}"
+                        f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
+                        f"Entry: {entry_price:.2f}\n"
+                        f"SL:    {sl_price:.2f}\n"
+                        f"TP1:   {tp1_price:.2f}\n"
+                        f"TP2:   {tp2_price:.2f}"
+                        f"{trap_line}"
                     )
 
         # === Pozisyon yönetimi: LONG ===
@@ -734,9 +734,9 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['sl_price'] = current_pos['entry_price']  # BE
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
-                    f"{symbol} {timeframe}: TP1 Hit 🚀\nCur:{current_price:.4f}\nTP1:{current_pos['tp1_price']:.4f}\n"
-                    f"Profit:{profit_percent:.2f}%\n%30 satıldı, SL:{current_pos['sl_price']:.4f}\n"
-                    f"Kalan:%{current_pos['remaining_ratio']*100:.0f}\nTime:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP1 Hit 🎯\n"
+                    f"Cur: {current_price:.2f} | TP1: {current_pos['tp1_price']:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
             elif not current_pos['tp2_hit'] and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
@@ -744,8 +744,9 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['remaining_ratio'] -= 0.4
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
-                    f"{symbol} {timeframe}: TP2 Hit 🚀\nCur:{current_price:.4f}\nTP2:{current_pos['tp2_price']:.4f}\n"
-                    f"Profit:{profit_percent:.2f}%\n%40 satıldı, kalan %30 EMA/SMA çıkışına kadar\nTime:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
+                    f"Cur: {current_price:.2f} | TP2: {current_pos['tp2_price']:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
             # EMA/SMA exit (bearish cross)
@@ -753,10 +754,9 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (LONG) 🔁\n"
-                    f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent >= 0 else 'Loss:'} {profit_percent:.2f}%\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (kesişim çıkışı)\n"
-                    f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"Price: {current_price:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}%\n"
+                    f"Kalan %30 kapandı."
                 )
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -771,12 +771,10 @@ async def check_signals(symbol, timeframe='4h'):
             if current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
-                    f"{symbol} {timeframe}: {'LONG 🚀' if profit_percent > 0 else 'STOP LONG 📉'}\n"
-                    f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent > 0 else 'Loss:'} {profit_percent:.2f}%\n"
-                    f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                    f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: STOP LONG ⛔\n"
+                    f"Price: {current_price:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}%\n"
+                    f"Kalan %100 kapandı."
                 )
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -800,9 +798,9 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['sl_price'] = current_pos['entry_price']  # BE
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
-                    f"{symbol} {timeframe}: TP1 Hit 🚀\nCur:{current_price:.4f}\nTP1:{current_pos['tp1_price']:.4f}\n"
-                    f"Profit:{profit_percent:.2f}%\n%30 satıldı, SL:{current_pos['sl_price']:.4f}\n"
-                    f"Kalan:%{current_pos['remaining_ratio']*100:.0f}\nTime:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP1 Hit 🎯\n"
+                    f"Cur: {current_price:.2f} | TP1: {current_pos['tp1_price']:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
             elif not current_pos['tp2_hit'] and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
@@ -810,8 +808,9 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['remaining_ratio'] -= 0.4
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
-                    f"{symbol} {timeframe}: TP2 Hit 🚀\nCur:{current_price:.4f}\nTP2:{current_pos['tp2_price']:.4f}\n"
-                    f"Profit:{profit_percent:.2f}%\n%40 satıldı, kalan %30 EMA/SMA çıkışına kadar\nTime:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
+                    f"Cur: {current_price:.2f} | TP2: {current_pos['tp2_price']:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
             # EMA/SMA exit (bullish cross)
@@ -819,10 +818,9 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (SHORT) 🔁\n"
-                    f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent >= 0 else 'Loss:'} {profit_percent:.2f}%\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı (kesişim çıkışı)\n"
-                    f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"Price: {current_price:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}%\n"
+                    f"Kalan %30 kapandı."
                 )
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
@@ -835,14 +833,12 @@ async def check_signals(symbol, timeframe='4h'):
 
             # SL tetik
             if current_price >= current_pos['sl_price']:
-                profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                profit_percent = ((current_pos['entry_price'] - current_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
-                    f"{symbol} {timeframe}: {'SHORT 🚀' if profit_percent > 0 else 'STOP SHORT 📉'}\n"
-                    f"Price:{current_price:.4f}\n"
-                    f"{'Profit:' if profit_percent > 0 else 'Loss:'} {profit_percent:.2f}%\n"
-                    f"{'PARAYI VURDUK 🚀' if profit_percent > 0 else 'STOP 😞'}\n"
-                    f"Kalan %{current_pos['remaining_ratio']*100:.0f} satıldı\n"
-                    f"Time:{datetime.now(tz).strftime('%H:%M:%S')}"
+                    f"{symbol} {timeframe}: STOP SHORT ⛔\n"
+                    f"Price: {current_price:.2f}\n"
+                    f"P/L: {profit_percent:+.2f}%\n"
+                    f"Kalan %100 kapandı."
                 )
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
