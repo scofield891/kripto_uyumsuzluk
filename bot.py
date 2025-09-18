@@ -38,7 +38,18 @@ LOOKBACK_SMI = 20
 ADX_PERIOD = 14
 ADX_THRESHOLD = 18             # >= 18
 APPLY_COOLDOWN_BOTH_DIRECTIONS = True
-SMI_LIGHT_NORM_MAX = 0.5       # |SMI/ATR| < 0.5 "light"
+
+# ==== SMI Light (Adaptif + Slope teyidi + opsiyonel froth guard) ====
+SMI_LIGHT_NORM_MAX = 0.75        # statik fallback/başlangıç
+SMI_LIGHT_ADAPTIVE = True
+SMI_LIGHT_PCTL = 0.65            # 0.60 agresif, 0.70 muhafazakar
+SMI_LIGHT_MAX_MIN = 0.60         # adaptif alt sınır
+SMI_LIGHT_MAX_MAX = 1.10         # adaptif üst sınır
+SMI_LIGHT_REQUIRE_SQUEEZE = False  # squeeze_off zorunlu değil
+
+USE_SMI_SLOPE_CONFIRM = True     # SMI eğimi yön teyidi (önerilir)
+USE_FROTH_GUARD = False          # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
+FROTH_GUARD_K_ATR = 0.9          # |close-ema13| <= K * ATR
 
 # === ADX sinyal modu: "2of3" (önerilen) ===
 # Üçlü: (ADX>=18, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
@@ -511,12 +522,55 @@ async def check_signals(symbol, timeframe='4h'):
             logger.warning(f"ATR NaN/Inf ({symbol} {timeframe}), skip.")
             return
 
-        # SMI 'light' koşulu ATR ile normalize
+        # ================== SMI LIGHT (ADAPTİF + SLOPE + OPSİYONELLER) ==================
         smi_raw = smi_histogram
         atr_for_norm = max(atr_value, 1e-9)
         smi_norm = (smi_raw / atr_for_norm) if np.isfinite(smi_raw) else np.nan
-        smi_condition_long  = smi_squeeze_off and (smi_norm > 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX)
-        smi_condition_short = smi_squeeze_off and (smi_norm < 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX)
+
+        # Adaptif eşik
+        if SMI_LIGHT_ADAPTIVE:
+            smi_norm_series = (df['smi'] / df['atr']).replace([np.inf, -np.inf], np.nan)
+            ref = smi_norm_series.iloc[-(SCORING_WIN+1):-1].abs() if len(df) >= SCORING_WIN else smi_norm_series.abs()
+            if ref.notna().sum() >= 20:
+                pct_val = float(np.nanpercentile(ref, SMI_LIGHT_PCTL * 100))
+                SMI_LIGHT_NORM_MAX_EFF = clamp(pct_val, SMI_LIGHT_MAX_MIN, SMI_LIGHT_MAX_MAX)
+            else:
+                SMI_LIGHT_NORM_MAX_EFF = SMI_LIGHT_NORM_MAX
+        else:
+            SMI_LIGHT_NORM_MAX_EFF = SMI_LIGHT_NORM_MAX
+
+        # Squeeze opsiyonel
+        if SMI_LIGHT_REQUIRE_SQUEEZE:
+            base_long  = smi_squeeze_off and (smi_norm > 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
+            base_short = smi_squeeze_off and (smi_norm < 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
+        else:
+            base_long  = (smi_norm > 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
+            base_short = (smi_norm < 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
+
+        # Slope teyidi
+        if USE_SMI_SLOPE_CONFIRM and pd.notna(df['smi'].iloc[-3]) and pd.notna(df['smi'].iloc[-2]):
+            smi_slope = float(df['smi'].iloc[-2] - df['smi'].iloc[-3])
+            slope_ok_long  = smi_slope > 0
+            slope_ok_short = smi_slope < 0
+        else:
+            slope_ok_long = slope_ok_short = True
+
+        # (opsiyonel) coşku freni
+        if USE_FROTH_GUARD and pd.notna(df['ema13'].iloc[-2]):
+            ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
+            froth_ok = (ema_gap <= FROTH_GUARD_K_ATR * atr_for_norm)
+        else:
+            froth_ok = True
+
+        smi_condition_long  = base_long  and slope_ok_long  and froth_ok
+        smi_condition_short = base_short and slope_ok_short and froth_ok
+
+        logger.info(
+            f"{symbol} {timeframe} SMI_norm:{(smi_norm if np.isfinite(smi_norm) else float('nan')):.3f} "
+            f"squeeze_off:{smi_squeeze_off} eff_light:{SMI_LIGHT_NORM_MAX_EFF:.2f} "
+            f"slope_ok(L/S):{slope_ok_long}/{slope_ok_short} froth_ok:{froth_ok}"
+        )
+        # ================================================================================
 
         closed_candle = df.iloc[-2]
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
