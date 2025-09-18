@@ -159,6 +159,16 @@ def rolling_z(series: pd.Series, win: int) -> float:
         return 0.0
     return float((s.iloc[-1] - s.mean()) / (s.std(ddof=0) + 1e-12))
 
+# --- Fiyat formatlama (Telegram mesajları için) ---
+PRICE_DECIMALS = 5
+def fmt_price(x, dec=PRICE_DECIMALS):
+    try:
+        if not np.isfinite(x):
+            return "NaN"
+        return f"{x:.{dec}f}"
+    except Exception:
+        return str(x)
+
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str):
     try:
@@ -671,7 +681,7 @@ async def check_signals(symbol, timeframe='4h'):
                     profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: REVERSAL CLOSE 🔁\n"
-                    f"Price: {current_price:.4f}\n"
+                    f"Price: {fmt_price(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -723,10 +733,10 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                        f"Entry: {entry_price:.2f}\n"
-                        f"SL:    {sl_price:.2f}\n"
-                        f"TP1:   {tp1_price:.2f}\n"
-                        f"TP2:   {tp2_price:.2f}"
+                        f"Entry: {fmt_price(entry_price)}\n"
+                        f"SL:    {fmt_price(sl_price)}\n"
+                        f"TP1:   {fmt_price(tp1_price)}\n"
+                        f"TP2:   {fmt_price(tp2_price)}"
                         f"{trap_line}"
                     )
 
@@ -769,10 +779,10 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                        f"Entry: {entry_price:.2f}\n"
-                        f"SL:    {sl_price:.2f}\n"
-                        f"TP1:   {tp1_price:.2f}\n"
-                        f"TP2:   {tp2_price:.2f}"
+                        f"Entry: {fmt_price(entry_price)}\n"
+                        f"SL:    {fmt_price(sl_price)}\n"
+                        f"TP1:   {fmt_price(tp1_price)}\n"
+                        f"TP2:   {fmt_price(tp2_price)}"
                         f"{trap_line}"
                     )
 
@@ -789,7 +799,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🎯\n"
-                    f"Cur: {current_price:.2f} | TP1: {current_pos['tp1_price']:.2f}\n"
+                    f"Cur: {fmt_price(current_price)} | TP1: {fmt_price(current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
@@ -799,7 +809,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
-                    f"Cur: {current_price:.2f} | TP2: {current_pos['tp2_price']:.2f}\n"
+                    f"Cur: {fmt_price(current_price)} | TP2: {fmt_price(current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
@@ -808,7 +818,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (LONG) 🔁\n"
-                    f"Price: {current_price:.2f}\n"
+                    f"Price: {fmt_price(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %30 kapandı."
                 )
@@ -826,7 +836,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: STOP LONG ⛔\n"
-                    f"Price: {current_price:.2f}\n"
+                    f"Price: {fmt_price(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %100 kapandı."
                 )
@@ -853,7 +863,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🎯\n"
-                    f"Cur: {current_price:.2f} | TP1: {current_pos['tp1_price']:.2f}\n"
+                    f"Cur: {fmt_price(current_price)} | TP1: {fmt_price(current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
@@ -863,7 +873,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
-                    f"Cur: {current_price:.2f} | TP2: {current_pos['tp2_price']:.2f}\n"
+                    f"Cur: {fmt_price(current_price)} | TP2: {fmt_price(current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
@@ -872,7 +882,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (SHORT) 🔁\n"
-                    f"Price: {current_price:.2f}\n"
+                    f"Price: {fmt_price(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %30 kapandı."
                 )
@@ -890,7 +900,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: STOP SHORT ⛔\n"
-                    f"Price: {current_price:.2f}\n"
+                    f"Price: {fmt_price(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %100 kapandı."
                 )
