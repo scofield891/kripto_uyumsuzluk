@@ -30,7 +30,7 @@ TP_MULTIPLIER2 = 3.5 # TP2 = 3.5 x ATR (satış %40)
 SL_BUFFER = 0.3 # ATR x (SL'e ilave buffer)
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05 # ATR x (entry anında SL'e çok yakınsa atla)
-LOOKBACK_CROSSOVER = 30
+LOOKBACK_CROSSOVER = 12  # 30'dan 12'ye düşürdük, ~2 gün
 LOOKBACK_SMI = 20
 ADX_PERIOD = 14
 ADX_THRESHOLD = 18 # >= 18
@@ -73,14 +73,14 @@ RSI_LONG_EXCESS = 70.0   # Klasik overbought
 RSI_SHORT_EXCESS = 30.0  # Klasik oversold
 # === Trap risk sinyal kapısı + çıktı formatı ===
 TRAP_ONLY_LOW = True # True: sadece "Çok düşük / Düşük" risk sinyali gönder
-TRAP_MAX_SCORE = 40.0 # 0-39 izinli (40 ve üstü = Orta/Yüksek/Aşırı -> blok)
+TRAP_MAX_SCORE = 30.0 # 0-29 izinli (30 ve üstü blok - orta ve üstü engellemek için düşürdük)
 # ==== Dinamik trap eşiği (ADX'e göre) ====
-TRAP_DYN_USE = True
-TRAP_BASE_MAX = 40.0 # TRAP_DYN_USE=False iken kullanılan sabit eşiğin karşılığı
-TRAP_DYN_MIN = 35.0 # ADX çok zayıfken izin verilen max skor
-TRAP_DYN_MAX = 48.0 # ADX güçlü iken izin verilen max skor
-TRAP_ADX_LO = 14.0 # alt referans ADX
-TRAP_ADX_HI = 30.0 # üst referans ADX
+TRAP_DYN_USE = False # Kaldırdık, sabit eşik kullan
+TRAP_BASE_MAX = 30.0 # Sabit eşik (dinamik kapalıyken)
+TRAP_DYN_MIN = 35.0 # Kullanılmıyor
+TRAP_DYN_MAX = 48.0 # Kullanılmıyor
+TRAP_ADX_LO = 14.0 # Kullanılmıyor
+TRAP_ADX_HI = 30.0 # Kullanılmıyor
 PRICE_DECIMALS = 5 # mesajlarda ondalık hane
 def fmt(x, d=PRICE_DECIMALS):
     try:
@@ -90,7 +90,7 @@ def fmt(x, d=PRICE_DECIMALS):
 # TT mesaj etiketleri
 def _risk_label(score: float) -> str:
     if score < 20: return "Çok düşük risk 🟢"
-    if score < 40: return "Düşük risk 🟢"
+    if score < 30: return "Düşük risk 🟢"  # Eşik düşürüldüğü için label'ı uyarladım
     if score < 60: return "Orta risk ⚠️"
     if score < 80: return "Yüksek risk 🟠"
     return "Aşırı risk 🔴"
@@ -525,6 +525,8 @@ def _dynamic_liq_floor(dv_series: pd.Series) -> float:
     med = float(s.tail(VOL_LIQ_ROLL).median())
     dyn = med * VOL_LIQ_MED_FACTOR
     return clamp(dyn, VOL_LIQ_MIN_DVOL_LO, VOL_LIQ_MIN_DVOL_HI)
+MAJOR_SYMBOLS = {"BTC/USDT:USDT", "ETH/USDT:USDT"}
+MAJOR_LIQ_MIN = 100_000
 def volume_gate(df: pd.DataFrame, side: str, atr_ratio: float, symbol: str = "") -> (bool, str):
     if len(df) < max(VOL_LIQ_ROLL+2, VOL_REF_WIN+2):
         return False, "data_short"
@@ -541,7 +543,7 @@ def volume_gate(df: pd.DataFrame, side: str, atr_ratio: float, symbol: str = "")
         base = symbol.split('/')[0]
         is_major = base in {"BTC", "ETH"}
         if is_major:
-            dyn_min = max(dyn_min, VOL_LIQ_MIN_DVOL_USD)  # majör için sabit min kullan
+            dyn_min = max(dyn_min, MAJOR_LIQ_MIN)
         min_required = max(qv, dyn_min)
         liq_bypass = False
         if LIQ_BYPASS_GOOD_SPIKE:
