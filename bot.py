@@ -30,7 +30,7 @@ TP_MULTIPLIER2 = 3.5 # TP2 = 3.5 x ATR (satış %40)
 SL_BUFFER = 0.3 # ATR x (SL'e ilave buffer)
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05 # ATR x (entry anında SL'e çok yakınsa atla)
-LOOKBACK_CROSSOVER = 12  # 30'dan 12'ye düşürdük, ~2 gün
+LOOKBACK_CROSSOVER = 12  # Sadeleştirdik, ~2 gün geriye bak
 LOOKBACK_SMI = 20
 ADX_PERIOD = 14
 ADX_THRESHOLD = 18 # >= 18
@@ -73,14 +73,10 @@ RSI_LONG_EXCESS = 70.0   # Klasik overbought
 RSI_SHORT_EXCESS = 30.0  # Klasik oversold
 # === Trap risk sinyal kapısı + çıktı formatı ===
 TRAP_ONLY_LOW = True # True: sadece "Çok düşük / Düşük" risk sinyali gönder
-TRAP_MAX_SCORE = 30.0 # 0-29 izinli (30 ve üstü blok - orta ve üstü engellemek için düşürdük)
+TRAP_MAX_SCORE = 40.0 # 0-39 izinli (40 ve üstü blok)
 # ==== Dinamik trap eşiği (ADX'e göre) ====
-TRAP_DYN_USE = False # Kaldırdık, sabit eşik kullan
-TRAP_BASE_MAX = 30.0 # Sabit eşik (dinamik kapalıyken)
-TRAP_DYN_MIN = 35.0 # Kullanılmıyor
-TRAP_DYN_MAX = 48.0 # Kullanılmıyor
-TRAP_ADX_LO = 14.0 # Kullanılmıyor
-TRAP_ADX_HI = 30.0 # Kullanılmıyor
+TRAP_DYN_USE = False # Kaldırıldı
+TRAP_BASE_MAX = 40.0 # Sabit eşik
 PRICE_DECIMALS = 5 # mesajlarda ondalık hane
 def fmt(x, d=PRICE_DECIMALS):
     try:
@@ -90,7 +86,7 @@ def fmt(x, d=PRICE_DECIMALS):
 # TT mesaj etiketleri
 def _risk_label(score: float) -> str:
     if score < 20: return "Çok düşük risk 🟢"
-    if score < 30: return "Düşük risk 🟢"  # Eşik düşürüldüğü için label'ı uyarladım
+    if score < 40: return "Düşük risk 🟢"
     if score < 60: return "Orta risk ⚠️"
     if score < 80: return "Yüksek risk 🟠"
     return "Aşırı risk 🔴"
@@ -147,13 +143,6 @@ def rolling_z(series: pd.Series, win: int) -> float:
     if s.size < 5 or s.std(ddof=0) == 0 or not np.isfinite(s.iloc[-1]):
         return 0.0
     return float((s.iloc[-1] - s.mean()) / (s.std(ddof=0) + 1e-12))
-# ---- Dinamik trap eşiği yardımcı fonksiyonu ----
-def trap_threshold_by_adx(adx_value: float) -> float:
-    """ADX'e göre low-risk barajını [TRAP_DYN_MIN .. TRAP_DYN_MAX] arasında ölçekle."""
-    if not TRAP_DYN_USE or not np.isfinite(adx_value):
-        return TRAP_BASE_MAX if TRAP_BASE_MAX is not None else TRAP_MAX_SCORE
-    a = clamp((adx_value - TRAP_ADX_LO) / max(TRAP_ADX_HI - TRAP_ADX_LO, 1e-9), 0.0, 1.0)
-    return TRAP_DYN_MIN + a * (TRAP_DYN_MAX - TRAP_DYN_MIN)
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str):
     try:
@@ -525,8 +514,6 @@ def _dynamic_liq_floor(dv_series: pd.Series) -> float:
     med = float(s.tail(VOL_LIQ_ROLL).median())
     dyn = med * VOL_LIQ_MED_FACTOR
     return clamp(dyn, VOL_LIQ_MIN_DVOL_LO, VOL_LIQ_MIN_DVOL_HI)
-MAJOR_SYMBOLS = {"BTC/USDT:USDT", "ETH/USDT:USDT"}
-MAJOR_LIQ_MIN = 100_000
 def volume_gate(df: pd.DataFrame, side: str, atr_ratio: float, symbol: str = "") -> (bool, str):
     if len(df) < max(VOL_LIQ_ROLL+2, VOL_REF_WIN+2):
         return False, "data_short"
@@ -543,7 +530,7 @@ def volume_gate(df: pd.DataFrame, side: str, atr_ratio: float, symbol: str = "")
         base = symbol.split('/')[0]
         is_major = base in {"BTC", "ETH"}
         if is_major:
-            dyn_min = max(dyn_min, MAJOR_LIQ_MIN)
+            dyn_min = max(dyn_min, VOL_LIQ_MIN_DVOL_USD)
         min_required = max(qv, dyn_min)
         liq_bypass = False
         if LIQ_BYPASS_GOOD_SPIKE:
@@ -681,12 +668,11 @@ async def check_signals(symbol, timeframe='4h'):
         ok_s, reason_s = volume_gate(df, side="short", atr_ratio=avg_atr_ratio, symbol=symbol)
         logger.info(f"{symbol} {timeframe} VOL_LONG {ok_l} | {reason_l}")
         logger.info(f"{symbol} {timeframe} VOL_SHORT {ok_s} | {reason_s}")
-        # ---- Trap skoru & dinamik kapı ----
+        # ---- Trap skoru & sabit kapı ----
         bull_score = compute_trap_scores(df, side="long") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
         bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
-        adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
-        eff_trap_max = trap_threshold_by_adx(adx_last)
-        logger.info(f"{symbol} {timeframe} trap_dyn_thr:{eff_trap_max:.2f}")
+        eff_trap_max = TRAP_BASE_MAX  # Dinamik kaldırıldı, sabit eşik
+        logger.info(f"{symbol} {timeframe} trap_thr:{eff_trap_max:.2f}")
         trap_ok_long = (not TRAP_ONLY_LOW) or (bull_score["score"] < eff_trap_max)
         trap_ok_short = (not TRAP_ONLY_LOW) or (bear_score["score"] < eff_trap_max)
         closed_candle = df.iloc[-2]
