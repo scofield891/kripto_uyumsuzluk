@@ -6,6 +6,7 @@ import telegram
 import logging
 import asyncio
 from datetime import datetime, timedelta
+import time
 import pytz
 import sys
 import os
@@ -14,7 +15,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
-import time  # <-- eklendi
 
 # ================== Sabit Değerler ==================
 # Güvenlik: ENV zorunlu
@@ -25,7 +25,7 @@ if not BOT_TOKEN or not CHAT_ID:
 
 TEST_MODE = False
 
-# ---- Sinyal / Risk Parametreleri (SİSTEM AYNI) ----
+# ---- Sinyal / Risk Parametreleri ----
 LOOKBACK_ATR = 18
 SL_MULTIPLIER = 1.8            # SL = 1.8 x ATR
 TP_MULTIPLIER1 = 2.0           # TP1 = 2.0 x ATR  (satış %30)
@@ -48,26 +48,19 @@ SMI_LIGHT_MAX_MIN = 0.60         # adaptif alt sınır
 SMI_LIGHT_MAX_MAX = 1.10         # adaptif üst sınır
 SMI_LIGHT_REQUIRE_SQUEEZE = False  # squeeze_off zorunlu değil
 
-USE_SMI_SLOPE_CONFIRM = True     # SMI eğimi yön teyidi (önerilir)
+USE_SMI_SLOPE_CONFIRM = True     # SMI eğimi yön teyidi
 USE_FROTH_GUARD = False          # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
 FROTH_GUARD_K_ATR = 0.9          # |close-ema13| <= K * ATR
 
-# === ADX rising (k=5, slope + net + pos_ratio; hibrit k=3 opsiyonlu) ===
-ADX_RISE_K = 5
-ADX_RISE_MIN_NET = 1.0
-ADX_RISE_POS_RATIO = 0.6
-ADX_RISE_EPS = 0.0
-ADX_RISE_HYBRID = True  # k=3 hızlı test
-
-# === ADX sinyal modu: "2of3" (önerilen) ===
-SIGNAL_MODE = "2of3"
+# === ADX sinyal modu ===
+SIGNAL_MODE = "2of3"             # Üçlü: (ADX>=18, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
 
 # ---- Rate-limit & tarama pacing ----
-MAX_CONCURRENT_FETCHES = 6
-RATE_LIMIT_MS = 150
-N_SHARDS = 10
-BATCH_SIZE = 8
-INTER_BATCH_SLEEP = 1.5
+MAX_CONCURRENT_FETCHES = 4
+RATE_LIMIT_MS = 200
+N_SHARDS = 5
+BATCH_SIZE = 10
+INTER_BATCH_SLEEP = 5.0
 
 # ---- Sembol keşif ----
 LINEAR_ONLY = True
@@ -80,17 +73,36 @@ LIQ_QUANTILE  = 0.70
 LIQ_MIN_DVOL_USD = 0
 
 # ================== TRAP SKORLAMA ==================
-USE_TRAP_SCORING = True
-SCORING_CTX_BARS = 3
-SCORING_WIN = 120
-# ---- Ağırlıklar (TOPLAM = 100) ----
-W_WICK   = 18.0
-W_VOL    = 18.0
-W_FB     = 15.0   # Fitil-bias (soft bonus)
-W_BBPROX = 15.0
-W_ATRZ   = 15.0
-W_RSI    = 15.0
-W_MISC   = 4.0
+USE_TRAP_SCORING = True           # sadece puanlama; filtre YOK (kapı aşağıda)
+SCORING_CTX_BARS = 3              # son 3 bar bağlam (wick/vol/RSI medyanı)
+SCORING_WIN = 120                 # persentil/z-score penceresi (bar)
+
+# Ağırlıklar (toplam ~100; mevcut dağılımı bozmadık)
+W_WICK   = 25.0                   # wick/boy oranı
+W_VOL    = 25.0                   # hacim z / vol_ma oranı
+W_BBPROX = 15.0                   # BB üst/alt banda yakınlık
+W_ATRZ   = 15.0                   # ATR z-score
+W_RSI    = 15.0                   # RSI aşırılık
+W_MISC   = 5.0                    # ufak bağlam (ADX zayıf / squeeze vb.)
+
+# === Trap risk sinyal kapısı + çıktı formatı ===
+TRAP_ONLY_LOW = True          # True: sadece "Çok düşük / Düşük" risk sinyali gönder
+TRAP_MAX_SCORE = 40.0         # 0-39 izinli (40 ve üstü = Orta/Yüksek/Aşırı -> blok)
+
+# ==== Dinamik trap eşiği (ADX'e göre) ====
+TRAP_DYN_USE   = True
+TRAP_BASE_MAX  = 40.0   # TRAP_DYN_USE=False iken kullanılan sabit eşiğin karşılığı
+TRAP_DYN_MIN   = 35.0   # ADX çok zayıfken izin verilen max skor
+TRAP_DYN_MAX   = 48.0   # ADX güçlü iken izin verilen max skor
+TRAP_ADX_LO    = 14.0   # alt referans ADX
+TRAP_ADX_HI    = 30.0   # üst referans ADX
+
+PRICE_DECIMALS = 5            # mesajlarda ondalık hane
+def fmt(x, d=PRICE_DECIMALS):
+    try:
+        return f"{float(x):.{d}f}"
+    except Exception:
+        return str(x)
 
 # TT mesaj etiketleri
 def _risk_label(score: float) -> str:
@@ -166,14 +178,14 @@ def rolling_z(series: pd.Series, win: int) -> float:
         return 0.0
     return float((s.iloc[-1] - s.mean()) / (s.std(ddof=0) + 1e-12))
 
-# Yeterli veri limiti (tek merkezden)
-REQUIRED_BARS = max(
-    SCORING_WIN + 5,
-    LOOKBACK_ATR + 80,
-    LOOKBACK_SMI + 5,
-    ADX_PERIOD + 5,
-    160
-)
+# ---- Dinamik trap eşiği yardımcı fonksiyonu ----
+def trap_threshold_by_adx(adx_value: float) -> float:
+    """ADX'e göre low-risk barajını [TRAP_DYN_MIN .. TRAP_DYN_MAX] arasında ölçekle."""
+    if not TRAP_DYN_USE or not np.isfinite(adx_value):
+        # Dinamik kapalıysa sabit eşiğin karşılığını kullan
+        return TRAP_BASE_MAX if TRAP_BASE_MAX is not None else TRAP_MAX_SCORE
+    a = clamp((adx_value - TRAP_ADX_LO) / max(TRAP_ADX_HI - TRAP_ADX_LO, 1e-9), 0.0, 1.0)
+    return TRAP_DYN_MIN + a * (TRAP_DYN_MAX - TRAP_DYN_MIN)
 
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str):
@@ -281,40 +293,17 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close = np.abs(df['low'] - df['close'].shift(1))
     df['TR'] = np.maximum(high_low, np.maximum(high_close, low_close))
-    alpha = 1.0 / period  # Wilder
+    alpha = 1.0 / period  # Wilder smoothing
     tr_ema = df['TR'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
     df['di_plus'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     df['di_minus'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     df['DX'] = 100 * np.abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus']).replace(0, np.nan).fillna(0)
     df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
-
-    # ---- ADX rising (k=5 + hibrit k=3) ----
-    adx_rising = False
-    try:
-        adx_series = df['adx'].iloc[-(ADX_RISE_K+1):-1].astype(float)  # son kapalı k mum
-        adx_series = adx_series.replace([np.inf, -np.inf], np.nan).dropna()
-        if len(adx_series) >= ADX_RISE_K:
-            x = np.arange(len(adx_series))
-            slope = np.polyfit(x, adx_series, 1)[0]
-            net = adx_series.iloc[-1] - adx_series.iloc[0]
-            diffs = np.diff(adx_series.values)
-            pos_ratio = (diffs > ADX_RISE_EPS).mean() if diffs.size else 0.0
-            adx_rising = (slope > 0) and (net >= ADX_RISE_MIN_NET) and (pos_ratio >= ADX_RISE_POS_RATIO)
-        if not adx_rising and ADX_RISE_HYBRID:
-            adx3 = df['adx'].iloc[-4:-1].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-            if len(adx3) == 3:
-                slope3 = np.polyfit(np.arange(3), adx3, 1)[0]
-                diffs3 = np.diff(adx3.values)
-                last_diff_pos = diffs3[-1] > ADX_RISE_EPS if diffs3.size else False
-                adx_rising = (slope3 > 0) and last_diff_pos
-    except Exception:
-        adx_rising = False
-
     adx_condition = df['adx'].iloc[-2] >= ADX_THRESHOLD if pd.notna(df['adx'].iloc[-2]) else False
     di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
-    logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]} | rising:{adx_rising}")
-    return df, adx_condition, di_condition_long, di_condition_short, adx_rising
+    logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
+    return df, adx_condition, di_condition_long, di_condition_short
 
 def calculate_bb(df, period=20, mult=2.0):
     df['bb_mid'] = df['close'].rolling(period).mean()
@@ -395,25 +384,23 @@ def calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60):
 
 def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
     df = ensure_atr(df, period=14)
-    if df is None or df.empty or len(df) < lookback_atr + 2:
+    if len(df) < lookback_atr + 2:
         return np.nan, np.nan
-    atr_series = df['atr'].iloc[-(lookback_atr+1):-1].replace([np.inf, -np.inf], np.nan).dropna()
+    atr_series = df['atr'].iloc[-(lookback_atr+1):-1].dropna()
     close_last = float(df['close'].iloc[-2]) if pd.notna(df['close'].iloc[-2]) else np.nan
     if atr_series.empty or not np.isfinite(close_last) or close_last == 0:
-        logger.warning("ATR serisi/close_last geçersiz (NaN/Inf/0) -> skip risk metrikleri")
         return np.nan, np.nan
     atr_value = float(df['atr'].iloc[-2]) if pd.notna(df['atr'].iloc[-2]) else np.nan
     avg_atr_ratio = float(atr_series.mean() / close_last)
     return atr_value, avg_atr_ratio
 
 def calculate_indicators(df, symbol, timeframe):
-    if df is None or df.empty or len(df) < REQUIRED_BARS:
-        logger.warning(f"DF kısa ({0 if df is None else len(df)}), indikatör atlandı: {symbol} {timeframe}")
+    if len(df) < 80:
+        logger.warning(f"DF çok kısa ({len(df)}), indikatör hesaplanamadı.")
         return None, None, None, None, None, None, None
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
         df.set_index('timestamp', inplace=True)
-
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, 13)
     df['sma34'] = calculate_sma(closes, 34)
@@ -423,10 +410,50 @@ def calculate_indicators(df, symbol, timeframe):
     df = calculate_kc(df)
     df = calculate_squeeze(df)
     df = calculate_smi_momentum(df)
-    df, adx_condition, di_condition_long, di_condition_short, adx_rising = calculate_adx(df, symbol)
+    df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)
     df = ensure_atr(df, period=14)
     df = calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60)
-    return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short, adx_rising
+    return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
+
+# ========= ADX Rising (k=5 ana test + k=3 hibrit hızlı test) =========
+ADX_RISE_K = 5
+ADX_RISE_MIN_NET = 1.0
+ADX_RISE_POS_RATIO = 0.6
+ADX_RISE_EPS = 0.0
+ADX_RISE_USE_HYBRID = True  # k=3 hızlı test açık
+
+def adx_rising_strict(df_adx: pd.Series) -> bool:
+    """Kapalı mumlardan son k değeriyle ([-k-1:-1]) ADX rising kontrolü."""
+    if df_adx is None or len(df_adx) < ADX_RISE_K + 1:
+        return False
+    window = df_adx.iloc[-(ADX_RISE_K+1):-1].astype(float)  # kapalı mumlar
+    if window.isna().any():
+        return False
+    x = np.arange(len(window))
+    slope, _ = np.polyfit(x, window.values, 1)
+    diffs = np.diff(window.values)
+    pos_ratio = (diffs > ADX_RISE_EPS).mean() if diffs.size > 0 else 0.0
+    net = window.iloc[-1] - window.iloc[0]
+    return (slope > 0) and (net >= ADX_RISE_MIN_NET) and (pos_ratio >= ADX_RISE_POS_RATIO)
+
+def adx_rising_hybrid(df_adx: pd.Series) -> bool:
+    if not ADX_RISE_USE_HYBRID:
+        return False
+    # k=3 hızlı test: slope>0 ve SON fark > eps ise True
+    if df_adx is None or len(df_adx) < 4:
+        return False
+    window = df_adx.iloc[-4:-1].astype(float)  # 3 kapalı fark
+    if window.isna().any():
+        return False
+    x = np.arange(len(window))
+    slope, _ = np.polyfit(x, window.values, 1)
+    last_diff = window.values[-1] - window.values[-2]
+    return (slope > 0) and (last_diff > ADX_RISE_EPS)
+
+def adx_rising(df: pd.DataFrame) -> bool:
+    if 'adx' not in df.columns:
+        return False
+    return adx_rising_strict(df['adx']) or adx_rising_hybrid(df['adx'])
 
 # ================== Likidite Filtresi ==================
 def liquidity_ok(df: pd.DataFrame) -> bool:
@@ -451,22 +478,16 @@ def candle_body_wicks(row):
     return body / rng, upper_wick / rng, lower_wick / rng
 
 def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
-    """
-    side = "long" -> Bull Trap Riski (yukarı fakeout)
-    side = "short"-> Bear Trap riski (aşağı fakeout)
-    """
     try:
-        ctx = df.iloc[-(SCORING_CTX_BARS+1):-1]  # -2 dahil, -1 hariç
+        ctx = df.iloc[-(SCORING_CTX_BARS+1):-1]
         last = df.iloc[-2]
 
-        # --- wick/body ---
         body_u_l = ctx.apply(candle_body_wicks, axis=1, result_type='expand')
         body_ctx = float(body_u_l[0].median()) if not body_u_l.empty else 0.0
         upper_ctx = float(body_u_l[1].median()) if not body_u_l.empty else 0.0
         lower_ctx = float(body_u_l[2].median()) if not body_u_l.empty else 0.0
         wick_ctx = upper_ctx if side == "long" else lower_ctx
 
-        # --- vol z / vol_ma oranı ---
         vol_z_ctx = float(ctx['vol_z'].median()) if 'vol_z' in ctx else 0.0
         vol_ma = float(last.get('vol_ma', np.nan))
         vol_now = float(last['volume'])
@@ -474,7 +495,6 @@ def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
         vol_sig = np.tanh(max(0.0, vol_z_ctx) / 3.0)
         vol_sig = max(vol_sig, np.tanh(max(0.0, vol_ratio - 1.0)))
 
-        # --- BB prox ---
         if side == "long":
             num = float(last['close'] - last['bb_mid'])
             den = float(last['bb_upper'] - last['bb_mid'])
@@ -483,52 +503,34 @@ def compute_trap_scores(df: pd.DataFrame, side: str = "long") -> dict:
             den = float(last['bb_mid'] - last['bb_lower'])
         bb_prox = clamp(num / (den + 1e-12), 0.0, 1.0) if np.isfinite(num) and np.isfinite(den) else 0.0
 
-        # --- ATR z-score ---
         atr_z = rolling_z(df['atr'], SCORING_WIN) if 'atr' in df else 0.0
         atr_sig = clamp((atr_z + 1.0) / 3.0, 0.0, 1.0)
 
-        # --- RSI aşırılık ---
         rsi_ctx = float(ctx['rsi'].median()) if 'rsi' in ctx else 50.0
         if side == "long":
             rsi_sig = clamp((rsi_ctx - 60.0) / 20.0, 0.0, 1.0)
         else:
             rsi_sig = clamp((40.0 - rsi_ctx) / 20.0, 0.0, 1.0)
 
-        # --- Misc: ADX zayıf + squeeze_on ise küçük ek risk ---
         misc = 0.0
         if 'adx' in last and np.isfinite(last['adx']) and last['adx'] < ADX_THRESHOLD:
             misc += 0.5
         if 'squeeze_on' in last and bool(last['squeeze_on']):
             misc += 0.5
-        # aşırı hacim tuzağı işareti: vol_z son bar > 2.0 ise 0.3 ek
-        try:
-            if pd.notna(last.get('vol_z', np.nan)) and float(last['vol_z']) > 2.0:
-                misc += 0.3
-        except Exception:
-            pass
-        misc_sig = clamp(misc / 1.3, 0.0, 1.0)  # normalize ~[0..1]
+        misc_sig = clamp(misc / 1.0, 0.0, 1.0)
 
-        # --- Wick sinyali ---
         wick_sig = clamp((wick_ctx - 0.25) / 0.5, 0.0, 1.0)
 
-        # --- Fitil-bias (FB) soft bonus ---
-        fb_sig = 0.0
-        try:
-            if side == "long":
-                # uzun üst fitil → bull trap riski; bonusu "yumuşak" tut
-                uw = upper_ctx
-                fb_sig = clamp((uw - 0.30) / 0.40, 0.0, 1.0) * 0.3  # max 0.3
-            else:
-                lw = lower_ctx
-                fb_sig = clamp((lw - 0.30) / 0.40, 0.0, 1.0) * 0.3
-        except Exception:
-            fb_sig = 0.0
+        if len(df) >= SCORING_WIN:
+            wick_ref = df.iloc[-(SCORING_WIN+1):-1].apply(candle_body_wicks, axis=1, result_type='expand')
+            if not wick_ref.empty:
+                uref = float(wick_ref[1].median()) if side == "long" else float(wick_ref[2].median())
+                if np.isfinite(uref) and uref > 0:
+                    wick_sig *= clamp(0.8 + 0.4 * (0.5 / (uref + 1e-9)), 0.5, 1.2)
 
-        # --- Skor (0..100) ---
         score = (
             W_WICK   * wick_sig +
             W_VOL    * vol_sig  +
-            W_FB     * fb_sig   +
             W_BBPROX * bb_prox  +
             W_ATRZ   * atr_sig  +
             W_RSI    * rsi_sig  +
@@ -554,17 +556,18 @@ async def check_signals(symbol, timeframe='4h'):
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             logger.info(f"Test modu: {symbol} {timeframe}")
         else:
-            ohlcv = await fetch_ohlcv_async(symbol, timeframe, limit=REQUIRED_BARS)  # <-- dinamik limit
+            limit_need = max(150, LOOKBACK_ATR + 80, LOOKBACK_SMI + 40, ADX_PERIOD + 40, SCORING_WIN + 5)
+            ohlcv = await fetch_ohlcv_async(symbol, timeframe, limit=limit_need)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            if df is None or df.empty or len(df) < REQUIRED_BARS:
+            if df is None or df.empty or len(df) < 80:
                 logger.warning(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), skip.")
                 return
 
         # --- İndikatörler ---
-        out = calculate_indicators(df, symbol, timeframe)
-        if out[0] is None:
+        calc = calculate_indicators(df, symbol, timeframe)
+        if not calc or calc[0] is None:
             return
-        df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short, adx_rising = out
+        df, smi_squeeze_off, smi_histogram, smi_color, adx_condition, di_condition_long, di_condition_short = calc
 
         # --- Likidite ---
         liq_ok = liquidity_ok(df)
@@ -575,12 +578,11 @@ async def check_signals(symbol, timeframe='4h'):
             logger.warning(f"ATR NaN/Inf ({symbol} {timeframe}), skip.")
             return
 
-        # ================== SMI LIGHT (ADAPTİF + SLOPE + OPSİYONELLER) ==================
+        # ================== SMI LIGHT (ADAPTİF + SLOPE + OPSİYONEL) ==================
         smi_raw = smi_histogram
         atr_for_norm = max(atr_value, 1e-9)
         smi_norm = (smi_raw / atr_for_norm) if np.isfinite(smi_raw) else np.nan
 
-        # Adaptif eşik
         if SMI_LIGHT_ADAPTIVE:
             smi_norm_series = (df['smi'] / df['atr']).replace([np.inf, -np.inf], np.nan)
             ref = smi_norm_series.iloc[-(SCORING_WIN+1):-1].abs() if len(df) >= SCORING_WIN else smi_norm_series.abs()
@@ -592,7 +594,6 @@ async def check_signals(symbol, timeframe='4h'):
         else:
             SMI_LIGHT_NORM_MAX_EFF = SMI_LIGHT_NORM_MAX
 
-        # Squeeze opsiyonel
         if SMI_LIGHT_REQUIRE_SQUEEZE:
             base_long  = smi_squeeze_off and (smi_norm > 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
             base_short = smi_squeeze_off and (smi_norm < 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
@@ -600,7 +601,6 @@ async def check_signals(symbol, timeframe='4h'):
             base_long  = (smi_norm > 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
             base_short = (smi_norm < 0) and (abs(smi_norm) < SMI_LIGHT_NORM_MAX_EFF)
 
-        # Slope teyidi
         if USE_SMI_SLOPE_CONFIRM and pd.notna(df['smi'].iloc[-3]) and pd.notna(df['smi'].iloc[-2]):
             smi_slope = float(df['smi'].iloc[-2] - df['smi'].iloc[-3])
             slope_ok_long  = smi_slope > 0
@@ -608,7 +608,6 @@ async def check_signals(symbol, timeframe='4h'):
         else:
             slope_ok_long = slope_ok_short = True
 
-        # (opsiyonel) coşku freni
         if USE_FROTH_GUARD and pd.notna(df['ema13'].iloc[-2]):
             ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
             froth_ok = (ema_gap <= FROTH_GUARD_K_ATR * atr_for_norm)
@@ -618,26 +617,7 @@ async def check_signals(symbol, timeframe='4h'):
         smi_condition_long  = base_long  and slope_ok_long  and froth_ok
         smi_condition_short = base_short and slope_ok_short and froth_ok
 
-        logger.info(
-            f"{symbol} {timeframe} SMI_norm:{(smi_norm if np.isfinite(smi_norm) else float('nan')):.3f} "
-            f"squeeze_off:{smi_squeeze_off} eff_light:{SMI_LIGHT_NORM_MAX_EFF:.2f} "
-            f"slope_ok(L/S):{slope_ok_long}/{slope_ok_short} froth_ok:{froth_ok}"
-        )
-        # ================================================================================
-
-        closed_candle = df.iloc[-2]
-        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-        logger.info(f"{symbol} {timeframe} Closed:{closed_candle['close']:.5f} Cur:{current_price:.5f} | LIQ_OK={liq_ok}")
-
-        key = f"{symbol}_{timeframe}"
-        current_pos = signal_cache.get(key, {
-            'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-            'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-            'remaining_ratio': 1.0, 'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
-            'tp1_hit': False, 'tp2_hit': False
-        })
-
-        # --- EMA13 / SMA34 giriş kesişimi (lookback penceresi) ---
+        # --- EMA/SMA giriş kesişimi (lookback penceresi) ---
         ema_arr = df['ema13'].to_numpy(dtype=np.float64)
         sma_arr = df['sma34'].to_numpy(dtype=np.float64)
         price_arr = df['close'].to_numpy(dtype=np.float64)
@@ -658,18 +638,15 @@ async def check_signals(symbol, timeframe='4h'):
             if ema_arr[pre] >= sma_arr[pre] and ema_arr[cur] < sma_arr[cur] and price_arr[cur] < sma_arr[cur]:
                 ema_sma_crossover_sell = True
 
-        logger.info(f"{symbol} {timeframe} EMA/SMA buy:{ema_sma_crossover_buy} sell:{ema_sma_crossover_sell}")
-
-        # --- Yön teyidi (ADX 2/3) ---
-        adx_value = f"{closed_candle['adx']:.2f}" if pd.notna(closed_candle['adx']) else 'NaN'
+        # --- ADX yön teyidi (2-of-3) ---
         adx_ok = adx_condition
+        rising = adx_rising(df)
         di_long = di_condition_long
         di_short = di_condition_short
 
-        # adx_rising calculate_adx içinde
         if SIGNAL_MODE == "2of3":
-            dir_long_ok  = (int(adx_ok) + int(adx_rising) + int(di_long))  >= 2
-            dir_short_ok = (int(adx_ok) + int(adx_rising) + int(di_short)) >= 2
+            dir_long_ok  = (int(adx_ok) + int(rising) + int(di_long))  >= 2
+            dir_short_ok = (int(adx_ok) + int(rising) + int(di_short)) >= 2
             str_ok = True
         else:
             dir_long_ok, dir_short_ok = di_long, di_short
@@ -677,32 +654,58 @@ async def check_signals(symbol, timeframe='4h'):
 
         # --- Hacim filtresi (ATR oranına göre multiplier) ---
         volume_multiplier = 1.0 + min(avg_atr_ratio * 3, 0.2) if np.isfinite(avg_atr_ratio) else 1.0
-        volume_ok = closed_candle['volume'] > closed_candle['volume_sma20'] * volume_multiplier if pd.notna(closed_candle['volume']) and pd.notna(closed_candle['volume_sma20']) else False
+        volume_ok = df['volume'].iloc[-2] > df['volume_sma20'].iloc[-2] * volume_multiplier if pd.notna(df['volume'].iloc[-2]) and pd.notna(df['volume_sma20'].iloc[-2]) else False
+
+        # ---- Trap skoru & dinamik kapı ----
+        bull_score = compute_trap_scores(df, side="long")  if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
+        bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
+
+        adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
+        eff_trap_max = trap_threshold_by_adx(adx_last)
+        logger.info(f"{symbol} {timeframe} trap_dyn_thr:{eff_trap_max:.2f}")
+
+        # TRAP_ONLY_LOW True ise: skor dinamik barajın altında olmalı (low-only kapısı korunuyor)
+        trap_ok_long  = (not TRAP_ONLY_LOW) or (bull_score["score"] < eff_trap_max)
+        trap_ok_short = (not TRAP_ONLY_LOW) or (bear_score["score"] < eff_trap_max)
+
+        closed_candle = df.iloc[-2]
+        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
+
+        # --- Mum rengi şartı (long = yeşil, short = kırmızı) ---
+        is_green = pd.notna(closed_candle['close']) and pd.notna(closed_candle['open']) and (closed_candle['close'] > closed_candle['open'])
+        is_red   = pd.notna(closed_candle['close']) and pd.notna(closed_candle['open']) and (closed_candle['close'] < closed_candle['open'])
 
         # --- Al / Sat koşulları ---
         buy_condition = (
             liq_ok and
             ema_sma_crossover_buy and volume_ok and smi_condition_long and
-            str_ok and dir_long_ok and
+            str_ok and dir_long_ok and trap_ok_long and is_green and
             (closed_candle['close'] > closed_candle['ema13'] and closed_candle['close'] > closed_candle['sma34'])
         )
         sell_condition = (
             liq_ok and
             ema_sma_crossover_sell and volume_ok and smi_condition_short and
-            str_ok and dir_short_ok and
+            str_ok and dir_short_ok and trap_ok_short and is_red and
             (closed_candle['close'] < closed_candle['ema13'] and closed_candle['close'] < closed_candle['sma34'])
         )
 
-        logger.info(f"{symbol} {timeframe} ADX_ok:{adx_ok} rising:{adx_rising} di_long:{di_long} di_short:{di_short}")
-        logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition}")
+        logger.info(f"{symbol} {timeframe} EMA/SMA buy:{ema_sma_crossover_buy} sell:{ema_sma_crossover_sell}")
+        logger.info(f"{symbol} {timeframe} ADX_ok:{adx_ok} rising:{rising} di_long:{di_long} di_short:{di_short}")
+        logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition} riskL:{bull_score['label']} riskS:{bear_score['label']}")
 
-        current_pos = signal_cache.get(key, current_pos)
-        current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-        now = datetime.now(tz)
+        key = f"{symbol}_{timeframe}"
+        current_pos = signal_cache.get(key, {
+            'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
+            'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
+            'remaining_ratio': 1.0, 'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
+            'tp1_hit': False, 'tp2_hit': False
+        })
 
         if buy_condition and sell_condition:
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
             return
+
+        now = datetime.now(tz)
 
         # --- EMA/SMA EXIT kesişimleri (son kapalı mum) ---
         ema_prev, sma_prev = df['ema13'].iloc[-3], df['sma34'].iloc[-3]
@@ -723,7 +726,7 @@ async def check_signals(symbol, timeframe='4h'):
                     profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: REVERSAL CLOSE 🔁\n"
-                    f"Price: {current_price:.5f}\n"
+                    f"Price: {fmt(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -759,10 +762,7 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
 
-                    trap_line = ""
-                    if USE_TRAP_SCORING:
-                        bull_score = compute_trap_scores(df, side="long")
-                        trap_line = f"\nTrap Risk (Bull): {bull_score['score']:.0f}/100 → {bull_score['label']}"
+                    trap_line = f"\nTrap Risk (Bull): {int(bull_score['score'])}/100 → {bull_score['label']}" if USE_TRAP_SCORING else ""
 
                     current_pos = {
                         'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -774,10 +774,10 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: BUY (LONG) 🚀\n"
-                        f"Entry: {entry_price:.5f}\n"
-                        f"SL:    {sl_price:.5f}\n"
-                        f"TP1:   {tp1_price:.5f}\n"
-                        f"TP2:   {tp2_price:.5f}"
+                        f"Entry: {fmt(entry_price)}\n"
+                        f"SL:    {fmt(sl_price)}\n"
+                        f"TP1:   {fmt(tp1_price)}\n"
+                        f"TP2:   {fmt(tp2_price)}"
                         f"{trap_line}"
                     )
 
@@ -805,10 +805,7 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
 
-                    trap_line = ""
-                    if USE_TRAP_SCORING:
-                        bear_score = compute_trap_scores(df, side="short")
-                        trap_line = f"\nTrap Risk (Bear): {bear_score['score']:.0f}/100 → {bear_score['label']}"
+                    trap_line = f"\nTrap Risk (Bear): {int(bear_score['score'])}/100 → {bear_score['label']}" if USE_TRAP_SCORING else ""
 
                     current_pos = {
                         'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
@@ -820,10 +817,10 @@ async def check_signals(symbol, timeframe='4h'):
                     signal_cache[key] = current_pos
                     await enqueue_message(
                         f"{symbol} {timeframe}: SELL (SHORT) 📉\n"
-                        f"Entry: {entry_price:.5f}\n"
-                        f"SL:    {sl_price:.5f}\n"
-                        f"TP1:   {tp1_price:.5f}\n"
-                        f"TP2:   {tp2_price:.5f}"
+                        f"Entry: {fmt(entry_price)}\n"
+                        f"SL:    {fmt(sl_price)}\n"
+                        f"TP1:   {fmt(tp1_price)}\n"
+                        f"TP2:   {fmt(tp2_price)}"
                         f"{trap_line}"
                     )
 
@@ -840,7 +837,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🎯\n"
-                    f"Cur: {current_price:.5f} | TP1: {current_pos['tp1_price']:.5f}\n"
+                    f"Cur: {fmt(current_price)} | TP1: {fmt(current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
@@ -850,7 +847,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
-                    f"Cur: {current_price:.5f} | TP2: {current_pos['tp2_price']:.5f}\n"
+                    f"Cur: {fmt(current_price)} | TP2: {fmt(current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
@@ -859,7 +856,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (LONG) 🔁\n"
-                    f"Price: {current_price:.5f}\n"
+                    f"Price: {fmt(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -877,7 +874,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: STOP LONG ⛔\n"
-                    f"Price: {current_price:.5f}\n"
+                    f"Price: {fmt(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -904,7 +901,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp1_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP1 Hit 🎯\n"
-                    f"Cur: {current_price:.5f} | TP1: {current_pos['tp1_price']:.5f}\n"
+                    f"Cur: {fmt(current_price)} | TP1: {fmt(current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
             # TP2
@@ -914,7 +911,7 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos['tp2_hit'] = True
                 await enqueue_message(
                     f"{symbol} {timeframe}: TP2 Hit 🎯🎯\n"
-                    f"Cur: {current_price:.5f} | TP2: {current_pos['tp2_price']:.5f}\n"
+                    f"Cur: {fmt(current_price)} | TP2: {fmt(current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
 
@@ -923,7 +920,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: EMA/SMA EXIT (SHORT) 🔁\n"
-                    f"Price: {current_price:.5f}\n"
+                    f"Price: {fmt(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -941,7 +938,7 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
                     f"{symbol} {timeframe}: STOP SHORT ⛔\n"
-                    f"Price: {current_price:.5f}\n"
+                    f"Price: {fmt(current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
@@ -980,29 +977,25 @@ async def main():
     if not symbols:
         raise RuntimeError("Uygun sembol bulunamadı. Permissions/region?")
 
-    # ========== Tur döngüsü (tüm shard'lar, 2 dk hedef) ==========
-    TARGET_LOOP_SEC = 120  # 2 dakika
+    logger.info(f"Toplam sembol: {len(symbols)} | N_SHARDS={N_SHARDS} | BATCH_SIZE={BATCH_SIZE}")
+
     while True:
         loop_start = time.time()
         total_scanned = 0
-
+        # Her turda TÜM shard'ları tara (gecikmeyi düşürmek için)
         for shard_index in range(N_SHARDS):
             shard_symbols = [s for i, s in enumerate(symbols) if (i % N_SHARDS) == shard_index]
             total_scanned += len(shard_symbols)
             logger.info(f"Shard {shard_index+1}/{N_SHARDS} -> {len(shard_symbols)} sembol taranacak")
-
             tasks = [check_signals(sym, tf) for tf in timeframes for sym in shard_symbols]
             for i in range(0, len(tasks), BATCH_SIZE):
                 await asyncio.gather(*tasks[i:i+BATCH_SIZE])
                 await asyncio.sleep(INTER_BATCH_SLEEP + random.random()*0.5)  # jitter
 
         elapsed = time.time() - loop_start
-        sleep_s = max(0.0, TARGET_LOOP_SEC - elapsed)
-        if sleep_s > 0:
-            logger.info(f"Tur bitti (tarama: {elapsed:.1f}s, {total_scanned} sembol). {sleep_s/60:.1f} dk bekle...")
-            await asyncio.sleep(sleep_s)
-        else:
-            logger.info(f"Tur bitti (tarama: {elapsed:.1f}s, {total_scanned} sembol). Hedef 2 dk aşıldı, yeni tura geçiliyor.")
+        sleep_sec = max(0.0, 120.0 - elapsed)  # 2 dk hedef
+        logger.info(f"Tur bitti, {total_scanned} sembol tarandı, {elapsed:.1f}s sürdü, {sleep_sec:.1f}s bekle...")
+        await asyncio.sleep(sleep_sec)
 
 if __name__ == "__main__":
     asyncio.run(main())
