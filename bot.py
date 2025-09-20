@@ -43,8 +43,8 @@ SMI_LIGHT_MAX_MIN = 0.60 # adaptif alt sınır
 SMI_LIGHT_MAX_MAX = 1.10 # adaptif üst sınır
 SMI_LIGHT_REQUIRE_SQUEEZE = False # squeeze_off zorunlu değil
 USE_SMI_SLOPE_CONFIRM = True # SMI eğimi yön teyidi
-USE_FROTH_GUARD = False # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
-FROTH_GUARD_K_ATR = 0.9 # |close-ema13| <= K * ATR
+USE_FROTH_GUARD = True # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
+FROTH_GUARD_K_ATR = 1 # |close-ema13| <= K * ATR
 # === ADX sinyal modu ===
 SIGNAL_MODE = "2of3" # Üçlü: (ADX>=18, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
 # ---- Rate-limit & tarama pacing ----
