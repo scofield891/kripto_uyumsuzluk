@@ -47,9 +47,10 @@ SMI_LIGHT_MAX_MAX = 1.10 # adaptif üst sınır
 SMI_LIGHT_REQUIRE_SQUEEZE = False # squeeze_off zorunlu değil
 USE_SMI_SLOPE_CONFIRM = True # SMI eğimi yön teyidi
 USE_FROTH_GUARD = True # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
-FROTH_GUARD_K_ATR = 1 # |close-ema13| <= K * ATR
+FROTH_GUARD_K_ATR = 1.1 # |close-ema13| <= K * ATR (tweak için 1.1)
 # === ADX sinyal modu ===
 SIGNAL_MODE = "2of3" # Üçlü: (ADX>=18, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
+REQUIRE_DIRECTION = False  # Opsiyonel: Yön bacağını zorunlu yap (güç + yön or rising + yön)
 # ---- Rate-limit & tarama pacing ----
 MAX_CONCURRENT_FETCHES = 4
 RATE_LIMIT_MS = 200
@@ -76,10 +77,10 @@ RSI_LONG_EXCESS = 70.0 # Klasik overbought
 RSI_SHORT_EXCESS = 30.0 # Klasik oversold
 # === Trap risk sinyal kapısı + çıktı formatı ===
 TRAP_ONLY_LOW = True # True: sadece "Çok düşük / Düşük" risk sinyali gönder
-TRAP_MAX_SCORE = 40.0 # 0-39 izinli (40 ve üstü blok)
+TRAP_MAX_SCORE = 45.0 # 0-44 izinli (40 → 45 tweak)
 # ==== Dinamik trap eşiği (ADX'e göre) ====
 TRAP_DYN_USE = False # Kaldırıldı
-TRAP_BASE_MAX = 40.0 # Sabit eşik
+TRAP_BASE_MAX = 45.0 # Sabit eşik (tweak)
 # ==== Hacim Filtresi ====
 VOLUME_GATE_MODE = "lite"
 VOL_REF_WIN = 20
@@ -105,6 +106,22 @@ VOL_RELAX = 1.00
 VOL_TIGHT = 1.10
 OBV_SLOPE_WIN = 5
 VOL_OBV_TIGHT = 1.00
+# ==== NTX (Noise-Tolerant Trend Index) ====
+NTX_PERIOD = 14        # Wilder benzeri smoothing
+NTX_K_EFF = 10         # ER / slope / monotoniklik penceresi
+NTX_VOL_WIN = 60       # Hacim referansı (vol_ma zaten var)
+NTX_THR_LO, NTX_THR_HI = 52.0, 60.0      # Dinamik eşik alt/üst
+NTX_ATRZ_LO, NTX_ATRZ_HI = -1.0, 1.5     # ATR_z clamp
+
+# Rising ayarları
+NTX_MIN_FOR_HYBRID = 50.0
+NTX_RISE_K_STRICT = 5
+NTX_RISE_MIN_NET = 1.0
+NTX_RISE_POS_RATIO = 0.6
+NTX_RISE_EPS = 0.05
+NTX_RISE_K_HYBRID = 3
+NTX_FROTH_K = 1.0              # |close-EMA13| <= K * ATR (hibrit koruma)
+NTX_HYBRID_TRAP_MARGIN = 3.0   # hibritte trap skoru, eff_trap_max - margin altında olmalı
 # TT mesaj etiketleri
 def _risk_label(score: float) -> str:
     if score < 20: return "Çok düşük risk 🟢"
@@ -418,6 +435,7 @@ def calculate_indicators(df, symbol, timeframe):
     df, adx_condition, di_condition_long, di_condition_short = calculate_adx(df, symbol)
     df = ensure_atr(df, period=14)
     df = calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60)
+    df = calc_ntx(df, period=NTX_PERIOD, k_eff=NTX_K_EFF)
     return df, df['squeeze_off'].iloc[-2], df['smi'].iloc[-2], 'green' if df['smi'].iloc[-2] > 0 else 'red' if df['smi'].iloc[-2] < 0 else 'gray', adx_condition, di_condition_long, di_condition_short
 # ========= ADX Rising (k=5 ana test + k=3 hibrit hızlı test) =========
 ADX_RISE_K = 5
@@ -453,6 +471,93 @@ def adx_rising(df: pd.DataFrame) -> bool:
     if 'adx' not in df.columns:
         return False
     return adx_rising_strict(df['adx']) or adx_rising_hybrid(df['adx'])
+# ==== NTX (Noise-Tolerant Trend Index) ====
+def calc_ntx(df: pd.DataFrame, period: int = NTX_PERIOD, k_eff: int = NTX_K_EFF) -> pd.DataFrame:
+    # Gerekli sütunlar: close, atr, ema13, volume, vol_ma
+    close = df['close'].astype(float)
+    atr   = df['atr'].astype(float).replace(0, np.nan)
+    ema13 = df['ema13'].astype(float)
+
+    # 1) Efficiency Ratio (trend verimliliği)
+    num = (close - close.shift(k_eff)).abs()
+    den = close.diff().abs().rolling(k_eff).sum()
+    er  = (num / (den + 1e-12)).clip(0, 1).fillna(0)  # NaN → 0
+
+    # 2) EMA slope (ATR-normalize, ölçek bağımsız)
+    slope_norm = (ema13 - ema13.shift(k_eff)) / ((atr * k_eff) + 1e-12)
+    slope_mag  = slope_norm.abs().clip(0, 3) / 3.0
+    slope_mag = slope_mag.fillna(0)  # NaN → 0
+
+    # 3) Monotoniklik (son k_eff çubukta tutarlılık)
+    dif = close.diff()
+    sign_price = np.sign(dif)
+    sign_slope = np.sign(slope_norm.shift(1)).replace(0, np.nan)
+    same_dir   = (sign_price == sign_slope).astype(float)
+    pos_ratio  = same_dir.rolling(k_eff).mean().fillna(0)  # NaN → 0
+
+    # 4) Hacim katkısı (katılım)
+    vol_ratio = (df['volume'] / df['vol_ma'].replace(0, np.nan)).clip(lower=0).fillna(0)  # NaN → 0
+    vol_sig   = np.tanh(np.maximum(0.0, vol_ratio - 1.0)).fillna(0)  # NaN → 0
+
+    base = (
+        0.35 * er +
+        0.35 * slope_mag +
+        0.15 * pos_ratio +
+        0.15 * vol_sig
+    ).clip(0, 1)
+
+    df['ntx_raw'] = base
+    df['ntx'] = df['ntx_raw'].ewm(alpha=1.0/period, adjust=False).mean() * 100.0
+    return df
+def ntx_threshold(atr_z: float) -> float:
+    a = clamp((atr_z - NTX_ATRZ_LO) / (NTX_ATRZ_HI - NTX_ATRZ_LO + 1e-12), 0.0, 1.0)
+    return NTX_THR_LO + a * (NTX_THR_HI - NTX_THR_LO)
+def ntx_rising_strict(s: pd.Series, k: int = NTX_RISE_K_STRICT,
+                      min_net: float = NTX_RISE_MIN_NET,
+                      pos_ratio_th: float = NTX_RISE_POS_RATIO,
+                      eps: float = NTX_RISE_EPS) -> bool:
+    if s is None or len(s) < k + 1: return False
+    w = s.iloc[-(k+1):-1].astype(float)
+    if w.isna().any(): return False
+    x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
+    diffs = np.diff(w.values)
+    posr  = (diffs > eps).mean() if diffs.size else 0.0
+    net   = w.iloc[-1] - w.iloc[0]
+    return (slope > 0) and (net >= min_net) and (posr >= pos_ratio_th)
+def ntx_rising_hybrid_guarded(df: pd.DataFrame, side: str,
+                              eps: float = NTX_RISE_EPS,
+                              min_ntx: float = NTX_MIN_FOR_HYBRID,
+                              k: int = NTX_RISE_K_HYBRID,
+                              froth_k: float = NTX_FROTH_K,
+                              trap_margin: float = NTX_HYBRID_TRAP_MARGIN,
+                              eff_trap_max: float = 45.0,
+                              trap_score_current: float | None = None) -> bool:
+    s = df['ntx'] if 'ntx' in df.columns else None
+    if s is None or len(s) < k + 1: return False
+    w = s.iloc[-(k+1):-1].astype(float)
+    if w.isna().any(): return False
+
+    x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
+    last_diff = w.values[-1] - w.values[-2]
+    if not (slope > 0 and last_diff > eps): return False
+    if w.iloc[-1] < min_ntx: return False
+
+    # Froth guard (overextended hareketi ele)
+    close_last = float(df['close'].iloc[-2])
+    ema13_last = float(df['ema13'].iloc[-2])
+    atr_value  = float(df['atr'].iloc[-2])
+    if not (np.isfinite(close_last) and np.isfinite(ema13_last) and np.isfinite(atr_value) and atr_value > 0):
+        return False
+    if abs(close_last - ema13_last) > froth_k * atr_value:
+        return False
+
+    # Trap marjı (ilgili yönün skoru güvenli bölgede olmalı)
+    if trap_score_current is None:
+        trap_score_current = compute_trap_scores(df, side=side)["score"]
+    if trap_score_current >= (eff_trap_max - trap_margin):
+        return False
+
+    return True
 # ================== TRAP SKORLAMA HESABI ==================
 def candle_body_wicks(row):
     o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
@@ -673,13 +778,8 @@ async def check_signals(symbol, timeframe='4h'):
             slope_ok_short = smi_slope < 0
         else:
             slope_ok_long = slope_ok_short = True
-        if USE_FROTH_GUARD and pd.notna(df['ema13'].iloc[-2]):
-            ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
-            froth_ok = (ema_gap <= FROTH_GUARD_K_ATR * atr_for_norm)
-        else:
-            froth_ok = True
-        smi_condition_long = base_long and slope_ok_long and froth_ok
-        smi_condition_short = base_short and slope_ok_short and froth_ok
+        smi_condition_long = base_long and slope_ok_long
+        smi_condition_short = base_short and slope_ok_short
         # --- EMA/SMA giriş kesişimi (lookback penceresi) ---
         ema_arr = df['ema13'].to_numpy(dtype=np.float64)
         sma_arr = df['sma34'].to_numpy(dtype=np.float64)
@@ -701,20 +801,38 @@ async def check_signals(symbol, timeframe='4h'):
                 ema_sma_crossover_sell = True
             if ema_sma_crossover_buy or ema_sma_crossover_sell:
                 break  # ← ilk geçer koşulda dur
-        # --- ADX yön teyidi (2-of-3) ---
+        # --- ADX yön teyidi (2-of-3 hibrit NTX) ---
         adx_ok = adx_condition
-        rising = adx_rising(df)
+        rising_adx = adx_rising(df)
+        atr_z = rolling_z(df['atr'], SCORING_WIN) if 'atr' in df else 0.0
+        ntx_thr = ntx_threshold(atr_z)
+        ntx_last = float(df['ntx'].iloc[-2]) if pd.notna(df['ntx'].iloc[-2]) else np.nan
+        ntx_ok = (np.isfinite(ntx_last) and ntx_last >= ntx_thr)
+        strength_ok = adx_ok or ntx_ok
+        ntx_rising_str = ntx_rising_strict(df['ntx']) if 'ntx' in df else False
+        ntx_rising_hyb_long = ntx_rising_hybrid_guarded(df, side="long") if 'ntx' in df else False
+        ntx_rising_hyb_short = ntx_rising_hybrid_guarded(df, side="short") if 'ntx' in df else False
+        rising_long = rising_adx or ntx_rising_str or ntx_rising_hyb_long
+        rising_short = rising_adx or ntx_rising_str or ntx_rising_hyb_short
         di_long = di_condition_long
         di_short = di_condition_short
         if SIGNAL_MODE == "2of3":
-            dir_long_ok = (int(adx_ok) + int(rising) + int(di_long)) >= 2
-            dir_short_ok = (int(adx_ok) + int(rising) + int(di_short)) >= 2
+            dir_long_ok = (int(strength_ok) + int(rising_long) + int(di_long)) >= 2
+            dir_short_ok = (int(strength_ok) + int(rising_short) + int(di_short)) >= 2
+            if REQUIRE_DIRECTION:
+                dir_long_ok = dir_long_ok and di_long
+                dir_short_ok = dir_short_ok and di_short
             str_ok = True
         else:
             dir_long_ok, dir_short_ok = di_long, di_short
-            str_ok = adx_ok
-        # --- Hacim filtresi (yeni volume_gate) ---
-        relax = trend_relax_factor(df['adx'].iloc[-2])
+            str_ok = strength_ok
+        # NTX log (görünürlüğü artır)
+        logger.info(f"{symbol} {timeframe} NTX_last:{ntx_last:.2f} thr:{ntx_thr:.2f} ntx_ok:{ntx_ok} ntx_rising_str:{ntx_rising_str} rising_long:{rising_long} rising_short:{rising_short}")
+        # Trend gücü (long/short için)
+        trend_strong_long = dir_long_ok and rising_long
+        trend_strong_short = dir_short_ok and rising_short
+        # --- Hacim filtresi ---
+        relax = trend_relax_factor(df['adx'].iloc[-2], ntx_last, ntx_thr)  # NTX ile hibrit
         ok_l, reason_l = volume_gate(df, "long", avg_atr_ratio, symbol, relax=relax)
         ok_s, reason_s = volume_gate(df, "short", avg_atr_ratio, symbol, relax=relax)
         logger.info(f"{symbol} {timeframe} VOL_LONG {ok_l} | {reason_l}")
@@ -722,10 +840,18 @@ async def check_signals(symbol, timeframe='4h'):
         # ---- Trap skoru & sabit kapı ----
         bull_score = compute_trap_scores(df, side="long") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
         bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
-        eff_trap_max = TRAP_BASE_MAX # Dinamik kaldırıldı, sabit eşik
+        eff_trap_max = TRAP_BASE_MAX  # 45
+        trap_ok_long = (bull_score["score"] < eff_trap_max)
+        trap_ok_short = (bear_score["score"] < eff_trap_max)
         logger.info(f"{symbol} {timeframe} trap_thr:{eff_trap_max:.2f}")
-        trap_ok_long = (not TRAP_ONLY_LOW) or (bull_score["score"] < eff_trap_max)
-        trap_ok_short = (not TRAP_ONLY_LOW) or (bear_score["score"] < eff_trap_max)
+        # ---- Adaptif froth guard (trend'e göre K esnet) ----
+        base_K = FROTH_GUARD_K_ATR  # 1.1
+        K_long = min(base_K * 1.2, 1.3) if trend_strong_long else base_K
+        K_short = min(base_K * 1.2, 1.3) if trend_strong_short else base_K
+        ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
+        froth_ok_long = (ema_gap <= K_long * atr_value) or trend_strong_long  # soft-AND
+        froth_ok_short = (ema_gap <= K_short * atr_value) or trend_strong_short  # soft-AND
+        # Mum rengi, closed_candle vs.
         closed_candle = df.iloc[-2]
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
         # --- Mum rengi şartı (long = yeşil, short = kırmızı) ---
@@ -734,16 +860,15 @@ async def check_signals(symbol, timeframe='4h'):
         # --- Al / Sat koşulları ---
         buy_condition = (
             ema_sma_crossover_buy and ok_l and smi_condition_long and
-            str_ok and dir_long_ok and trap_ok_long and is_green and
+            str_ok and dir_long_ok and trap_ok_long and froth_ok_long and is_green and
             (closed_candle['close'] > closed_candle['ema13'] and closed_candle['close'] > closed_candle['sma34'])
         )
         sell_condition = (
             ema_sma_crossover_sell and ok_s and smi_condition_short and
-            str_ok and dir_short_ok and trap_ok_short and is_red and
+            str_ok and dir_short_ok and trap_ok_short and froth_ok_short and is_red and
             (closed_candle['close'] < closed_candle['ema13'] and closed_candle['close'] < closed_candle['sma34'])
         )
         logger.info(f"{symbol} {timeframe} EMA/SMA buy:{ema_sma_crossover_buy} sell:{ema_sma_crossover_sell}")
-        logger.info(f"{symbol} {timeframe} ADX_ok:{adx_ok} rising:{rising} di_long:{di_long} di_short:{di_short}")
         logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition} riskL:{bull_score['label']} riskS:{bear_score['label']}")
         key = f"{symbol}_{timeframe}"
         current_pos = signal_cache.get(key, {
@@ -1004,16 +1129,11 @@ async def check_signals(symbol, timeframe='4h'):
                 save_state()
                 return
             signal_cache[key] = current_pos
-        # telemetri için basit stats (check_signals sonuna ekle)
-        stats = {"vol_block_l": not ok_l, "vol_block_s": not ok_s, "signal": buy_condition or sell_condition}
-        if VERBOSE_LOG:
-            logger.info(f"{symbol} stats: {stats}")
-    except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-        logger.warning(f"{symbol} {timeframe}: Rate limit -> skip this round ({e.__class__.__name__})")
-        return
-    except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
-        logger.warning(f"{symbol} {timeframe}: Network/Timeout -> skip this round ({e.__class__.__name__})")
-        return
+        # Sayaçlar (telemetri, check_signals sonuna ekle)
+        blocked_by_froth = 0 if froth_ok_long else 1
+        blocked_by_trap = 0 if trap_ok_long else 1
+        passed_because_strong = 1 if trend_strong_long and not froth_ok_long else 0
+        logger.info(f"{symbol} {timeframe} blocked_by_froth:{blocked_by_froth} blocked_by_trap:{blocked_by_trap} passed_because_strong:{passed_because_strong}")
     except Exception as e:
         logger.exception(f"Hata ({symbol} {timeframe}): {str(e)}")
         return
