@@ -1,4 +1,3 @@
-# bot.py
 import ccxt
 import numpy as np
 import pandas as pd
@@ -15,8 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from logging.handlers import RotatingFileHandler
-import json  # state persist için
-
+import json # state persist için
 # ================== Sabit Değerler ==================
 # Güvenlik: ENV zorunlu
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,7 +22,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 TEST_MODE = False
-VERBOSE_LOG = False  # detaylı log için True yap
+VERBOSE_LOG = False # detaylı log için True yap
 # ---- Sinyal / Risk Parametreleri ----
 LOOKBACK_ATR = 18
 SL_MULTIPLIER = 1.8 # SL = 1.8 x ATR
@@ -33,10 +31,10 @@ TP_MULTIPLIER2 = 3.5 # TP2 = 3.5 x ATR (satış %40)
 SL_BUFFER = 0.3 # ATR x (SL'e ilave buffer)
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05 # ATR x (entry anında SL'e çok yakınsa atla)
-LOOKBACK_CROSSOVER = 12 # Sadeleştirdik, ~2 gün geriye bak
 LOOKBACK_SMI = 20
 ADX_PERIOD = 14
-ADX_THRESHOLD = 18 # >= 18
+ADX_THRESHOLD = 15 # >=15 (düşük ADX'te modlar devreye girer)
+ADX_NORMAL_HIGH = 21 # >=21 direkt mod
 APPLY_COOLDOWN_BOTH_DIRECTIONS = True
 # ==== SMI Light (Adaptif + Slope teyidi + opsiyonel froth guard) ====
 SMI_LIGHT_NORM_MAX = 0.75 # statik fallback/başlangıç
@@ -47,10 +45,10 @@ SMI_LIGHT_MAX_MAX = 1.10 # adaptif üst sınır
 SMI_LIGHT_REQUIRE_SQUEEZE = False # squeeze_off zorunlu değil
 USE_SMI_SLOPE_CONFIRM = True # SMI eğimi yön teyidi
 USE_FROTH_GUARD = True # fiyat EMA13'ten aşırı kopmuşsa sinyali pas geç
-FROTH_GUARD_K_ATR = 1.1 # |close-ema13| <= K * ATR (tweak için 1.1)
+FROTH_GUARD_K_ATR = 1.0 # |close-ema13| <= K * ATR (tweak için 1.0)
 # === ADX sinyal modu ===
-SIGNAL_MODE = "2of3" # Üçlü: (ADX>=18, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
-REQUIRE_DIRECTION = False  # Opsiyonel: Yön bacağını zorunlu yap (güç + yön or rising + yön)
+SIGNAL_MODE = "2of3" # Üçlü: (ADX>=15, ADX rising, DI yönü). En az 2 doğruysa yön teyidi geçer.
+REQUIRE_DIRECTION = False # Opsiyonel: Yön bacağını zorunlu yap (güç + yön or rising + yön)
 # ---- Rate-limit & tarama pacing ----
 MAX_CONCURRENT_FETCHES = 4
 RATE_LIMIT_MS = 200
@@ -77,10 +75,11 @@ RSI_LONG_EXCESS = 70.0 # Klasik overbought
 RSI_SHORT_EXCESS = 30.0 # Klasik oversold
 # === Trap risk sinyal kapısı + çıktı formatı ===
 TRAP_ONLY_LOW = True # True: sadece "Çok düşük / Düşük" risk sinyali gönder
-TRAP_MAX_SCORE = 45.0 # 0-44 izinli (40 → 45 tweak)
+TRAP_MAX_SCORE = 39.0 # 0-39 izinli (orta risk filtreli)
+TRAP_TIGHT_MAX = 35.0 # Çok sıkı modda trap skoru <35
+TRAP_BASE_MAX = TRAP_MAX_SCORE # alias, tek kaynaktan
 # ==== Dinamik trap eşiği (ADX'e göre) ====
 TRAP_DYN_USE = False # Kaldırıldı
-TRAP_BASE_MAX = 45.0 # Sabit eşik (tweak)
 # ==== Hacim Filtresi ====
 VOLUME_GATE_MODE = "lite"
 VOL_REF_WIN = 20
@@ -107,12 +106,10 @@ VOL_TIGHT = 1.10
 OBV_SLOPE_WIN = 5
 VOL_OBV_TIGHT = 1.00
 # ==== NTX (Noise-Tolerant Trend Index) ====
-NTX_PERIOD = 14        # Wilder benzeri smoothing
-NTX_K_EFF = 10         # ER / slope / monotoniklik penceresi
-NTX_VOL_WIN = 60       # Hacim referansı (vol_ma zaten var)
-NTX_THR_LO, NTX_THR_HI = 52.0, 60.0      # Dinamik eşik alt/üst
-NTX_ATRZ_LO, NTX_ATRZ_HI = -1.0, 1.5     # ATR_z clamp
-
+NTX_PERIOD = 14 # Wilder benzeri smoothing
+NTX_K_EFF = 10 # ER / slope / monotoniklik penceresi
+NTX_THR_LO, NTX_THR_HI = 52.0, 60.0 # Dinamik eşik alt/üst
+NTX_ATRZ_LO, NTX_ATRZ_HI = -1.0, 1.5 # ATR_z clamp
 # Rising ayarları
 NTX_MIN_FOR_HYBRID = 50.0
 NTX_RISE_K_STRICT = 5
@@ -120,8 +117,18 @@ NTX_RISE_MIN_NET = 1.0
 NTX_RISE_POS_RATIO = 0.6
 NTX_RISE_EPS = 0.05
 NTX_RISE_K_HYBRID = 3
-NTX_FROTH_K = 1.0              # |close-EMA13| <= K * ATR (hibrit koruma)
-NTX_HYBRID_TRAP_MARGIN = 3.0   # hibritte trap skoru, eff_trap_max - margin altında olmalı
+NTX_FROTH_K = 1.0 # |close-EMA13| <= K * ATR (hibrit koruma)
+NTX_HYBRID_TRAP_MARGIN = 3.0 # hibritte trap skoru, eff_trap_max - margin altında olmalı
+# ==== EMA 13/34/100 Parametreleri ====
+MID_TYPE = "EMA"  # "EMA" | "SMA" (winrate için EMA, stabil için SMA)
+MID_PERIOD = 34
+CROSS_FRESH_BARS = 4 # tetik tazeliği
+SLOPE_WINDOW = 5 # EMA100 eğimi için
+CONFIRM_K_ATR = 0.20 # fiyat/EMA34 mesafe onayı
+RETEST_K_ATR = 0.30 # EMA34’a retest yakınlığı
+D_K_ATR = 0.10 # EMA34-EMA100 arası min ayrışma (ATR)
+USE_STACK_ONLY = False # True: sadece stack ile tetik (daha sert)
+USE_STACK_FRESH = True # stack + (fresh cross veya retest)
 # TT mesaj etiketleri
 def _risk_label(score: float) -> str:
     if score < 20: return "Çok düşük risk 🟢"
@@ -142,13 +149,14 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
+logger.info(f"MID_TYPE={MID_TYPE}, MID_PERIOD={MID_PERIOD}")
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'linear'},
     'timeout': 60000
 })
-MARKETS = {}  # precision için
+MARKETS = {} # precision için
 async def load_markets():
     global MARKETS
     MARKETS = await asyncio.to_thread(exchange.load_markets)
@@ -173,7 +181,7 @@ message_queue = asyncio.Queue(maxsize=1000)
 _fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 _rate_lock = asyncio.Lock()
 _last_call_ts = 0.0
-STATE_FILE = 'positions.json'  # persist için
+STATE_FILE = 'positions.json' # persist için
 DT_KEYS = {"last_signal_time", "entry_time", "last_bar_time"}
 def _json_default(o):
     if isinstance(o, datetime):
@@ -208,7 +216,7 @@ def save_state():
             json.dump(signal_cache, f, default=_json_default)
     except Exception as e:
         logger.warning(f"State kaydedilemedi: {e}")
-signal_cache = load_state()  # başlangıçta yükle
+signal_cache = load_state() # başlangıçta yükle
 # ================== Util ==================
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -426,7 +434,11 @@ def calculate_indicators(df, symbol, timeframe):
         df.set_index('timestamp', inplace=True)
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, 13)
-    df['sma34'] = calculate_sma(closes, 34)
+    if MID_TYPE == "EMA":
+        df['mid34'] = calculate_ema(closes, MID_PERIOD)
+    else:
+        df['mid34'] = calculate_sma(closes, MID_PERIOD)
+    df['ema100'] = calculate_ema(closes, 100)
     df['rsi'] = calculate_rsi(closes, 14)
     df = calculate_bb(df)
     df = calculate_kc(df)
@@ -473,39 +485,33 @@ def adx_rising(df: pd.DataFrame) -> bool:
     return adx_rising_strict(df['adx']) or adx_rising_hybrid(df['adx'])
 # ==== NTX (Noise-Tolerant Trend Index) ====
 def calc_ntx(df: pd.DataFrame, period: int = NTX_PERIOD, k_eff: int = NTX_K_EFF) -> pd.DataFrame:
-    # Gerekli sütunlar: close, atr, ema13, volume, vol_ma
+    # Gerekli sütunlar: close, atr, ema13 (froth için ema13 kullandım)
     close = df['close'].astype(float)
-    atr   = df['atr'].astype(float).replace(0, np.nan)
-    ema13 = df['ema13'].astype(float)
-
+    atr = df['atr'].astype(float).replace(0, np.nan)
+    ema_fast = df['ema13'].astype(float)
     # 1) Efficiency Ratio (trend verimliliği)
     num = (close - close.shift(k_eff)).abs()
     den = close.diff().abs().rolling(k_eff).sum()
-    er  = (num / (den + 1e-12)).clip(0, 1).fillna(0)  # NaN → 0
-
+    er = (num / (den + 1e-12)).clip(0, 1).fillna(0) # NaN → 0
     # 2) EMA slope (ATR-normalize, ölçek bağımsız)
-    slope_norm = (ema13 - ema13.shift(k_eff)) / ((atr * k_eff) + 1e-12)
-    slope_mag  = slope_norm.abs().clip(0, 3) / 3.0
-    slope_mag = slope_mag.fillna(0)  # NaN → 0
-
+    slope_norm = (ema_fast - ema_fast.shift(k_eff)) / ((atr * k_eff) + 1e-12)
+    slope_mag = slope_norm.abs().clip(0, 3) / 3.0
+    slope_mag = slope_mag.fillna(0) # NaN → 0
     # 3) Monotoniklik (son k_eff çubukta tutarlılık)
     dif = close.diff()
     sign_price = np.sign(dif)
     sign_slope = np.sign(slope_norm.shift(1)).replace(0, np.nan)
-    same_dir   = (sign_price == sign_slope).astype(float)
-    pos_ratio  = same_dir.rolling(k_eff).mean().fillna(0)  # NaN → 0
-
+    same_dir = (sign_price == sign_slope).astype(float)
+    pos_ratio = same_dir.rolling(k_eff).mean().fillna(0) # NaN → 0
     # 4) Hacim katkısı (katılım)
-    vol_ratio = (df['volume'] / df['vol_ma'].replace(0, np.nan)).clip(lower=0).fillna(0)  # NaN → 0
-    vol_sig   = np.tanh(np.maximum(0.0, vol_ratio - 1.0)).fillna(0)  # NaN → 0
-
+    vol_ratio = (df['volume'] / df['vol_ma'].replace(0, np.nan)).clip(lower=0).fillna(0) # NaN → 0
+    vol_sig = np.tanh(np.maximum(0.0, vol_ratio - 1.0)).fillna(0) # NaN → 0
     base = (
         0.35 * er +
         0.35 * slope_mag +
         0.15 * pos_ratio +
         0.15 * vol_sig
     ).clip(0, 1)
-
     df['ntx_raw'] = base
     df['ntx'] = df['ntx_raw'].ewm(alpha=1.0/period, adjust=False).mean() * 100.0
     return df
@@ -521,8 +527,8 @@ def ntx_rising_strict(s: pd.Series, k: int = NTX_RISE_K_STRICT,
     if w.isna().any(): return False
     x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
     diffs = np.diff(w.values)
-    posr  = (diffs > eps).mean() if diffs.size else 0.0
-    net   = w.iloc[-1] - w.iloc[0]
+    posr = (diffs > eps).mean() if diffs.size else 0.0
+    net = w.iloc[-1] - w.iloc[0]
     return (slope > 0) and (net >= min_net) and (posr >= pos_ratio_th)
 def ntx_rising_hybrid_guarded(df: pd.DataFrame, side: str,
                               eps: float = NTX_RISE_EPS,
@@ -530,33 +536,29 @@ def ntx_rising_hybrid_guarded(df: pd.DataFrame, side: str,
                               k: int = NTX_RISE_K_HYBRID,
                               froth_k: float = NTX_FROTH_K,
                               trap_margin: float = NTX_HYBRID_TRAP_MARGIN,
-                              eff_trap_max: float = 45.0,
+                              eff_trap_max: float = TRAP_MAX_SCORE,
                               trap_score_current: float | None = None) -> bool:
     s = df['ntx'] if 'ntx' in df.columns else None
     if s is None or len(s) < k + 1: return False
     w = s.iloc[-(k+1):-1].astype(float)
     if w.isna().any(): return False
-
     x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
     last_diff = w.values[-1] - w.values[-2]
     if not (slope > 0 and last_diff > eps): return False
     if w.iloc[-1] < min_ntx: return False
-
     # Froth guard (overextended hareketi ele)
     close_last = float(df['close'].iloc[-2])
     ema13_last = float(df['ema13'].iloc[-2])
-    atr_value  = float(df['atr'].iloc[-2])
+    atr_value = float(df['atr'].iloc[-2])
     if not (np.isfinite(close_last) and np.isfinite(ema13_last) and np.isfinite(atr_value) and atr_value > 0):
         return False
     if abs(close_last - ema13_last) > froth_k * atr_value:
         return False
-
     # Trap marjı (ilgili yönün skoru güvenli bölgede olmalı)
     if trap_score_current is None:
         trap_score_current = compute_trap_scores(df, side=side)["score"]
     if trap_score_current >= (eff_trap_max - trap_margin):
         return False
-
     return True
 # ================== TRAP SKORLAMA HESABI ==================
 def candle_body_wicks(row):
@@ -663,10 +665,10 @@ def _dynamic_liq_floor(dv_series: pd.Series) -> float:
 def trend_relax_factor(adx_last, ntx_last=None, ntx_thr=None):
     s = 0.0
     if np.isfinite(adx_last):
-        s += max(0.0, (adx_last - 18.0) / 20.0) * 0.6
+        s += max(0.0, (adx_last - 15.0) / 20.0) * 0.6
     if ntx_last is not None and ntx_thr is not None and np.isfinite(ntx_last) and np.isfinite(ntx_thr):
         s += max(0.0, (ntx_last - ntx_thr) / 15.0) * 0.4
-    return 1.0 - 0.25 * min(1.0, s)  # en fazla %25 gevşet
+    return 1.0 - 0.25 * min(1.0, s) # en fazla %25 gevşet
 def volume_gate(df: pd.DataFrame, side: str, atr_ratio: float, symbol: str = "", relax: float = 1.0) -> (bool, str):
     if len(df) < max(VOL_LIQ_ROLL+2, VOL_REF_WIN+2):
         return False, "data_short"
@@ -750,7 +752,7 @@ async def check_signals(symbol, timeframe='4h'):
         # ATR değerleri
         atr_value, avg_atr_ratio = get_atr_values(df, LOOKBACK_ATR)
         if not np.isfinite(atr_value) or not np.isfinite(avg_atr_ratio):
-            logger.warning(f"ATR NaN/Inf ({symbol} {timeframe}), skip.")
+            logger.warning(f"Geçersiz ATR ({symbol} {timeframe}), skip.")
             return
         # ================== SMI LIGHT (ADAPTİF + SLOPE + OPSİYONEL) ==================
         smi_raw = smi_histogram
@@ -759,7 +761,7 @@ async def check_signals(symbol, timeframe='4h'):
         if SMI_LIGHT_ADAPTIVE:
             smi_norm_series = (df['smi'] / df['atr']).replace([np.inf, -np.inf], np.nan)
             ref = smi_norm_series.iloc[-(SCORING_WIN+1):-1].abs() if len(df) >= SCORING_WIN else smi_norm_series.abs()
-            if ref.notna().sum() >= 30:  # ← min örnek artır
+            if ref.notna().sum() >= 30: # ← min örnek artır
                 pct_val = float(np.nanpercentile(ref, SMI_LIGHT_PCTL * 100))
                 SMI_LIGHT_NORM_MAX_EFF = clamp(pct_val, SMI_LIGHT_MAX_MIN, SMI_LIGHT_MAX_MAX)
             else:
@@ -780,27 +782,6 @@ async def check_signals(symbol, timeframe='4h'):
             slope_ok_long = slope_ok_short = True
         smi_condition_long = base_long and slope_ok_long
         smi_condition_short = base_short and slope_ok_short
-        # --- EMA/SMA giriş kesişimi (lookback penceresi) ---
-        ema_arr = df['ema13'].to_numpy(dtype=np.float64)
-        sma_arr = df['sma34'].to_numpy(dtype=np.float64)
-        price_arr = df['close'].to_numpy(dtype=np.float64)
-        window = max(0, min(LOOKBACK_CROSSOVER, len(ema_arr) - 1))
-        if window == 0:
-            logger.warning(f"Veri yetersiz (crossover) {symbol} {timeframe}, skip.")
-            return
-        ema_sma_crossover_buy = False
-        ema_sma_crossover_sell = False
-        for i in range(1, window + 1):
-            pre = -i-1
-            cur = -i
-            if not (np.isfinite(ema_arr[pre]) and np.isfinite(sma_arr[pre]) and np.isfinite(ema_arr[cur]) and np.isfinite(sma_arr[cur]) and np.isfinite(price_arr[cur])):
-                continue
-            if not ema_sma_crossover_buy and ema_arr[pre] <= sma_arr[pre] and ema_arr[cur] > sma_arr[cur] and price_arr[cur] > sma_arr[cur]:
-                ema_sma_crossover_buy = True
-            if not ema_sma_crossover_sell and ema_arr[pre] >= sma_arr[pre] and ema_arr[cur] < sma_arr[cur] and price_arr[cur] < sma_arr[cur]:
-                ema_sma_crossover_sell = True
-            if ema_sma_crossover_buy or ema_sma_crossover_sell:
-                break  # ← ilk geçer koşulda dur
         # --- ADX yön teyidi (2-of-3 hibrit NTX) ---
         adx_ok = adx_condition
         rising_adx = adx_rising(df)
@@ -832,7 +813,7 @@ async def check_signals(symbol, timeframe='4h'):
         trend_strong_long = dir_long_ok and rising_long
         trend_strong_short = dir_short_ok and rising_short
         # --- Hacim filtresi ---
-        relax = trend_relax_factor(df['adx'].iloc[-2], ntx_last, ntx_thr)  # NTX ile hibrit
+        relax = trend_relax_factor(df['adx'].iloc[-2], ntx_last, ntx_thr) # NTX ile hibrit
         ok_l, reason_l = volume_gate(df, "long", avg_atr_ratio, symbol, relax=relax)
         ok_s, reason_s = volume_gate(df, "short", avg_atr_ratio, symbol, relax=relax)
         logger.info(f"{symbol} {timeframe} VOL_LONG {ok_l} | {reason_l}")
@@ -840,35 +821,75 @@ async def check_signals(symbol, timeframe='4h'):
         # ---- Trap skoru & sabit kapı ----
         bull_score = compute_trap_scores(df, side="long") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
         bear_score = compute_trap_scores(df, side="short") if USE_TRAP_SCORING else {"score": 0.0, "label": _risk_label(0.0)}
-        eff_trap_max = TRAP_BASE_MAX  # 45
-        trap_ok_long = (bull_score["score"] < eff_trap_max)
-        trap_ok_short = (bear_score["score"] < eff_trap_max)
+        eff_trap_max = TRAP_MAX_SCORE # tek kaynaktan
+        trap_ok_long = (bull_score["score"] <= eff_trap_max)
+        trap_ok_short = (bear_score["score"] <= eff_trap_max)
         logger.info(f"{symbol} {timeframe} trap_thr:{eff_trap_max:.2f}")
         # ---- Adaptif froth guard (trend'e göre K esnet) ----
-        base_K = FROTH_GUARD_K_ATR  # 1.1
+        base_K = FROTH_GUARD_K_ATR # 1.0
         K_long = min(base_K * 1.2, 1.3) if trend_strong_long else base_K
         K_short = min(base_K * 1.2, 1.3) if trend_strong_short else base_K
         ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
-        froth_ok_long = (ema_gap <= K_long * atr_value) or trend_strong_long  # soft-AND
-        froth_ok_short = (ema_gap <= K_short * atr_value) or trend_strong_short  # soft-AND
+        froth_ok_long = (ema_gap <= K_long * atr_value) or trend_strong_long # soft-AND
+        froth_ok_short = (ema_gap <= K_short * atr_value) or trend_strong_short # soft-AND
         # Mum rengi, closed_candle vs.
         closed_candle = df.iloc[-2]
         current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
         # --- Mum rengi şartı (long = yeşil, short = kırmızı) ---
         is_green = pd.notna(closed_candle['close']) and pd.notna(closed_candle['open']) and (closed_candle['close'] > closed_candle['open'])
         is_red = pd.notna(closed_candle['close']) and pd.notna(closed_candle['open']) and (closed_candle['close'] < closed_candle['open'])
+        # --- EMA 13/34/100 giriş koşulları (ADX modlarına göre) ---
+        e13 = df['ema13']
+        s34 = df['mid34']
+        e100 = df['ema100']
+        # Rejim/stack (son kapalı mum)
+        regime_long = (s34.iloc[-2] > e100.iloc[-2])
+        regime_short = (s34.iloc[-2] < e100.iloc[-2])
+        stack_long = (e13.iloc[-2] > s34.iloc[-2]) and regime_long
+        stack_short = (e13.iloc[-2] < s34.iloc[-2]) and regime_short
+        # Tazelik: 13/34 son CROSS_FRESH_BARS içinde kesişmiş mi?
+        cross_up_1334 = (e13.shift(1) <= s34.shift(1)) & (e13 > s34)
+        cross_dn_1334 = (e13.shift(1) >= s34.shift(1)) & (e13 < s34)
+        fresh_up = bool(cross_up_1334.iloc[-(CROSS_FRESH_BARS+1):-1].any())
+        fresh_dn = bool(cross_dn_1334.iloc[-(CROSS_FRESH_BARS+1):-1].any())
+        # Slope & ayrışma
+        slow_ok_long = (e100.iloc[-2] - e100.iloc[-(SLOPE_WINDOW+2)]) > 0 if len(e100) >= SLOPE_WINDOW+2 else False
+        slow_ok_short = (e100.iloc[-2] - e100.iloc[-(SLOPE_WINDOW+2)]) < 0 if len(e100) >= SLOPE_WINDOW+2 else False
+        div_ok_long = (s34.iloc[-2] - e100.iloc[-2]) >= D_K_ATR * atr_value
+        div_ok_short = (e100.iloc[-2] - s34.iloc[-2]) >= D_K_ATR * atr_value
+        # Mesafe & retest
+        close_last = float(df['close'].iloc[-2])
+        dist_ok_long = (close_last - s34.iloc[-2]) >= CONFIRM_K_ATR * atr_value
+        dist_ok_short = (s34.iloc[-2] - close_last) >= CONFIRM_K_ATR * atr_value
+        retest_long = abs(float(df['low'].iloc[-2]) - s34.iloc[-2]) <= RETEST_K_ATR * atr_value
+        retest_short = abs(float(df['high'].iloc[-2]) - s34.iloc[-2]) <= RETEST_K_ATR * atr_value
+        # Tetik (ADX moduna göre ayarlanıyor)
+        adx_last = df['adx'].iloc[-2]
+        if adx_last < ADX_THRESHOLD: # <15: Çok sıkı mod
+            ema_setup_buy = stack_long and retest_long and ok_l and (bull_score["score"] < TRAP_TIGHT_MAX) and slow_ok_long and smi_condition_long
+            ema_setup_sell = stack_short and retest_short and ok_s and (bear_score["score"] < TRAP_TIGHT_MAX) and slow_ok_short and smi_condition_short
+        elif ADX_THRESHOLD <= adx_last < ADX_NORMAL_HIGH: # 15-21: Normal mod (2of3)
+            trig_long = fresh_up or retest_long if USE_STACK_FRESH else fresh_up
+            trig_short = fresh_dn or retest_short if USE_STACK_FRESH else fresh_dn
+            ema_setup_buy = (stack_long if USE_STACK_ONLY else regime_long) and trig_long and slow_ok_long and div_ok_long and dist_ok_long
+            ema_setup_sell = (stack_short if USE_STACK_ONLY else regime_short) and trig_short and slow_ok_short and div_ok_short and dist_ok_short
+        else: # >=21: Direkt mod
+            trig_long = fresh_up # retest zorunlu değil
+            trig_short = fresh_dn
+            ema_setup_buy = regime_long and trig_long and dist_ok_long # minimum filtre
+            ema_setup_sell = regime_short and trig_short and dist_ok_short
         # --- Al / Sat koşulları ---
         buy_condition = (
-            ema_sma_crossover_buy and ok_l and smi_condition_long and
+            ema_setup_buy and ok_l and smi_condition_long and
             str_ok and dir_long_ok and trap_ok_long and froth_ok_long and is_green and
-            (closed_candle['close'] > closed_candle['ema13'] and closed_candle['close'] > closed_candle['sma34'])
+            (closed_candle['close'] > s34.iloc[-2] and closed_candle['close'] > e100.iloc[-2])
         )
         sell_condition = (
-            ema_sma_crossover_sell and ok_s and smi_condition_short and
+            ema_setup_sell and ok_s and smi_condition_short and
             str_ok and dir_short_ok and trap_ok_short and froth_ok_short and is_red and
-            (closed_candle['close'] < closed_candle['ema13'] and closed_candle['close'] < closed_candle['sma34'])
+            (closed_candle['close'] < s34.iloc[-2] and closed_candle['close'] < e100.iloc[-2])
         )
-        logger.info(f"{symbol} {timeframe} EMA/SMA buy:{ema_sma_crossover_buy} sell:{ema_sma_crossover_sell}")
+        logger.info(f"{symbol} {timeframe} EMA buy:{ema_setup_buy} sell:{ema_setup_sell}")
         logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition} riskL:{bull_score['label']} riskS:{bear_score['label']}")
         key = f"{symbol}_{timeframe}"
         current_pos = signal_cache.get(key, {
@@ -881,14 +902,18 @@ async def check_signals(symbol, timeframe='4h'):
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
             return
         now = datetime.now(tz)
-        # --- EMA/SMA EXIT kesişimleri (son kapalı mum) ---
-        ema_prev, sma_prev = df['ema13'].iloc[-3], df['sma34'].iloc[-3]
-        ema_last, sma_last = df['ema13'].iloc[-2], df['sma34'].iloc[-2]
-        exit_cross_long = (pd.notna(ema_prev) and pd.notna(sma_prev) and pd.notna(ema_last) and pd.notna(sma_last)
-                            and (ema_prev >= sma_prev) and (ema_last < sma_last))
-        exit_cross_short = (pd.notna(ema_prev) and pd.notna(sma_prev) and pd.notna(ema_last) and pd.notna(sma_last)
-                            and (ema_prev <= sma_prev) and (ema_last > sma_last))
-        logger.info(f"{symbol} {timeframe} exit_cross_long:{exit_cross_long} exit_cross_short:{exit_cross_short}")
+        # --- EMA çıkış kesişimleri (son kapalı mum) ---
+        e13_prev, s34_prev, e100_prev = e13.iloc[-3], s34.iloc[-3], e100.iloc[-3]
+        e13_last, s34_last, e100_last = e13.iloc[-2], s34.iloc[-2], e100.iloc[-2]
+        # Normal exit: ters 13/34 cross
+        exit_cross_long = (pd.notna(e13_prev) and pd.notna(s34_prev) and pd.notna(e13_last) and pd.notna(s34_last)
+                           and (e13_prev >= s34_prev) and (e13_last < s34_last))
+        exit_cross_short = (pd.notna(e13_prev) and pd.notna(s34_prev) and pd.notna(e13_last) and pd.notna(s34_last)
+                            and (e13_prev <= s34_prev) and (e13_last > s34_last))
+        # Acil exit: rejim kırılımı (34/100 ters)
+        regime_break_long = s34_last < e100_last
+        regime_break_short = s34_last > e100_last
+        logger.info(f"{symbol} {timeframe} exit_cross_long:{exit_cross_long} exit_cross_short:{exit_cross_short} regime_break_long:{regime_break_long} regime_break_short:{regime_break_short}")
         # === Reversal kapama ===
         if (buy_condition or sell_condition) and (current_pos['signal'] is not None):
             new_signal = 'buy' if buy_condition else 'sell'
@@ -906,7 +931,7 @@ async def check_signals(symbol, timeframe='4h'):
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now,  # ← çıkışta güncelle
+                    'remaining_ratio': 1.0, 'last_signal_time': now, # ← çıkışta güncelle
                     'last_signal_type': current_pos['signal'], 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None
                 }
@@ -922,7 +947,7 @@ async def check_signals(symbol, timeframe='4h'):
             if not isinstance(bar_time, (pd.Timestamp, datetime)):
                 bar_time = pd.to_datetime(bar_time, errors="ignore")
             if cooldown_active or current_pos.get('last_bar_time') == bar_time:
-                await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (cooldown veya aynı bar) 🚫")
+                logger.info(f"{symbol} {timeframe}: BUY atlandı (cooldown veya aynı bar)")
             else:
                 entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
                 eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
@@ -932,7 +957,7 @@ async def check_signals(symbol, timeframe='4h'):
                     logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
                     return
                 if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
-                    await enqueue_message(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
+                    logger.info(f"{symbol} {timeframe}: BUY atlandı (anında SL riski)")
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
@@ -942,7 +967,7 @@ async def check_signals(symbol, timeframe='4h'):
                         'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
                         'lowest_price': None, 'avg_atr_ratio': avg_atr_ratio,
                         'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time  # ← ekle
+                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time # ← ekle
                     }
                     signal_cache[key] = current_pos
                     await enqueue_message(
@@ -953,7 +978,7 @@ async def check_signals(symbol, timeframe='4h'):
                         f"TP2: {fmt_sym(symbol, tp2_price)}"
                         f"{trap_line}"
                     )
-                    save_state()  # girişte persist
+                    save_state() # girişte persist
         # === Pozisyon aç — SELL ===
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
@@ -965,7 +990,7 @@ async def check_signals(symbol, timeframe='4h'):
             if not isinstance(bar_time, (pd.Timestamp, datetime)):
                 bar_time = pd.to_datetime(bar_time, errors="ignore")
             if cooldown_active or current_pos.get('last_bar_time') == bar_time:
-                await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (cooldown veya aynı bar) 🚫")
+                logger.info(f"{symbol} {timeframe}: SELL atlandı (cooldown veya aynı bar)")
             else:
                 entry_price = float(closed_candle['close']) if pd.notna(closed_candle['close']) else np.nan
                 eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
@@ -975,7 +1000,7 @@ async def check_signals(symbol, timeframe='4h'):
                     logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
                     return
                 if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
-                    await enqueue_message(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
+                    logger.info(f"{symbol} {timeframe}: SELL atlandı (anında SL riski)")
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
@@ -985,7 +1010,7 @@ async def check_signals(symbol, timeframe='4h'):
                         'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
                         'lowest_price': entry_price, 'avg_atr_ratio': avg_atr_ratio,
                         'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time  # ← ekle
+                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time # ← ekle
                     }
                     signal_cache[key] = current_pos
                     await enqueue_message(
@@ -996,7 +1021,7 @@ async def check_signals(symbol, timeframe='4h'):
                         f"TP2: {fmt_sym(symbol, tp2_price)}"
                         f"{trap_line}"
                     )
-                    save_state()  # girişte persist
+                    save_state() # girişte persist
         # === Pozisyon yönetimi: LONG ===
         if current_pos['signal'] == 'buy':
             if current_pos['highest_price'] is None or current_price > current_pos['highest_price']:
@@ -1012,7 +1037,7 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Cur: {fmt_sym(symbol, current_price)} | TP1: {fmt_sym(symbol, current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
-                save_state()  # TP'de persist
+                save_state() # TP'de persist
             # TP2
             elif not current_pos['tp2_hit'] and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
@@ -1023,21 +1048,21 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Cur: {fmt_sym(symbol, current_price)} | TP2: {fmt_sym(symbol, current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
-                save_state()  # TP'de persist
-            # EMA/SMA exit (bearish cross)
-            if exit_cross_long:
+                save_state() # TP'de persist
+            # EMA exit (normal veya acil)
+            if exit_cross_long or regime_break_long:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
-                    f"{symbol} {timeframe}: EMA/SMA EXIT (LONG) 🔁\n"
+                    f"{symbol} {timeframe}: EMA EXIT (LONG) 🔁\n"
                     f"Price: {fmt_sym(symbol, current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
-                now = datetime.now(tz)  # ← now'ı yenile
+                now = datetime.now(tz) # ← now'ı yenile
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now,  # ← çıkışta güncelle
+                    'remaining_ratio': 1.0, 'last_signal_time': now, # ← çıkışta güncelle
                     'last_signal_type': 'buy', 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None
                 }
@@ -1052,11 +1077,11 @@ async def check_signals(symbol, timeframe='4h'):
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
-                now = datetime.now(tz)  # ← now'ı yenile
+                now = datetime.now(tz) # ← now'ı yenile
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now,  # ← çıkışta güncelle
+                    'remaining_ratio': 1.0, 'last_signal_time': now, # ← çıkışta güncelle
                     'last_signal_type': 'buy', 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None
                 }
@@ -1078,7 +1103,7 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Cur: {fmt_sym(symbol, current_price)} | TP1: {fmt_sym(symbol, current_pos['tp1_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %30 kapandı, Stop girişe çekildi."
                 )
-                save_state()  # TP'de persist
+                save_state() # TP'de persist
             # TP2
             elif not current_pos['tp2_hit'] and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
@@ -1089,21 +1114,21 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Cur: {fmt_sym(symbol, current_price)} | TP2: {fmt_sym(symbol, current_pos['tp2_price'])}\n"
                     f"P/L: {profit_percent:+.2f}% | %40 kapandı, kalan %30 açık."
                 )
-                save_state()  # TP'de persist
-            # EMA/SMA exit (bullish cross)
-            if exit_cross_short:
+                save_state() # TP'de persist
+            # EMA exit (normal veya acil)
+            if exit_cross_short or regime_break_short:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(
-                    f"{symbol} {timeframe}: EMA/SMA EXIT (SHORT) 🔁\n"
+                    f"{symbol} {timeframe}: EMA EXIT (SHORT) 🔁\n"
                     f"Price: {fmt_sym(symbol, current_price)}\n"
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
-                now = datetime.now(tz)  # ← now'ı yenile
+                now = datetime.now(tz) # ← now'ı yenile
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now,  # ← çıkışta güncelle
+                    'remaining_ratio': 1.0, 'last_signal_time': now, # ← çıkışta güncelle
                     'last_signal_type': 'sell', 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None
                 }
@@ -1118,11 +1143,11 @@ async def check_signals(symbol, timeframe='4h'):
                     f"P/L: {profit_percent:+.2f}%\n"
                     f"Kalan %{current_pos['remaining_ratio']*100:.0f} kapandı."
                 )
-                now = datetime.now(tz)  # ← now'ı yenile
+                now = datetime.now(tz) # ← now'ı yenile
                 signal_cache[key] = {
                     'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
                     'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now,  # ← çıkışta güncelle
+                    'remaining_ratio': 1.0, 'last_signal_time': now, # ← çıkışta güncelle
                     'last_signal_type': 'sell', 'entry_time': None,
                     'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None
                 }
@@ -1139,7 +1164,7 @@ async def check_signals(symbol, timeframe='4h'):
         return
 # ================== Main ==================
 async def main():
-    await load_markets()  # precision için
+    await load_markets() # precision için
     tz = pytz.timezone('Europe/Istanbul')
     try:
         await telegram_bot.send_message(chat_id=CHAT_ID, text="Bot başladı 🟢 " + datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S'))
@@ -1167,6 +1192,6 @@ async def main():
         sleep_sec = max(0.0, 120.0 - elapsed) # 2 dk hedef
         logger.info(f"Tur bitti, {total_scanned} sembol tarandı, {elapsed:.1f}s sürdü, {sleep_sec:.1f}s bekle...")
         await asyncio.sleep(sleep_sec)
-        save_state()  # periyodik persist
+        save_state() # periyodik persist
 if __name__ == "__main__":
     asyncio.run(main())
