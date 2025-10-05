@@ -47,11 +47,6 @@ LINEAR_ONLY = True
 QUOTE_WHITELIST = ("USDT",)
 VOL_WIN = 60
 VOL_Q = 0.60
-FF_BODY_MIN = 0.45
-FF_UPWICK_MAX = 0.35
-FF_DNWICK_MAX = 0.35
-FF_BB_MIN = 0.20
-OBV_SLOPE_WIN = 3
 NTX_PERIOD = 14
 NTX_K_EFF = 10
 NTX_VOL_WIN = 60
@@ -107,12 +102,18 @@ if FF_ACTIVE_PROFILE == "agresif":
     BANDK_MIN, BANDK_MAX = 0.16, 0.35
     VOL_MA_RATIO_MIN = 1.02
     VOL_Z_MIN = 0.8
+    FF_BODY_MIN = 0.40
+    FF_UPWICK_MAX = 0.40
+    FF_DNWICK_MAX = 0.40
     G3_BOS_CONFIRM_BARS = max(1, G3_BOS_CONFIRM_BARS - 1)
 else:
     NTX_LOCAL_WIN = 300
     BANDK_MIN, BANDK_MAX = 0.20, 0.35
     VOL_MA_RATIO_MIN = 1.05
     VOL_Z_MIN = 1.0
+    FF_BODY_MIN = 0.45
+    FF_UPWICK_MAX = 0.35
+    FF_DNWICK_MAX = 0.35
 NTX_LOCAL_Q = 0.60
 NTX_Z_EWMA_ALPHA = 0.02
 ntx_local_cache = {}
@@ -251,7 +252,13 @@ def bars_since(mask: pd.Series, idx: int = -2) -> int:
     rev = s.values[::-1]
     return int(np.argmax(rev)) if rev.any() else len(rev)
 
-def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55) -> (bool, float, float):
+def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
+    if 'pos_ratio_th' in kwargs:
+        try:
+            logger.warning("rising_ema(): 'pos_ratio_th' is deprecated; use 'pos_ratio_thr'.")
+        except Exception:
+            pass
+        pos_ratio_thr = kwargs.pop('pos_ratio_th')
     s = pd.to_numeric(series, errors='coerce').dropna()
     if len(s) < win + 2:
         return False, 0.0, 0.0
@@ -262,7 +269,13 @@ def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr:
     ok = (slope > eps) and (pos_ratio >= pos_ratio_thr)
     return ok, slope, pos_ratio
 
-def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55) -> (bool, float, float):
+def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
+    if 'pos_ratio_th' in kwargs:
+        try:
+            logger.warning("robust_up(): 'pos_ratio_th' is deprecated; use 'pos_ratio_thr'.")
+        except Exception:
+            pass
+        pos_ratio_thr = kwargs.pop('pos_ratio_th')
     s = pd.to_numeric(series, errors='coerce').dropna()
     if len(s) < win + 2:
         return False, 0.0, 0.0
@@ -503,10 +516,12 @@ def adx_rising_strict(df_adx: pd.Series) -> bool:
     return (slope > 0) and (net >= ADX_RISE_MIN_NET) and (pos_ratio >= ADX_RISE_POS_RATIO)
 
 def adx_rising_hybrid(df_adx: pd.Series) -> bool:
-    if not ADX_RISE_USE_HYBRID:
+    if not ADX_RISE_USE_HYBRID or df_adx is None or len(df_adx) < 4:
         return False
-    if df_adx is None or len(df_adx) < 4:
-        return False
+    if USE_ROBUST_SLOPE:
+        ok, _, _ = robust_up(df_adx, win=4, eps=ADX_RISE_EPS, pos_ratio_thr=0.55)
+        last_diff = float(df_adx.iloc[-2] - df_adx.iloc[-3])
+        return ok and (last_diff > ADX_RISE_EPS)
     window = df_adx.iloc[-4:-1].astype(float)
     if window.isna().any():
         return False
@@ -553,7 +568,7 @@ def ntx_threshold(atr_z: float) -> float:
 
 def ntx_rising_strict(s: pd.Series, k: int = NTX_RISE_K_STRICT, min_net: float = NTX_RISE_MIN_NET, pos_ratio_th: float = NTX_RISE_POS_RATIO, eps: float = NTX_RISE_EPS) -> bool:
     if USE_ROBUST_SLOPE:
-        ok, _, pr = robust_up(s, win=min(k+1, 8), eps=eps, pos_ratio_th=pos_ratio_th)
+        ok, _, pr = robust_up(s, win=min(k+1, 8), eps=eps, pos_ratio_thr=pos_ratio_th)
         return ok
     if s is None or len(s) < k + 1: return False
     w = s.iloc[-(k+1):-1].astype(float)
@@ -566,21 +581,27 @@ def ntx_rising_strict(s: pd.Series, k: int = NTX_RISE_K_STRICT, min_net: float =
 
 def ntx_rising_hybrid_guarded(df: pd.DataFrame, side: str, eps: float = NTX_RISE_EPS, min_ntx: float = NTX_MIN_FOR_HYBRID, k: int = NTX_RISE_K_HYBRID, froth_k: float = NTX_FROTH_K) -> bool:
     s = df['ntx'] if 'ntx' in df.columns else None
-    if s is None or len(s) < k + 1: return False
+    if s is None or len(s) < k + 1:
+        return False
     w = s.iloc[-(k+1):-1].astype(float)
-    if w.isna().any(): return False
-    x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
-    last_diff = w.values[-1] - w.values[-2]
-    if not (slope > 0 and last_diff > eps): return False
-    if w.iloc[-1] < min_ntx: return False
-    close_last = float(df['close'].iloc[-2])
-    ema13_last = float(df['ema13'].iloc[-2])
-    atr_value = float(df['atr'].iloc[-2])
+    if w.isna().any():
+        return False
+    if USE_ROBUST_SLOPE:
+        ok, _, _ = robust_up(w, win=k, eps=eps, pos_ratio_thr=0.55)
+        last_diff = float(w.iloc[-1] - w.iloc[-2])
+        if not (ok and last_diff > eps):
+            return False
+    else:
+        x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
+        last_diff = w.values[-1] - w.values[-2]
+        if not (slope > 0 and last_diff > eps):
+            return False
+    if w.iloc[-1] < min_ntx:
+        return False
+    close_last = float(df['close'].iloc[-2]); ema13_last = float(df['ema13'].iloc[-2]); atr_value = float(df['atr'].iloc[-2])
     if not (np.isfinite(close_last) and np.isfinite(ema13_last) and np.isfinite(atr_value) and atr_value > 0):
         return False
-    if abs(close_last - ema13_last) > froth_k * atr_value:
-        return False
-    return True
+    return abs(close_last - ema13_last) <= froth_k * atr_value
 
 def ntx_vote(df: pd.DataFrame, ntx_thr: float) -> bool:
     if 'ntx' not in df.columns or 'ema13' not in df.columns:
@@ -612,7 +633,8 @@ def compute_dynamic_band_k(df: pd.DataFrame, adx_last: float) -> float:
 def compute_ntx_local_thr(df: pd.DataFrame, base_thr: float, symbol: str = None) -> (float, float):
     q_val = None
     tail = df['ntx'].iloc[-(NTX_LOCAL_WIN+2):-2].dropna()
-    if len(tail) >= 50:
+    min_bars = 40 if FF_ACTIVE_PROFILE == "agresif" else 60
+    if len(tail) >= min_bars:
         q_val = float(tail.quantile(NTX_LOCAL_Q))
         if symbol is not None:
             with _ntx_cache_lock:
