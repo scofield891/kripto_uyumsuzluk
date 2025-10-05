@@ -47,6 +47,7 @@ LINEAR_ONLY = True
 QUOTE_WHITELIST = ("USDT",)
 VOL_WIN = 60
 VOL_Q = 0.60
+OBV_SLOPE_WIN = 3
 NTX_PERIOD = 14
 NTX_K_EFF = 10
 NTX_VOL_WIN = 60
@@ -105,6 +106,7 @@ if FF_ACTIVE_PROFILE == "agresif":
     FF_BODY_MIN = 0.40
     FF_UPWICK_MAX = 0.40
     FF_DNWICK_MAX = 0.40
+    FF_BB_MIN = 0.18
     G3_BOS_CONFIRM_BARS = max(1, G3_BOS_CONFIRM_BARS - 1)
 else:
     NTX_LOCAL_WIN = 300
@@ -114,6 +116,7 @@ else:
     FF_BODY_MIN = 0.45
     FF_UPWICK_MAX = 0.35
     FF_DNWICK_MAX = 0.35
+    FF_BB_MIN = 0.20
 NTX_LOCAL_Q = 0.60
 NTX_Z_EWMA_ALPHA = 0.02
 ntx_local_cache = {}
@@ -343,6 +346,31 @@ async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
     syms = sorted(set(syms))
     logger.info(f"Keşfedilen sembol sayısı: {len(syms)} (linear={linear_only}, quotes={quote_whitelist})")
     return syms
+
+# ================== Volume Kontrol ==================
+def simple_volume_ok(df: pd.DataFrame, side: str) -> (bool, str):
+    # Son bar ve vol/MA oranı
+    last = df.iloc[-2]
+    vol = float(last['volume'])
+    vol_ma = float(last['vol_ma']) if pd.notna(last['vol_ma']) else np.nan
+    if not (np.isfinite(vol) and np.isfinite(vol_ma) and vol_ma > 0):
+        return False, "vol_nan"
+
+    ratio = vol / vol_ma
+    # Vol z-score (spike guard)
+    vz = float(df['vol_z'].iloc[-2]) if 'vol_z' in df.columns and pd.notna(df['vol_z'].iloc[-2]) else 0.0
+    # dvol quantile eşiği (likidite zemini)
+    d = float((df['close'] * df['volume']).iloc[-2])
+    d_q = float(df['dvol_q'].iloc[-2]) if 'dvol_q' in df.columns and pd.notna(df['dvol_q'].iloc[-2]) else 0.0
+
+    # Profil-bazlı eşikler
+    ratio_ok = (ratio >= VOL_MA_RATIO_MIN)
+    vz_ok = (vz >= VOL_Z_MIN)
+    d_ok = (d >= d_q) if np.isfinite(d_q) and d_q > 0 else True
+
+    ok = bool(ratio_ok and vz_ok and d_ok)
+    reason = f"ratio={ratio:.2f}{'✓' if ratio_ok else '✗'}, vz={vz:.2f}{'✓' if vz_ok else '✗'}, dvol>q={d_ok}"
+    return ok, reason
 
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
@@ -685,15 +713,15 @@ def _bb_prox(last, side="long"):
     return clamp(num/den, 0.0, 1.0)
 
 def _obv_slope_recent(df: pd.DataFrame, win=OBV_SLOPE_WIN) -> float:
-    s = df['obv'].iloc[-(win+1):-1].astype(float)
+    s = df['obv'].iloc[-(win+1):-1].astype(float) if 'obv' in df.columns else pd.Series(dtype=float)
     if s.size < 3 or s.isna().any():
         return 0.0
     if USE_ROBUST_SLOPE:
-        ok, slope, _ = robust_up(s, win=min(win, 8), eps=0.0, pos_ratio_thr=0.55)
-        if not ok:
-            ok2, slope2, _ = rising_ema(s, win=min(win, 8), eps=0.0, pos_ratio_thr=0.55)
-            return float(slope2 if ok2 else 0.0)
-        return float(slope)
+        ok1, slope1, _ = rising_ema(s, win=win, eps=0.0, pos_ratio_thr=0.55)
+        ok2, slope2, _ = robust_up(s, win=win, eps=0.0, pos_ratio_thr=0.55)
+        if ok1 or ok2:
+            return float(slope1 if ok1 else slope2)
+        return float(np.median(np.diff(s.values)))
     x = np.arange(len(s))
     m, _ = np.polyfit(x, s.values, 1)
     return float(m)
@@ -1126,12 +1154,23 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
                     current_pos = {
-                        'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
-                        'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
-                        'lowest_price': None, 'avg_atr_ratio': avg_atr_ratio,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
+                        'signal': 'buy',
+                        'entry_price': entry_price,
+                        'sl_price': sl_price,
+                        'tp1_price': tp1_price,
+                        'tp2_price': tp2_price,
+                        'highest_price': entry_price,
+                        'lowest_price': None,
+                        'avg_atr_ratio': avg_atr_ratio,
+                        'remaining_ratio': 1.0,
+                        'last_signal_time': now,
+                        'last_signal_type': 'buy',
+                        'entry_time': now,
+                        'tp1_hit': False,
+                        'tp2_hit': False,
+                        'last_bar_time': bar_time,
+                        'regime_dir': current_pos.get('regime_dir'),
+                        'last_regime_bar': current_pos.get('last_regime_bar')
                     }
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
                     await enqueue_message(f"{symbol} {timeframe}: BUY (LONG) 🚀 Sebep: {reason} Entry: {fmt_sym(symbol, entry_price)} SL: {fmt_sym(symbol, sl_price)} TP1: {fmt_sym(symbol, tp1_price)} TP2: {fmt_sym(symbol, tp2_price)}")
@@ -1164,12 +1203,23 @@ async def check_signals(symbol, timeframe='4h'):
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
                     tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
                     current_pos = {
-                        'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
-                        'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
-                        'lowest_price': entry_price, 'avg_atr_ratio': avg_atr_ratio,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
+                        'signal': 'sell',
+                        'entry_price': entry_price,
+                        'sl_price': sl_price,
+                        'tp1_price': tp1_price,
+                        'tp2_price': tp2_price,
+                        'highest_price': None,
+                        'lowest_price': entry_price,
+                        'avg_atr_ratio': avg_atr_ratio,
+                        'remaining_ratio': 1.0,
+                        'last_signal_time': now,
+                        'last_signal_type': 'sell',
+                        'entry_time': now,
+                        'tp1_hit': False,
+                        'tp2_hit': False,
+                        'last_bar_time': bar_time,
+                        'regime_dir': current_pos.get('regime_dir'),
+                        'last_regime_bar': current_pos.get('last_regime_bar')
                     }
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
                     await enqueue_message(f"{symbol} {timeframe}: SELL (SHORT) 📉 Sebep: {reason} Entry: {fmt_sym(symbol, entry_price)} SL: {fmt_sym(symbol, sl_price)} TP1: {fmt_sym(symbol, tp1_price)} TP2: {fmt_sym(symbol, tp2_price)}")
@@ -1275,6 +1325,7 @@ async def check_signals(symbol, timeframe='4h'):
 async def main():
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
+    asyncio.create_task(message_sender())
     await load_markets()
     symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
     random.shuffle(symbols)
