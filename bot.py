@@ -1,3 +1,4 @@
+
 import ccxt
 import numpy as np
 import pandas as pd
@@ -858,7 +859,7 @@ def _quality_ok(df, side, bear_mode):
     fk_ok, fk_dbg = fake_filter_v2(df, side=side, bear_mode=bear_mode)
     last = df.iloc[-2]
     ema13 = float(last['ema13']); close = float(last['close']); atrv = float(last['atr'])
-    ema13_ok = np.isfinite(atrv) and (abs(close-ema13) <= G3_ENTRY_DIST_EMA13_ATR * atrv)
+    ema13_ok = np.isfinite(atrv) and (abs(close - ema13) <= G3_ENTRY_DIST_EMA13_ATR * atrv)
     return (fk_ok and ema13_ok), f"ff={fk_ok} ({fk_dbg}), ema13_dist_ok={ema13_ok}"
 
 def _structure_ok(df, side):
@@ -932,6 +933,41 @@ def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None)
                     f"ntx_z_last:{ntx_z_last:.2f}, ntx_z_slope:{ntx_z_slope:.2f}}}")
         dbg = f"{dbg} | {dbg_json}"
     return ok, dbg
+
+def _summarize_coverage(all_symbols):
+    total = len(all_symbols)
+    # scan_status: {symbol: {'code': <status>, 'detail': ...}}
+    codes = {s: scan_status.get(s, {}).get('code') for s in all_symbols}
+    ok = sum(1 for c in codes.values() if c == 'completed')
+    cooldown = sum(1 for c in codes.values() if c == 'cooldown')
+    min_bars = sum(1 for c in codes.values() if c == 'min_bars')
+    skip = sum(1 for c in codes.values() if c == 'skip')
+    error = sum(1 for c in codes.values() if c == 'error')
+    missing = total - sum(1 for c in codes.values() if c is not None)
+    return {
+        "total": total,
+        "ok": ok,
+        "cooldown": cooldown,
+        "min_bars": min_bars,
+        "skip": skip,
+        "error": error,
+        "missing": missing,
+    }
+
+def _log_false_breakdown():
+    logger.info("Kriter FALSE dökümü (yüksekten düşüğe):")
+    if not crit_total_counts:
+        logger.info("  (veri yok)")
+        return
+    # False sayısına göre azalan sırala
+    items = sorted(crit_total_counts.items(),
+                   key=lambda kv: crit_false_counts[kv[0]],
+                   reverse=True)
+    for name, total in items:
+        f = crit_false_counts[name]
+        pct = (f / total * 100.0) if total else 0.0
+        # örnek: " - gate_short: 566/574 (98.6%)"
+        logger.info(f" - {name}: {f}/{total} ({pct:.1f}%)")
 
 # ================== Sinyal Döngüsü ==================
 async def check_signals(symbol, timeframe='4h'):
@@ -1361,16 +1397,37 @@ async def main():
         await enqueue_message("Bot başlatıldı! 🚀")
     asyncio.create_task(message_sender())
     await load_markets()
+    # sayaç/situasyon reset (tur bazlı rapor için)
+    async with _stats_lock:
+        scan_status.clear()
+    crit_false_counts.clear()
+    crit_total_counts.clear()
     symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
     random.shuffle(symbols)
     shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
+    t_start = time.time()
     tasks = []
-    for shard in shards:
+    for i, shard in enumerate(shards, start=1):
+        logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
         for symbol in shard:
             tasks.append(check_signals(symbol, timeframe='4h'))
         await asyncio.gather(*tasks)
         tasks = []
         await asyncio.sleep(INTER_BATCH_SLEEP)
+    # Tur sonu özetleri
+    cov = _summarize_coverage(symbols)
+    logger.info(
+        "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
+        "skip={skip} | error={error} | missing={missing}".format(**cov)
+    )
+    _log_false_breakdown()
+    elapsed = time.time() - t_start
+    logger.info(
+        "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
+        "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle=0.0s".format(
+            elapsed=elapsed, **cov
+        )
+    )
     if HEARTBEAT_ENABLED:
         while True:
             await asyncio.sleep(3600)
