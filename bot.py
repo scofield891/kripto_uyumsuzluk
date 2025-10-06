@@ -37,7 +37,7 @@ INSTANT_SL_BUFFER = 0.05
 ADX_PERIOD = 14
 APPLY_COOLDOWN_BOTH_DIRECTIONS = True
 USE_FROTH_GUARD = True
-FROTH_GUARD_K_ATR = 1.1
+FROTH_GUARD_K_ATR = 1.2
 MAX_CONCURRENT_FETCHES = 4
 RATE_LIMIT_MS = 200
 N_SHARDS = 5
@@ -47,7 +47,7 @@ LINEAR_ONLY = True
 QUOTE_WHITELIST = ("USDT",)
 VOL_WIN = 60
 VOL_Q = 0.60
-OBV_SLOPE_WIN = 3
+OBV_SLOPE_WIN = 4
 NTX_PERIOD = 14
 NTX_K_EFF = 10
 NTX_VOL_WIN = 60
@@ -62,7 +62,7 @@ NTX_RISE_K_HYBRID = 3
 NTX_FROTH_K = 1.0
 EMA_FAST = 13
 EMA_MID = 34
-EMA_SLOW = 100
+EMA_SLOW = 89
 ADX_SOFT = 21
 MIN_BARS = 80
 NEW_SYMBOL_COOLDOWN_MIN = 180
@@ -76,14 +76,15 @@ REGIME1_SLOPE_WIN = 5
 REGIME1_SLOPE_THR_PCT = 0.0
 REGIME1_REQUIRE_2CLOSE = True
 REGIME1_ADX_ADAPTIVE_BAND = True
-RECENCY_K = 8
+RECENCY_K = 6
 RECENCY_OPP_K = 2
+GRACE_BARS = 8  # 8 mum istisnası için sabit
 USE_GATE_V3 = True
 G3_BAND_K = 0.25
 G3_SLOPE_WIN = 5
 G3_SLOPE_THR_PCT = 0.0
-G3_MIN_ADX = 21
-G3_MIN_ADX_BEAR = 23
+G3_MIN_ADX = 22
+G3_MIN_ADX_BEAR = 24
 G3_NTX_BONUS_BEAR = 6.0
 G3_NTX_SLOPE_WIN = 5
 G3_USE_RETEST = False
@@ -91,7 +92,7 @@ G3_BOS_LOOKBACK = 12
 G3_BOS_CONFIRM_BARS = 2
 G3_BOS_MIN_BREAK_ATR = 0.20
 G3_SWING_WIN = 7
-G3_ENTRY_DIST_EMA13_ATR = 0.80
+G3_ENTRY_DIST_EMA13_ATR = 0.75
 G3_FF_MIN_SCORE = 3
 G3_FF_MIN_SCORE_BEAR = 4
 USE_ROBUST_SLOPE = True
@@ -100,23 +101,23 @@ DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
 if FF_ACTIVE_PROFILE == "agresif":
     NTX_LOCAL_WIN = 240
-    BANDK_MIN, BANDK_MAX = 0.16, 0.35
+    BANDK_MIN, BANDK_MAX = 0.18, 0.35
     VOL_MA_RATIO_MIN = 1.02
     VOL_Z_MIN = 0.8
     FF_BODY_MIN = 0.40
     FF_UPWICK_MAX = 0.40
     FF_DNWICK_MAX = 0.40
-    FF_BB_MIN = 0.18
+    FF_BB_MIN = 0.20
     G3_BOS_CONFIRM_BARS = max(1, G3_BOS_CONFIRM_BARS - 1)
 else:
     NTX_LOCAL_WIN = 300
-    BANDK_MIN, BANDK_MAX = 0.20, 0.35
+    BANDK_MIN, BANDK_MAX = 0.22, 0.35
     VOL_MA_RATIO_MIN = 1.05
     VOL_Z_MIN = 1.0
     FF_BODY_MIN = 0.45
     FF_UPWICK_MAX = 0.35
     FF_DNWICK_MAX = 0.35
-    FF_BB_MIN = 0.20
+    FF_BB_MIN = 0.22
 NTX_LOCAL_Q = 0.60
 NTX_Z_EWMA_ALPHA = 0.02
 ntx_local_cache = {}
@@ -255,6 +256,21 @@ def bars_since(mask: pd.Series, idx: int = -2) -> int:
     rev = s.values[::-1]
     return int(np.argmax(rev)) if rev.any() else len(rev)
 
+def format_signal_msg(symbol: str, timeframe: str, side: str,
+                     entry: float, sl: float, tp1: float, tp2: float,
+                     tz_name: str = "Europe/Istanbul") -> str:
+    tz = pytz.timezone(tz_name)
+    date_str = datetime.now(tz).strftime("%d.%m.%Y")
+    title = "BUY (LONG) 🚀" if side == "buy" else "SELL (SHORT) 📉"
+    return (
+        f"{symbol} {timeframe}: {title}\n"
+        f"Entry: {fmt_sym(symbol, entry)}\n"
+        f"SL: {fmt_sym(symbol, sl)}\n"
+        f"TP1: {fmt_sym(symbol, tp1)}\n"
+        f"TP2: {fmt_sym(symbol, tp2)}\n"
+        f"Tarih: {date_str}"
+    )
+
 def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
     if 'pos_ratio_th' in kwargs:
         try:
@@ -287,6 +303,14 @@ def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: 
     pos_ratio = float((np.diff(window_vals) > eps).mean())
     ok = (med_d > eps) and (pos_ratio >= pos_ratio_thr)
     return ok, med_d, pos_ratio
+
+def _last_true_index(s: pd.Series, upto_idx: int) -> int:
+    # upto_idx dahil olacak şekilde sondan ilk True index'i döndürür, yoksa -1
+    vals = s.iloc[:upto_idx+1].values
+    for i in range(len(vals)-1, -1, -1):
+        if bool(vals[i]):
+            return i
+    return -1
 
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str):
@@ -349,25 +373,18 @@ async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
 
 # ================== Volume Kontrol ==================
 def simple_volume_ok(df: pd.DataFrame, side: str) -> (bool, str):
-    # Son bar ve vol/MA oranı
     last = df.iloc[-2]
     vol = float(last['volume'])
     vol_ma = float(last['vol_ma']) if pd.notna(last['vol_ma']) else np.nan
     if not (np.isfinite(vol) and np.isfinite(vol_ma) and vol_ma > 0):
         return False, "vol_nan"
-
     ratio = vol / vol_ma
-    # Vol z-score (spike guard)
     vz = float(df['vol_z'].iloc[-2]) if 'vol_z' in df.columns and pd.notna(df['vol_z'].iloc[-2]) else 0.0
-    # dvol quantile eşiği (likidite zemini)
     d = float((df['close'] * df['volume']).iloc[-2])
     d_q = float(df['dvol_q'].iloc[-2]) if 'dvol_q' in df.columns and pd.notna(df['dvol_q'].iloc[-2]) else 0.0
-
-    # Profil-bazlı eşikler
     ratio_ok = (ratio >= VOL_MA_RATIO_MIN)
     vz_ok = (vz >= VOL_Z_MIN)
     d_ok = (d >= d_q) if np.isfinite(d_q) and d_q > 0 else True
-
     ok = bool(ratio_ok and vz_ok and d_ok)
     reason = f"ratio={ratio:.2f}{'✓' if ratio_ok else '✗'}, vz={vz:.2f}{'✓' if vz_ok else '✗'}, dvol>q={d_ok}"
     return ok, reason
@@ -516,7 +533,7 @@ def calculate_indicators(df, symbol, timeframe):
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, EMA_FAST)
     df['ema34'] = calculate_ema(closes, EMA_MID)
-    df['ema100'] = calculate_ema(closes, EMA_SLOW)
+    df['ema89'] = calculate_ema(closes, EMA_SLOW)
     df = calculate_bb(df)
     df = calc_sqzmom_lb(df, length=20, mult_bb=2.0, lengthKC=20, multKC=1.5, use_true_range=True)
     df, di_condition_long, di_condition_short = calculate_adx(df, symbol)
@@ -529,7 +546,12 @@ def calculate_indicators(df, symbol, timeframe):
 
 def adx_rising_strict(df_adx: pd.Series) -> bool:
     if USE_ROBUST_SLOPE:
-        ok, _, pr = robust_up(df_adx, win=min(ADX_RISE_K+1, 8), eps=ADX_RISE_EPS, pos_ratio_thr=ADX_RISE_POS_RATIO)
+        ok, _, _ = robust_up(
+            df_adx,
+            win=min(ADX_RISE_K + 1, 8),
+            eps=ADX_RISE_EPS,
+            pos_ratio_thr=ADX_RISE_POS_RATIO
+        )
         return ok
     if df_adx is None or len(df_adx) < ADX_RISE_K + 1:
         return False
@@ -798,15 +820,15 @@ def _bos_only(df: pd.DataFrame, side: str,
         return (ok >= conf_needed), f"bos_only_short conf={ok}/{conf_needed}"
 
 def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
-    c2 = float(df['close'].iloc[-2]); e100 = float(df['ema100'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
-    c3 = float(df['close'].iloc[-3]); e100_3 = float(df['ema100'].iloc[-3]); atr3 = float(df['atr'].iloc[-3])
-    if any(map(lambda x: not np.isfinite(x), [c2,e100,atr2,c3,e100_3,atr3])): return False, "nan"
+    c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
+    c3 = float(df['close'].iloc[-3]); e89_3 = float(df['ema89'].iloc[-3]); atr3 = float(df['atr'].iloc[-3])
+    if any(map(lambda x: not np.isfinite(x), [c2,e89,atr2,c3,e89_3,atr3])): return False, "nan"
     if side == 'long':
-        band_ok = (c2 > e100 + band_k*atr2) and (c3 > e100_3 + band_k*atr3)
+        band_ok = (c2 > e89 + band_k*atr2) and (c3 > e89_3 + band_k*atr3)
     else:
-        band_ok = (c2 < e100 - band_k*atr2) and (c3 < e100_3 - band_k*atr3)
-    if len(df) > slope_win + 2 and pd.notna(df['ema100'].iloc[-2 - slope_win]):
-        e_now = float(df['ema100'].iloc[-2]); e_then = float(df['ema100'].iloc[-2 - slope_win])
+        band_ok = (c2 < e89 - band_k*atr2) and (c3 < e89_3 - band_k*atr3)
+    if len(df) > slope_win + 2 and pd.notna(df['ema89'].iloc[-2 - slope_win]):
+        e_now = float(df['ema89'].iloc[-2]); e_then = float(df['ema89'].iloc[-2 - slope_win])
         pct_slope = (e_now - e_then) / max(abs(e_then), 1e-12)
     else:
         pct_slope = 0.0
@@ -980,18 +1002,18 @@ async def check_signals(symbol, timeframe='4h'):
         else:
             band_k = REGIME1_BAND_K_DEFAULT
         c2 = float(df['close'].iloc[-2]); c3 = float(df['close'].iloc[-3])
-        e100_2 = float(df['ema100'].iloc[-2]); e100_3 = float(df['ema100'].iloc[-3])
+        e89_2 = float(df['ema89'].iloc[-2]); e89_3 = float(df['ema89'].iloc[-3])
         atr2 = float(df['atr'].iloc[-2]); atr3 = float(df['atr'].iloc[-3])
         if REGIME1_REQUIRE_2CLOSE:
-            long_band_ok = (c2 > e100_2 + band_k*atr2) and (c3 > e100_3 + band_k*atr3)
-            short_band_ok = (c2 < e100_2 - band_k*atr2) and (c3 < e100_3 - band_k*atr3)
+            long_band_ok = (c2 > e89_2 + band_k*atr2) and (c3 > e89_3 + band_k*atr3)
+            short_band_ok = (c2 < e89_2 - band_k*atr2) and (c3 < e89_3 - band_k*atr3)
         else:
-            long_band_ok = (c2 > e100_2 + band_k*atr2)
-            short_band_ok = (c2 < e100_2 - band_k*atr2)
-        if len(df) > REGIME1_SLOPE_WIN + 2 and pd.notna(df['ema100'].iloc[-2 - REGIME1_SLOPE_WIN]):
-            e100_now = float(df['ema100'].iloc[-2])
-            e100_then = float(df['ema100'].iloc[-2 - REGIME1_SLOPE_WIN])
-            pct_slope = (e100_now - e100_then) / max(abs(e100_then), 1e-12)
+            long_band_ok = (c2 > e89_2 + band_k*atr2)
+            short_band_ok = (c2 < e89_2 - band_k*atr2)
+        if len(df) > REGIME1_SLOPE_WIN + 2 and pd.notna(df['ema89'].iloc[-2 - REGIME1_SLOPE_WIN]):
+            e89_now = float(df['ema89'].iloc[-2])
+            e89_then = float(df['ema89'].iloc[-2 - REGIME1_SLOPE_WIN])
+            pct_slope = (e89_now - e89_then) / max(abs(e89_then), 1e-12)
         else:
             pct_slope = 0.0
         slope_thr = REGIME1_SLOPE_THR_PCT / 100.0
@@ -1009,59 +1031,65 @@ async def check_signals(symbol, timeframe='4h'):
                          and (e13_prev >= e34_prev) and (e13_last < e34_last))
         cross_up_series = (e13.shift(1) <= e34.shift(1)) & (e13 > e34)
         cross_dn_series = (e13.shift(1) >= e34.shift(1)) & (e13 < e34)
-        last_up_age = bars_since(cross_up_series, idx=-2)
-        last_dn_age = bars_since(cross_dn_series, idx=-2)
-        still_aligned_long = (e13_last > e34_last)
-        still_aligned_short = (e13_last < e34_last)
-        smi_positive = bool(df['lb_sqz_val'].iloc[-2] > 0) if pd.notna(df['lb_sqz_val'].iloc[-2]) else False
-        smi_negative = bool(df['lb_sqz_val'].iloc[-2] < 0) if pd.notna(df['lb_sqz_val'].iloc[-2]) else False
+        idx_lastbar = len(df) - 2  # karar verilen bar
+        close = df['close'].values
+        ema89 = df['ema89'].values
+        # 1) Son YUKARI kesişimin bar index'i
+        idx_up = _last_true_index(cross_up_series, idx_lastbar)
+        # 2) Son AŞAĞI kesişimin bar index'i
+        idx_dn = _last_true_index(cross_dn_series, idx_lastbar)
+        grace_long = False
+        if idx_up >= 0:
+            # LONG grace: 89 altında 13-34 kesişimi + 8 mum içinde fiyat 89 üstüne
+            wrong_side_at_cross = close[idx_up] < ema89[idx_up]
+            within = (idx_lastbar - idx_up) <= GRACE_BARS
+            if wrong_side_at_cross and within:
+                crossed_to_right = np.any(close[idx_up+1:idx_lastbar+1] > ema89[idx_up+1:idx_lastbar+1])
+                grace_long = bool(crossed_to_right)
+        grace_short = False
+        if idx_dn >= 0:
+            # SHORT grace: 89 üstünde 13-34 kesişimi + 8 mum içinde fiyat 89 altına
+            wrong_side_at_cross = close[idx_dn] > ema89[idx_dn]
+            within = (idx_lastbar - idx_dn) <= GRACE_BARS
+            if wrong_side_at_cross and within:
+                crossed_to_right = np.any(close[idx_dn+1:idx_lastbar+1] < ema89[idx_dn+1:idx_lastbar+1])
+                grace_short = bool(crossed_to_right)
+        # Rejim + kesişim + istisna (yalın)
+        regime_now_long = bool(df['close'].iloc[-2] > df['ema89'].iloc[-2])
+        regime_now_short = bool(df['close'].iloc[-2] < df['ema89'].iloc[-2])
+        allow_long = (regime_now_long and cross_up_1334) or grace_long
+        allow_short = (regime_now_short and cross_dn_1334) or grace_short
+        # --- Squeeze Momentum (LazyBear) açık ton ve bar rengi zorunluluğu ---
+        smi_val_now = float(df['lb_sqz_val'].iloc[-2]) if pd.notna(df['lb_sqz_val'].iloc[-2]) else np.nan
+        smi_val_prev = float(df['lb_sqz_val'].iloc[-3]) if pd.notna(df['lb_sqz_val'].iloc[-3]) else np.nan
+        smi_positive = (np.isfinite(smi_val_now) and smi_val_now > 0.0)  # üst yarı
+        smi_negative = (np.isfinite(smi_val_now) and smi_val_now < 0.0)  # alt yarı
+        smi_up = (np.isfinite(smi_val_now) and np.isfinite(smi_val_prev) and (smi_val_now > smi_val_prev))
+        smi_down = (np.isfinite(smi_val_now) and np.isfinite(smi_val_prev) and (smi_val_now < smi_val_prev))
+        # Açık tonlar:
+        smi_open_green = smi_positive and smi_up  # açık yeşil (long)
+        smi_open_red = smi_negative and smi_down  # açık kırmızı (short)
+        # Bar rengi:
         is_green = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] > df['open'].iloc[-2]))
         is_red = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] < df['open'].iloc[-2]))
-        immediate_long = cross_up_1334 and only_long and smi_positive and is_green
-        immediate_short = cross_dn_1334 and only_short and smi_negative and is_red
-        no_fresh_opposite_long = (last_dn_age > RECENCY_OPP_K)
-        no_fresh_opposite_short = (last_up_age > RECENCY_OPP_K)
-        late_ok_long = (
-            only_long and still_aligned_long and
-            (last_up_age <= RECENCY_K) and (last_up_age < last_dn_age) and
-            no_fresh_opposite_long and smi_positive and is_green
-        )
-        late_ok_short = (
-            only_short and still_aligned_short and
-            (last_dn_age <= RECENCY_K) and (last_dn_age < last_up_age) and
-            no_fresh_opposite_short and smi_negative and is_red
-        )
-        buy_condition_raw = immediate_long or late_ok_long
-        sell_condition_raw = immediate_short or late_ok_short
-        if immediate_long:
-            entry_cause = "EMA13/34 Cross (immediate)"
-        elif late_ok_long:
-            entry_cause = f"EMA13/34 Cross (late-ok, t+{last_up_age})"
-        elif immediate_short:
-            entry_cause = "EMA13/34 Cross (immediate)"
-        elif late_ok_short:
-            entry_cause = f"EMA13/34 Cross (late-ok, t+{last_dn_age})"
-        else:
-            entry_cause = ""
-        if USE_GATE_V3:
-            okL, whyL = entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
-            okS, whyS = entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
-            buy_condition_raw = okL
-            sell_condition_raw = okS
-            buy_condition = (gate_long and froth_ok_long and buy_condition_raw)
-            sell_condition = (gate_short and froth_ok_short and sell_condition_raw)
-            if buy_condition:
-                reason = f"G3 LONG OK | {whyL}"
-            elif sell_condition:
-                reason = f"G3 SHORT OK | {whyS}"
-            else:
-                reason = ""
-            if VERBOSE_LOG and (buy_condition or sell_condition):
-                logger.info(f"{symbol} {timeframe} DYNDBG: {reason}")
-        else:
-            buy_condition = gate_long and fk_ok_L and froth_ok_long and buy_condition_raw
-            sell_condition = gate_short and fk_ok_S and froth_ok_short and sell_condition_raw
-            reason = entry_cause if (buy_condition or sell_condition) else ""
+        okL, whyL = entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
+        okS, whyS = entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
+        # ZORUNLU: LazyBear açık ton + bar rengi
+        buy_condition_raw = allow_long and smi_open_green and is_green
+        sell_condition_raw = allow_short and smi_open_red and is_red
+        buy_condition = gate_long and froth_ok_long and buy_condition_raw and okL
+        sell_condition = gate_short and froth_ok_short and sell_condition_raw and okS
+        reason = ""
+        if buy_condition:
+            reason = f"G3 LONG OK | {whyL}"
+            if grace_long:
+                reason = (reason + " | grace_long_8bar") if reason else "grace_long_8bar"
+        elif sell_condition:
+            reason = f"G3 SHORT OK | {whyS}"
+            if grace_short:
+                reason = (reason + " | grace_short_8bar") if reason else "grace_short_8bar"
+        if VERBOSE_LOG and (buy_condition or sell_condition):
+            logger.info(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
             ("gate_long", gate_long),
             ("gate_short", gate_short),
@@ -1073,18 +1101,20 @@ async def check_signals(symbol, timeframe='4h'):
             ("reg1_short_band_ok", short_band_ok),
             ("reg1_slope_pos", pct_slope > slope_thr),
             ("reg1_slope_neg", pct_slope < -slope_thr),
-            ("late_ok_long", late_ok_long),
-            ("late_ok_short", late_ok_short),
-            ("last_up_age_le_RECENCY", last_up_age <= RECENCY_K),
-            ("last_dn_age_le_RECENCY", last_dn_age <= RECENCY_K),
-            ("smi_positive", smi_positive),
-            ("smi_negative", smi_negative),
+            ("grace_long", grace_long),
+            ("grace_short", grace_short),
+            ("smi_open_green", smi_open_green),
+            ("smi_open_red", smi_open_red),
             ("fk_long", fk_ok_L),
             ("fk_short", fk_ok_S),
             ("froth_long", froth_ok_long),
             ("froth_short", froth_ok_short),
             ("is_green", is_green),
             ("is_red", is_red),
+            ("regime_now_long", regime_now_long),
+            ("regime_now_short", regime_now_short),
+            ("allow_long", allow_long),
+            ("allow_short", allow_short),
         ]
         await record_crit_batch(criteria)
         if VERBOSE_LOG:
@@ -1173,7 +1203,9 @@ async def check_signals(symbol, timeframe='4h'):
                         'last_regime_bar': current_pos.get('last_regime_bar')
                     }
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-                    await enqueue_message(f"{symbol} {timeframe}: BUY (LONG) 🚀 Sebep: {reason} Entry: {fmt_sym(symbol, entry_price)} SL: {fmt_sym(symbol, sl_price)} TP1: {fmt_sym(symbol, tp1_price)} TP2: {fmt_sym(symbol, tp2_price)}")
+                    await enqueue_message(
+                        format_signal_msg(symbol, timeframe, "buy", entry_price, sl_price, tp1_price, tp2_price)
+                    )
                     save_state()
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
@@ -1222,7 +1254,9 @@ async def check_signals(symbol, timeframe='4h'):
                         'last_regime_bar': current_pos.get('last_regime_bar')
                     }
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-                    await enqueue_message(f"{symbol} {timeframe}: SELL (SHORT) 📉 Sebep: {reason} Entry: {fmt_sym(symbol, entry_price)} SL: {fmt_sym(symbol, sl_price)} TP1: {fmt_sym(symbol, tp1_price)} TP2: {fmt_sym(symbol, tp2_price)}")
+                    await enqueue_message(
+                        format_signal_msg(symbol, timeframe, "sell", entry_price, sl_price, tp1_price, tp2_price)
+                    )
                     save_state()
         if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
