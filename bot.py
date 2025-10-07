@@ -1,4 +1,3 @@
-
 import ccxt
 import numpy as np
 import pandas as pd
@@ -97,6 +96,7 @@ G3_ENTRY_DIST_EMA13_ATR = 0.75
 G3_FF_MIN_SCORE = 3
 G3_FF_MIN_SCORE_BEAR = 4
 USE_ROBUST_SLOPE = True
+SCAN_PAUSE_SEC = 300  # her turun sonunda bekleme (5 dk)
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -1392,47 +1392,56 @@ async def check_signals(symbol, timeframe='4h'):
         await mark_status(symbol, "error", str(e))
 
 # ================== Ana Döngü ==================
+SCAN_PAUSE_SEC = 300  # her turun sonunda bekleme (5 dk)
+
 async def main():
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
     asyncio.create_task(message_sender())
     await load_markets()
-    # sayaç/situasyon reset (tur bazlı rapor için)
-    async with _stats_lock:
-        scan_status.clear()
-    crit_false_counts.clear()
-    crit_total_counts.clear()
-    symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
-    random.shuffle(symbols)
-    shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
-    t_start = time.time()
-    tasks = []
-    for i, shard in enumerate(shards, start=1):
-        logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
-        for symbol in shard:
-            tasks.append(check_signals(symbol, timeframe='4h'))
-        await asyncio.gather(*tasks)
-        tasks = []
-        await asyncio.sleep(INTER_BATCH_SLEEP)
-    # Tur sonu özetleri
-    cov = _summarize_coverage(symbols)
-    logger.info(
-        "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
-        "skip={skip} | error={error} | missing={missing}".format(**cov)
-    )
-    _log_false_breakdown()
-    elapsed = time.time() - t_start
-    logger.info(
-        "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
-        "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle=0.0s".format(
-            elapsed=elapsed, **cov
-        )
-    )
+    while True:  # turları sonsuza kadar döndür
+        # sayaç/situasyon reset (tur bazlı rapor için)
+        async with _stats_lock:
+            scan_status.clear()
+        crit_false_counts.clear()
+        crit_total_counts.clear()
+        try:
+            symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
+            random.shuffle(symbols)
+            shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
+            t_start = time.time()
+            tasks = []
+            for i, shard in enumerate(shards, start=1):
+                logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
+                for symbol in shard:
+                    tasks.append(check_signals(symbol, timeframe='4h'))
+                # hata bir sembolde olursa diğerleri iptal olmasın
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                await asyncio.sleep(INTER_BATCH_SLEEP)
+            # Tur sonu özetleri
+            cov = _summarize_coverage(symbols)
+            logger.info(
+                "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
+                "skip={skip} | error={error} | missing={missing}".format(**cov)
+            )
+            _log_false_breakdown()
+            elapsed = time.time() - t_start
+            logger.info(
+                "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
+                "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle=0.0s".format(
+                    elapsed=elapsed, **cov
+                )
+            )
+        except Exception as e:
+            logger.exception(f"Tur genel hatası: {e}")
+        # bir sonraki tura kadar bekle
+        await asyncio.sleep(SCAN_PAUSE_SEC)
+    # HEARTBEAT_ENABLED bloğu korundu, istersen aktif edersin
     if HEARTBEAT_ENABLED:
         while True:
             await asyncio.sleep(3600)
             await enqueue_message("Bot aktif, sinyaller taranıyor. 🕒")
-    await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
