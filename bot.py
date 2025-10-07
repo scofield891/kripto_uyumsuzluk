@@ -36,7 +36,7 @@ COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.05
 ADX_PERIOD = 14
 APPLY_COOLDOWN_BOTH_DIRECTIONS = True
-USE_FROTH_GUARD = True
+USE_FROTH_GUARD = False
 FROTH_GUARD_K_ATR = 1.2
 MAX_CONCURRENT_FETCHES = 4
 RATE_LIMIT_MS = 200
@@ -92,7 +92,7 @@ G3_BOS_LOOKBACK = 12
 G3_BOS_CONFIRM_BARS = 2
 G3_BOS_MIN_BREAK_ATR = 0.20
 G3_SWING_WIN = 7
-G3_ENTRY_DIST_EMA13_ATR = 0.75
+G3_ENTRY_DIST_EMA13_ATR = 0.90
 G3_FF_MIN_SCORE = 3
 G3_FF_MIN_SCORE_BEAR = 4
 USE_ROBUST_SLOPE = True
@@ -635,56 +635,11 @@ def ntx_threshold(atr_z: float) -> float:
     a = clamp((atr_z - NTX_ATRZ_LO) / (NTX_ATRZ_HI - NTX_ATRZ_LO + 1e-12), 0.0, 1.0)
     return NTX_THR_LO + a * (NTX_THR_HI - NTX_THR_LO)
 
-def ntx_rising_strict(s: pd.Series, k: int = NTX_RISE_K_STRICT, min_net: float = NTX_RISE_MIN_NET, pos_ratio_th: float = NTX_RISE_POS_RATIO, eps: float = NTX_RISE_EPS) -> bool:
-    if USE_ROBUST_SLOPE:
-        ok, _, pr = robust_up(s, win=min(k+1, 8), eps=eps, pos_ratio_thr=pos_ratio_th)
-        return ok
-    if s is None or len(s) < k + 1: return False
-    w = s.iloc[-(k+1):-1].astype(float)
-    if w.isna().any(): return False
-    x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
-    diffs = np.diff(w.values)
-    posr = (diffs > eps).mean() if diffs.size else 0.0
-    net = w.iloc[-1] - w.iloc[0]
-    return (slope > 0) and (net >= min_net) and (posr >= pos_ratio_th)
-
-def ntx_rising_hybrid_guarded(df: pd.DataFrame, side: str, eps: float = NTX_RISE_EPS, min_ntx: float = NTX_MIN_FOR_HYBRID, k: int = NTX_RISE_K_HYBRID, froth_k: float = NTX_FROTH_K) -> bool:
-    s = df['ntx'] if 'ntx' in df.columns else None
-    if s is None or len(s) < k + 1:
-        return False
-    w = s.iloc[-(k+1):-1].astype(float)
-    if w.isna().any():
-        return False
-    if USE_ROBUST_SLOPE:
-        ok, _, _ = robust_up(w, win=k, eps=eps, pos_ratio_thr=0.55)
-        last_diff = float(w.iloc[-1] - w.iloc[-2])
-        if not (ok and last_diff > eps):
-            return False
-    else:
-        x = np.arange(len(w)); slope, _ = np.polyfit(x, w.values, 1)
-        last_diff = w.values[-1] - w.values[-2]
-        if not (slope > 0 and last_diff > eps):
-            return False
-    if w.iloc[-1] < min_ntx:
-        return False
-    close_last = float(df['close'].iloc[-2]); ema13_last = float(df['ema13'].iloc[-2]); atr_value = float(df['atr'].iloc[-2])
-    if not (np.isfinite(close_last) and np.isfinite(ema13_last) and np.isfinite(atr_value) and atr_value > 0):
-        return False
-    return abs(close_last - ema13_last) <= froth_k * atr_value
-
 def ntx_vote(df: pd.DataFrame, ntx_thr: float) -> bool:
-    if 'ntx' not in df.columns or 'ema13' not in df.columns:
+    if 'ntx' not in df.columns:
         return False
     ntx_last = float(df['ntx'].iloc[-2]) if pd.notna(df['ntx'].iloc[-2]) else np.nan
-    level_ok = (np.isfinite(ntx_last) and ntx_last >= ntx_thr)
-    mom_ok = ntx_rising_strict(df['ntx']) or ntx_rising_hybrid_guarded(df, side="long") or ntx_rising_hybrid_guarded(df, side="short")
-    k = NTX_K_EFF
-    if len(df) >= k + 3 and pd.notna(df['ema13'].iloc[-2]) and pd.notna(df['ema13'].iloc[-2-k]):
-        slope_ok = (df['ema13'].iloc[-2] > df['ema13'].iloc[-2-k])
-    else:
-        slope_ok = False
-    votes = int(level_ok) + int(mom_ok) + int(slope_ok)
-    return votes >= 2
+    return bool(np.isfinite(ntx_last) and ntx_last >= ntx_thr)
 
 def compute_dynamic_band_k(df: pd.DataFrame, adx_last: float) -> float:
     band_k_adx = 0.20 if (np.isfinite(adx_last) and adx_last >= 25) else (0.30 if (np.isfinite(adx_last) and adx_last < 18) else REGIME1_BAND_K_DEFAULT)
@@ -984,7 +939,7 @@ def _log_false_breakdown():
     for name, total in items:
         f = crit_false_counts[name]
         pct = (f / total * 100.0) if total else 0.0
-        # örnek: " - gate_short: 566/574 (98.6%)"
+        # örnek: " - reg1_short_band_ok: 566/574 (98.6%)"
         logger.info(f" - {name}: {f}/{total} ({pct:.1f}%)")
 
 # ================== Sinyal Döngüsü ==================
@@ -1027,26 +982,8 @@ async def check_signals(symbol, timeframe='4h'):
         adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
         atr_z = rolling_z(df['atr'], LOOKBACK_ATR) if 'atr' in df else 0.0
         bear_mode = (adx_last > 25 and df['di_minus'].iloc[-2] > df['di_plus'].iloc[-2]) if pd.notna(adx_last) else False
-        rising_adx = adx_rising(df)
-        vote_adx = (np.isfinite(adx_last) and adx_last >= ADX_SOFT)
-        vote_dir_long = (di_condition_long or rising_adx)
-        vote_dir_short = (di_condition_short or rising_adx)
         ntx_thr = ntx_threshold(atr_z)
         vote_ntx = ntx_vote(df, ntx_thr)
-        gate_long = (int(vote_adx) + int(vote_dir_long) + int(vote_ntx)) >= 2
-        gate_short = (int(vote_adx) + int(vote_dir_short) + int(vote_ntx)) >= 2
-        if VERBOSE_LOG:
-            logger.debug(f"{symbol} {timeframe} GATE L/S -> ADX:{'✓' if vote_adx else '×'} "
-                        f"DIR(L:{'✓' if vote_dir_long else '×'},S:{'✓' if vote_dir_short else '×'}) "
-                        f"NTX:{'✓' if vote_ntx else '×'}")
-        base_K = FROTH_GUARD_K_ATR
-        trend_strong_long = (vote_adx and (di_condition_long or rising_adx))
-        trend_strong_short = (vote_adx and (di_condition_short or rising_adx))
-        K_long = min(base_K * 1.2, 1.3) if trend_strong_long else base_K
-        K_short = min(base_K * 1.2, 1.3) if trend_strong_short else base_K
-        ema_gap = abs(float(df['close'].iloc[-2]) - float(df['ema13'].iloc[-2]))
-        froth_ok_long = ((ema_gap <= K_long * atr_value) or trend_strong_long) if USE_FROTH_GUARD else True
-        froth_ok_short = ((ema_gap <= K_short * atr_value) or trend_strong_short) if USE_FROTH_GUARD else True
         fk_ok_L, fk_dbg_L = fake_filter_v2(df, side="long", bear_mode=bear_mode)
         fk_ok_S, fk_dbg_S = fake_filter_v2(df, side="short", bear_mode=bear_mode)
         if VERBOSE_LOG:
@@ -1072,11 +1009,6 @@ async def check_signals(symbol, timeframe='4h'):
         else:
             pct_slope = 0.0
         slope_thr = REGIME1_SLOPE_THR_PCT / 100.0
-        only_long = long_band_ok and (pct_slope > slope_thr)
-        only_short = short_band_ok and (pct_slope < -slope_thr)
-        if VERBOSE_LOG:
-            logger.debug(f"{symbol} {timeframe} ADX={adx_last:.2f} band_k={band_k:.2f} "
-                        f"LB={long_band_ok} SB={short_band_ok} slope={pct_slope*100:.3f}%")
         e13 = df['ema13']; e34 = df['ema34']
         e13_prev, e34_prev = e13.iloc[-3], e34.iloc[-3]
         e13_last, e34_last = e13.iloc[-2], e34.iloc[-2]
@@ -1109,11 +1041,9 @@ async def check_signals(symbol, timeframe='4h'):
             if wrong_side_at_cross and within:
                 crossed_to_right = np.any(close[idx_dn+1:idx_lastbar+1] < ema89[idx_dn+1:idx_lastbar+1])
                 grace_short = bool(crossed_to_right)
-        # Rejim + kesişim + istisna (yalın)
-        regime_now_long = bool(df['close'].iloc[-2] > df['ema89'].iloc[-2])
-        regime_now_short = bool(df['close'].iloc[-2] < df['ema89'].iloc[-2])
-        allow_long = (regime_now_long and cross_up_1334) or grace_long
-        allow_short = (regime_now_short and cross_dn_1334) or grace_short
+        # Kesişim + istisna (yalın)
+        allow_long = (cross_up_1334) or grace_long
+        allow_short = (cross_dn_1334) or grace_short
         # --- Squeeze Momentum (LazyBear) açık ton ve bar rengi zorunluluğu ---
         smi_val_now = float(df['lb_sqz_val'].iloc[-2]) if pd.notna(df['lb_sqz_val'].iloc[-2]) else np.nan
         smi_val_prev = float(df['lb_sqz_val'].iloc[-3]) if pd.notna(df['lb_sqz_val'].iloc[-3]) else np.nan
@@ -1127,13 +1057,17 @@ async def check_signals(symbol, timeframe='4h'):
         # Bar rengi:
         is_green = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] > df['open'].iloc[-2]))
         is_red = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] < df['open'].iloc[-2]))
+        # BOS kontrolü
+        structL, _ = _structure_ok(df, side="long")
+        structS, _ = _structure_ok(df, side="short")
         okL, whyL = entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
         okS, whyS = entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
-        # ZORUNLU: LazyBear açık ton + bar rengi
-        buy_condition_raw = allow_long and smi_open_green and is_green
-        sell_condition_raw = allow_short and smi_open_red and is_red
-        buy_condition = gate_long and froth_ok_long and buy_condition_raw and okL
-        sell_condition = gate_short and froth_ok_short and sell_condition_raw and okS
+        # ZORUNLU: (allow OR BOS) + LazyBear açık ton + bar rengi
+        buy_condition_raw = ((allow_long or structL) and smi_open_green and is_green)
+        sell_condition_raw = ((allow_short or structS) and smi_open_red and is_red)
+        # Nihai koşullar
+        buy_condition = buy_condition_raw and okL
+        sell_condition = sell_condition_raw and okS
         reason = ""
         if buy_condition:
             reason = f"G3 LONG OK | {whyL}"
@@ -1146,10 +1080,6 @@ async def check_signals(symbol, timeframe='4h'):
         if VERBOSE_LOG and (buy_condition or sell_condition):
             logger.debug(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
-            ("gate_long", gate_long),
-            ("gate_short", gate_short),
-            ("gate_adx", vote_adx),
-            ("ntx_vote", vote_ntx),
             ("cross_up_1334", cross_up_1334),
             ("cross_dn_1334", cross_dn_1334),
             ("reg1_long_band_ok", long_band_ok),
@@ -1162,12 +1092,8 @@ async def check_signals(symbol, timeframe='4h'):
             ("smi_open_red", smi_open_red),
             ("fk_long", fk_ok_L),
             ("fk_short", fk_ok_S),
-            ("froth_long", froth_ok_long),
-            ("froth_short", froth_ok_short),
             ("is_green", is_green),
             ("is_red", is_red),
-            ("regime_now_long", regime_now_long),
-            ("regime_now_short", regime_now_short),
             ("allow_long", allow_long),
             ("allow_short", allow_short),
         ]
