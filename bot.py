@@ -135,6 +135,24 @@ if not logger.handlers:
     file_handler = RotatingFileHandler('bot.log', maxBytes=5_000_000, backupCount=3)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+# INFO seviyesinde sadece shard başlıkları ve FALSE dökümünü geçir
+class MinimalInfoFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno != logging.INFO:
+            return True  # DEBUG/WARNING/ERROR dokunma
+        msg = str(record.getMessage())
+        return (
+            msg.startswith("Shard ") or
+            msg.startswith("Kriter FALSE dökümü") or
+            msg.startswith("  (veri yok)") or
+            msg.startswith(" - ")
+        )
+
+# Logger'a filtreyi ekle
+for h in logger.handlers:
+    h.addFilter(MinimalInfoFilter())
+
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
 
@@ -369,7 +387,7 @@ async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
         if m.get('quote') not in quote_whitelist: continue
         syms.append(s)
     syms = sorted(set(syms))
-    logger.info(f"Keşfedilen sembol sayısı: {len(syms)} (linear={linear_only}, quotes={quote_whitelist})")
+    logger.debug(f"Keşfedilen sembol sayısı: {len(syms)} (linear={linear_only}, quotes={quote_whitelist})")
     return syms
 
 # ================== Volume Kontrol ==================
@@ -418,7 +436,7 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     di_condition_long = df['di_plus'].iloc[-2] > df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     di_condition_short = df['di_plus'].iloc[-2] < df['di_minus'].iloc[-2] if pd.notna(df['di_plus'].iloc[-2]) and pd.notna(df['di_minus'].iloc[-2]) else False
     if VERBOSE_LOG:
-        logger.info(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
+        logger.debug(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df, di_condition_long, di_condition_short
 
 def calculate_bb(df, period=20, mult=2.0):
@@ -526,7 +544,7 @@ def _compute_ntx_z(ntx: pd.Series, win_ema: int = 21, win_q: int = 120) -> pd.Se
 
 def calculate_indicators(df, symbol, timeframe):
     if len(df) < MIN_BARS:
-        logger.info(f"{symbol}: Yetersiz veri ({len(df)} mum), skip.")
+        logger.debug(f"{symbol}: Yetersiz veri ({len(df)} mum), skip.")
         return None, None, None
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
@@ -916,7 +934,7 @@ def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None)
     else:
         ok = mom_ok or structure_ok
         dbg = f"momentum={mom_ok} ({m_dbg}) OR structure={structure_ok} ({s_dbg})"
-    if DYNAMIC_MODE:
+    if DYNAMIC_MODE and VERBOSE_LOG:
         try:
             dbg_payload = {
                 "band_k": round(band_k, 3),
@@ -926,7 +944,7 @@ def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None)
                 "ntx_z_last": None if not np.isfinite(ntx_z_last) else round(ntx_z_last, 2),
                 "ntx_z_slope": None if not np.isfinite(ntx_z_slope) else round(ntx_z_slope, 2),
             }
-            logger.info(f"{symbol} DYNDBG " + json.dumps(dbg_payload))
+            logger.debug(f"{symbol} DYNDBG " + json.dumps(dbg_payload))
         except Exception:
             pass
         dbg_json = (f"DYNDBG {{band_k:{band_k:.3f}, ntx_thr:{ntx_thr:.1f}, "
@@ -986,7 +1004,7 @@ async def check_signals(symbol, timeframe='4h'):
             volumes = np.random.rand(200) * 10000
             ohlcv = [[0, closes[i], highs[i], lows[i], closes[i], volumes[i]] for i in range(200)]
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            logger.info(f"Test modu: {symbol} {timeframe}")
+            logger.debug(f"Test modu: {symbol} {timeframe}")
         else:
             limit_need = max(150, LOOKBACK_ATR + 80, ADX_PERIOD + 40)
             ohlcv = await fetch_ohlcv_async(symbol, timeframe, limit=limit_need)
@@ -994,7 +1012,7 @@ async def check_signals(symbol, timeframe='4h'):
             if df is None or df.empty or len(df) < MIN_BARS:
                 new_symbol_until[symbol] = now + timedelta(minutes=NEW_SYMBOL_COOLDOWN_MIN)
                 await mark_status(symbol, "min_bars", f"bars={len(df) if df is not None else 0}")
-                logger.info(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), cooldown.")
+                logger.debug(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum), cooldown.")
                 return
         calc = calculate_indicators(df, symbol, timeframe)
         if not calc or calc[0] is None:
@@ -1017,9 +1035,8 @@ async def check_signals(symbol, timeframe='4h'):
         vote_ntx = ntx_vote(df, ntx_thr)
         gate_long = (int(vote_adx) + int(vote_dir_long) + int(vote_ntx)) >= 2
         gate_short = (int(vote_adx) + int(vote_dir_short) + int(vote_ntx)) >= 2
-        # Bu satırları VERBOSE moda bağla; aksi halde log çok şişiyor
         if VERBOSE_LOG:
-            logger.info(f"{symbol} {timeframe} GATE L/S -> ADX:{'✓' if vote_adx else '×'} "
+            logger.debug(f"{symbol} {timeframe} GATE L/S -> ADX:{'✓' if vote_adx else '×'} "
                         f"DIR(L:{'✓' if vote_dir_long else '×'},S:{'✓' if vote_dir_short else '×'}) "
                         f"NTX:{'✓' if vote_ntx else '×'}")
         base_K = FROTH_GUARD_K_ATR
@@ -1033,8 +1050,8 @@ async def check_signals(symbol, timeframe='4h'):
         fk_ok_L, fk_dbg_L = fake_filter_v2(df, side="long", bear_mode=bear_mode)
         fk_ok_S, fk_dbg_S = fake_filter_v2(df, side="short", bear_mode=bear_mode)
         if VERBOSE_LOG:
-            logger.info(f"{symbol} {timeframe} FK_LONG {fk_ok_L} | {fk_dbg_L}")
-            logger.info(f"{symbol} {timeframe} FK_SHORT {fk_ok_S} | {fk_dbg_S}")
+            logger.debug(f"{symbol} {timeframe} FK_LONG {fk_ok_L} | {fk_dbg_L}")
+            logger.debug(f"{symbol} {timeframe} FK_SHORT {fk_ok_S} | {fk_dbg_S}")
         if REGIME1_ADX_ADAPTIVE_BAND and np.isfinite(adx_last):
             band_k = 0.20 if adx_last >= 25 else (0.30 if adx_last < 18 else REGIME1_BAND_K_DEFAULT)
         else:
@@ -1058,7 +1075,7 @@ async def check_signals(symbol, timeframe='4h'):
         only_long = long_band_ok and (pct_slope > slope_thr)
         only_short = short_band_ok and (pct_slope < -slope_thr)
         if VERBOSE_LOG:
-            logger.info(f"{symbol} {timeframe} ADX={adx_last:.2f} band_k={band_k:.2f} "
+            logger.debug(f"{symbol} {timeframe} ADX={adx_last:.2f} band_k={band_k:.2f} "
                         f"LB={long_band_ok} SB={short_band_ok} slope={pct_slope*100:.3f}%")
         e13 = df['ema13']; e34 = df['ema34']
         e13_prev, e34_prev = e13.iloc[-3], e34.iloc[-3]
@@ -1127,7 +1144,7 @@ async def check_signals(symbol, timeframe='4h'):
             if grace_short:
                 reason = (reason + " | grace_short_8bar") if reason else "grace_short_8bar"
         if VERBOSE_LOG and (buy_condition or sell_condition):
-            logger.info(f"{symbol} {timeframe} DYNDBG: {reason}")
+            logger.debug(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
             ("gate_long", gate_long),
             ("gate_short", gate_short),
@@ -1156,7 +1173,7 @@ async def check_signals(symbol, timeframe='4h'):
         ]
         await record_crit_batch(criteria)
         if VERBOSE_LOG:
-            logger.info(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition} reason:{reason}")
+            logger.debug(f"{symbol} {timeframe} buy:{buy_condition} sell:{sell_condition} reason:{reason}")
         if buy_condition and sell_condition:
             await mark_status(symbol, "skip", "conflicting_signals")
             logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı.")
@@ -1202,7 +1219,7 @@ async def check_signals(symbol, timeframe='4h'):
             )
             if cooldown_active or current_pos.get('last_bar_time') == bar_time:
                 if VERBOSE_LOG:
-                    logger.info(f"{symbol} {timeframe}: BUY atlandı (cooldown veya aynı bar) 🚫")
+                    logger.debug(f"{symbol} {timeframe}: BUY atlandı (cooldown veya aynı bar) 🚫")
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
             else:
                 entry_price = float(df['close'].iloc[-2]) if pd.notna(df['close'].iloc[-2]) else np.nan
@@ -1216,7 +1233,7 @@ async def check_signals(symbol, timeframe='4h'):
                     return
                 if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
                     if VERBOSE_LOG:
-                        logger.info(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
+                        logger.debug(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
                     await mark_status(symbol, "skip", "instant_sl_risk")
                 else:
                     tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
@@ -1253,7 +1270,7 @@ async def check_signals(symbol, timeframe='4h'):
             )
             if cooldown_active or current_pos.get('last_bar_time') == bar_time:
                 if VERBOSE_LOG:
-                    logger.info(f"{symbol} {timeframe}: SELL atlandı (cooldown veya aynı bar) 🚫")
+                    logger.debug(f"{symbol} {timeframe}: SELL atlandı (cooldown veya aynı bar) 🚫")
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
             else:
                 entry_price = float(df['close'].iloc[-2]) if pd.notna(df['close'].iloc[-2]) else np.nan
@@ -1267,7 +1284,7 @@ async def check_signals(symbol, timeframe='4h'):
                     return
                 if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
                     if VERBOSE_LOG:
-                        logger.info(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
+                        logger.debug(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
                     await mark_status(symbol, "skip", "instant_sl_risk")
                 else:
                     tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
@@ -1426,14 +1443,14 @@ async def main():
                 await asyncio.sleep(INTER_BATCH_SLEEP)
             # --- Tur sonu özetleri ---
             cov = _summarize_coverage(symbols)
-            logger.info(
+            logger.debug(
                 "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
                 "skip={skip} | error={error} | missing={missing}".format(**cov)
             )
             # Kriter FALSE dökümü
             _log_false_breakdown()
             elapsed = time.time() - t_start
-            logger.info(
+            logger.debug(
                 "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
                 "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle={wait:.1f}s".format(
                     elapsed=elapsed, wait=float(SCAN_PAUSE_SEC), **cov
