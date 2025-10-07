@@ -96,7 +96,7 @@ G3_ENTRY_DIST_EMA13_ATR = 0.75
 G3_FF_MIN_SCORE = 3
 G3_FF_MIN_SCORE_BEAR = 4
 USE_ROBUST_SLOPE = True
-SCAN_PAUSE_SEC = 300  # her turun sonunda bekleme (5 dk)
+SCAN_PAUSE_SEC = 120  # her turun sonunda bekleme (2 dk)
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -1017,9 +1017,11 @@ async def check_signals(symbol, timeframe='4h'):
         vote_ntx = ntx_vote(df, ntx_thr)
         gate_long = (int(vote_adx) + int(vote_dir_long) + int(vote_ntx)) >= 2
         gate_short = (int(vote_adx) + int(vote_dir_short) + int(vote_ntx)) >= 2
-        logger.info(f"{symbol} {timeframe} GATE L/S -> ADX:{'✓' if vote_adx else '×'} "
-                    f"DIR(L:{'✓' if vote_dir_long else '×'},S:{'✓' if vote_dir_short else '×'}) "
-                    f"NTX:{'✓' if vote_ntx else '×'}")
+        # Bu satırları VERBOSE moda bağla; aksi halde log çok şişiyor
+        if VERBOSE_LOG:
+            logger.info(f"{symbol} {timeframe} GATE L/S -> ADX:{'✓' if vote_adx else '×'} "
+                        f"DIR(L:{'✓' if vote_dir_long else '×'},S:{'✓' if vote_dir_short else '×'}) "
+                        f"NTX:{'✓' if vote_ntx else '×'}")
         base_K = FROTH_GUARD_K_ATR
         trend_strong_long = (vote_adx and (di_condition_long or rising_adx))
         trend_strong_short = (vote_adx and (di_condition_short or rising_adx))
@@ -1391,57 +1393,56 @@ async def check_signals(symbol, timeframe='4h'):
         logger.error(f"{symbol} {timeframe}: Hata: {str(e)}")
         await mark_status(symbol, "error", str(e))
 
-# ================== Ana Döngü ==================
-SCAN_PAUSE_SEC = 300  # her turun sonunda bekleme (5 dk)
-
+# ================== Ana Döngü (SHARD log + FALSE dökümü, 2 dk bekleme) ==================
 async def main():
+    # Başlangıç mesajı sadece process başında bir kez gitsin
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
+    # Telegram sender task'ini tek sefer başlat
     asyncio.create_task(message_sender())
+    # Piyasaları yükle
     await load_markets()
     while True:  # turları sonsuza kadar döndür
-        # sayaç/situasyon reset (tur bazlı rapor için)
+        # --- tur başlangıcı: sayaç/situasyon reset ---
         async with _stats_lock:
             scan_status.clear()
         crit_false_counts.clear()
         crit_total_counts.clear()
         try:
+            # Sembol setini hazırla ve shard'lara böl
             symbols = await discover_bybit_symbols(linear_only=LINEAR_ONLY, quote_whitelist=QUOTE_WHITELIST)
             random.shuffle(symbols)
             shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
             t_start = time.time()
-            tasks = []
+            # Her shard'ı sırayla çalıştır (tamamlanınca diğerine geç)
             for i, shard in enumerate(shards, start=1):
+                # İstediğin formatta tek satır SHARD log'u
                 logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
-                for symbol in shard:
-                    tasks.append(check_signals(symbol, timeframe='4h'))
-                # hata bir sembolde olursa diğerleri iptal olmasın
+                # Shard içi görevleri topla ve birlikte yürüt
+                tasks = [check_signals(symbol, timeframe='4h') for symbol in shard]
+                # Bir sembolde hata olursa diğerleri iptal olmasın
                 await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
+                # Shard'lar arasında küçük nefes payı
                 await asyncio.sleep(INTER_BATCH_SLEEP)
-            # Tur sonu özetleri
+            # --- Tur sonu özetleri ---
             cov = _summarize_coverage(symbols)
             logger.info(
                 "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
                 "skip={skip} | error={error} | missing={missing}".format(**cov)
             )
+            # Kriter FALSE dökümü
             _log_false_breakdown()
             elapsed = time.time() - t_start
             logger.info(
                 "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
-                "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle=0.0s".format(
-                    elapsed=elapsed, **cov
+                "skip={skip} | error={error} | elapsed={elapsed:.1f}s | bekle={wait:.1f}s".format(
+                    elapsed=elapsed, wait=float(SCAN_PAUSE_SEC), **cov
                 )
             )
         except Exception as e:
             logger.exception(f"Tur genel hatası: {e}")
-        # bir sonraki tura kadar bekle
+        # --- Bir sonraki tura kadar 2 dk bekle ---
         await asyncio.sleep(SCAN_PAUSE_SEC)
-    # HEARTBEAT_ENABLED bloğu korundu, istersen aktif edersin
-    if HEARTBEAT_ENABLED:
-        while True:
-            await asyncio.sleep(3600)
-            await enqueue_message("Bot aktif, sinyaller taranıyor. 🕒")
 
 if __name__ == "__main__":
     asyncio.run(main())
