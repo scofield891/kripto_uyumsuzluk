@@ -244,6 +244,33 @@ _last_call_ts = 0.0
 STATE_FILE = 'positions.json'
 DT_KEYS = {"last_signal_time", "entry_time", "last_bar_time", "last_regime_bar"}
 
+def _default_pos_state():
+    return {
+        'signal': None,
+        'entry_price': None,
+        'sl_price': None,
+        'tp1_price': None,
+        'tp2_price': None,
+        'highest_price': None,
+        'lowest_price': None,
+        'avg_atr_ratio': None,
+        'remaining_ratio': 1.0,
+        'last_signal_time': None,
+        'last_signal_type': None,
+        'entry_time': None,
+        'tp1_hit': False,
+        'tp2_hit': False,
+        'last_bar_time': None,
+        'regime_dir': None,
+        'last_regime_bar': None,
+        'trend_on_prev': False,
+        'used_ob_ids': set(),
+        'tp1_pct': 0.0,
+        'tp2_pct': 0.0,
+        'rest_pct': 1.0,
+        'plan_desc': ''
+    }
+
 def _json_default(o):
     if isinstance(o, datetime):
         return o.isoformat()
@@ -1228,17 +1255,21 @@ async def check_signals(symbol, timeframe='4h'):
         adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
         atr_z = rolling_z(df['atr'], LOOKBACK_ATR) if 'atr' in df else 0.0
         async with _stats_lock:
-            trend_prev = signal_cache.get(f"{symbol}_{timeframe}", {}).get('trend_on_prev', False)
+            trend_prev = signal_cache.get(f"{symbol}_{timeframe}", _default_pos_state()).get('trend_on_prev', False)
         trend_on = (np.isfinite(adx_last) and ((adx_last >= BEAR_ADX_ON) or (trend_prev and adx_last > BEAR_ADX_OFF)))
         bull_mode = bool(trend_on)
         bear_mode = not bull_mode
         cur_key = f"{symbol}_{timeframe}"
         async with _stats_lock:
-            if cur_key not in signal_cache:
-                signal_cache[cur_key] = {'used_ob_ids': set()}
-            signal_cache[cur_key]['trend_on_prev'] = bull_mode
-            used_set = signal_cache[cur_key].get('used_ob_ids', set())
-            signal_cache[cur_key]['used_ob_ids'] = used_set
+            st = signal_cache.setdefault(cur_key, _default_pos_state())
+            base = _default_pos_state()
+            for k, v in base.items():
+                st.setdefault(k, v)
+            if not isinstance(st.get('used_ob_ids'), set):
+                st['used_ob_ids'] = set(st.get('used_ob_ids', []))
+            st['trend_on_prev'] = bull_mode
+            signal_cache[cur_key] = st
+            used_set = st['used_ob_ids']
         if VERBOSE_LOG:
             logger.debug(f"MODE bull={bull_mode} | ADX={adx_last:.1f} | ON={BEAR_ADX_ON} OFF={BEAR_ADX_OFF}")
         ntx_thr = ntx_threshold(atr_z)
@@ -1420,15 +1451,12 @@ async def check_signals(symbol, timeframe='4h'):
         if not isinstance(bar_time, (pd.Timestamp, datetime)):
             bar_time = pd.to_datetime(bar_time, errors="ignore")
         async with _stats_lock:
-            current_pos = signal_cache.get(f"{symbol}_{timeframe}", {
-                'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                'remaining_ratio': 1.0, 'last_signal_time': None, 'last_signal_type': None, 'entry_time': None,
-                'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                'regime_dir': None, 'last_regime_bar': None,
-                'trend_on_prev': False,
-                'used_ob_ids': set()
-            })
+            current_pos = signal_cache.setdefault(f"{symbol}_{timeframe}", _default_pos_state())
+            base = _default_pos_state()
+            for k, v in base.items():
+                current_pos.setdefault(k, v)
+            if not isinstance(current_pos.get('used_ob_ids'), set):
+                current_pos['used_ob_ids'] = set(current_pos.get('used_ob_ids', []))
         exit_cross_long = (pd.notna(e13_prev) and pd.notna(e34_prev) and pd.notna(e13_last) and pd.notna(e34_last)
                            and (e13_prev >= e34_prev) and (e13_last < e34_last))
         exit_cross_short = (pd.notna(e13_prev) and pd.notna(e34_prev) and pd.notna(e13_last) and pd.notna(e34_last)
@@ -1443,15 +1471,13 @@ async def check_signals(symbol, timeframe='4h'):
                     profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 await enqueue_message(f"{symbol} {timeframe}: REVERSAL CLOSE 🔁 Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 async with _stats_lock:
-                    signal_cache[f"{symbol}_{timeframe}"] = {
-                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': current_pos['signal'], 'entry_time': None,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
-                        'trend_on_prev': bull_mode,
-                        'used_ob_ids': used_set
-                    }
+                    signal_cache[f"{symbol}_{timeframe}"] = _default_pos_state()
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_time'] = now
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_type'] = current_pos['signal']
+                    signal_cache[f"{symbol}_{timeframe}"]['regime_dir'] = current_pos.get('regime_dir')
+                    signal_cache[f"{symbol}_{timeframe}"]['last_regime_bar'] = current_pos.get('last_regime_bar')
+                    signal_cache[f"{symbol}_{timeframe}"]['trend_on_prev'] = bull_mode
+                    signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 save_state()
                 async with _stats_lock:
                     current_pos = signal_cache[f"{symbol}_{timeframe}"]
@@ -1502,7 +1528,8 @@ async def check_signals(symbol, timeframe='4h'):
                     await mark_status(symbol, "skip", "instant_sl_risk")
                     return
                 async with _stats_lock:
-                    current_pos = {
+                    current_pos = _default_pos_state()
+                    current_pos.update({
                         'signal': 'buy',
                         'entry_price': entry_price,
                         'sl_price': sl_price,
@@ -1522,7 +1549,7 @@ async def check_signals(symbol, timeframe='4h'):
                         'last_regime_bar': current_pos.get('last_regime_bar'),
                         'trend_on_prev': bull_mode,
                         'used_ob_ids': used_set
-                    }
+                    })
                     apply_split_to_state(current_pos, plan)
                     if ob_buy_standalone and obL_id:
                         used_set.add(obL_id)
@@ -1584,7 +1611,8 @@ async def check_signals(symbol, timeframe='4h'):
                     await mark_status(symbol, "skip", "instant_sl_risk")
                     return
                 async with _stats_lock:
-                    current_pos = {
+                    current_pos = _default_pos_state()
+                    current_pos.update({
                         'signal': 'sell',
                         'entry_price': entry_price,
                         'sl_price': sl_price,
@@ -1604,7 +1632,7 @@ async def check_signals(symbol, timeframe='4h'):
                         'last_regime_bar': current_pos.get('last_regime_bar'),
                         'trend_on_prev': bull_mode,
                         'used_ob_ids': used_set
-                    }
+                    })
                     apply_split_to_state(current_pos, plan)
                     if ob_sell_standalone and obS_id:
                         used_set.add(obS_id)
@@ -1621,11 +1649,11 @@ async def check_signals(symbol, timeframe='4h'):
                 save_state()
         if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-            if current_pos['highest_price'] is None or current_price > current_pos['highest_price']:
+            if current_pos['highest_price'] is None or (np.isfinite(current_price) and current_price > current_pos['highest_price']):
                 async with _stats_lock:
                     current_pos['highest_price'] = current_price
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-            if not current_pos['tp1_hit'] and current_price >= current_pos['tp1_price']:
+            if not current_pos['tp1_hit'] and np.isfinite(current_price) and current_price >= current_pos['tp1_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec = current_pos.get('tp1_pct', 0.30)
                 async with _stats_lock:
@@ -1640,7 +1668,7 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Kalan: %{int(current_pos['remaining_ratio']*100)}"
                 )
                 save_state()
-            if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
+            if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and np.isfinite(current_price) and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec2 = current_pos.get('tp2_pct', 0.30)
                 async with _stats_lock:
@@ -1657,31 +1685,27 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                    signal_cache[f"{symbol}_{timeframe}"] = {
-                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': None,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
-                        'trend_on_prev': bull_mode,
-                        'used_ob_ids': used_set
-                    }
+                    signal_cache[f"{symbol}_{timeframe}"] = _default_pos_state()
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_time'] = now
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_type'] = 'buy'
+                    signal_cache[f"{symbol}_{timeframe}"]['regime_dir'] = current_pos.get('regime_dir')
+                    signal_cache[f"{symbol}_{timeframe}"]['last_regime_bar'] = current_pos.get('last_regime_bar')
+                    signal_cache[f"{symbol}_{timeframe}"]['trend_on_prev'] = bull_mode
+                    signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: EMA EXIT (LONG) 🔁 Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
                 return
-            if current_price <= current_pos['sl_price']:
+            if np.isfinite(current_price) and current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                    signal_cache[f"{symbol}_{timeframe}"] = {
-                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': None,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
-                        'trend_on_prev': bull_mode,
-                        'used_ob_ids': used_set
-                    }
+                    signal_cache[f"{symbol}_{timeframe}"] = _default_pos_state()
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_time'] = now
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_type'] = 'buy'
+                    signal_cache[f"{symbol}_{timeframe}"]['regime_dir'] = current_pos.get('regime_dir')
+                    signal_cache[f"{symbol}_{timeframe}"]['last_regime_bar'] = current_pos.get('last_regime_bar')
+                    signal_cache[f"{symbol}_{timeframe}"]['trend_on_prev'] = bull_mode
+                    signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: STOP LONG ⛔ Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
                 return
@@ -1689,11 +1713,11 @@ async def check_signals(symbol, timeframe='4h'):
                 signal_cache[f"{symbol}_{timeframe}"] = current_pos
         elif current_pos['signal'] == 'sell':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-            if current_pos['lowest_price'] is None or current_price < current_pos['lowest_price']:
+            if current_pos['lowest_price'] is None or (np.isfinite(current_price) and current_price < current_pos['lowest_price']):
                 async with _stats_lock:
                     current_pos['lowest_price'] = current_price
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-            if not current_pos['tp1_hit'] and current_price <= current_pos['tp1_price']:
+            if not current_pos['tp1_hit'] and np.isfinite(current_price) and current_price <= current_pos['tp1_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec = current_pos.get('tp1_pct', 0.30)
                 async with _stats_lock:
@@ -1708,7 +1732,7 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Kalan: %{int(current_pos['remaining_ratio']*100)}"
                 )
                 save_state()
-            if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
+            if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and np.isfinite(current_price) and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec2 = current_pos.get('tp2_pct', 0.30)
                 async with _stats_lock:
@@ -1725,31 +1749,27 @@ async def check_signals(symbol, timeframe='4h'):
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                    signal_cache[f"{symbol}_{timeframe}"] = {
-                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': None,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
-                        'trend_on_prev': bull_mode,
-                        'used_ob_ids': used_set
-                    }
+                    signal_cache[f"{symbol}_{timeframe}"] = _default_pos_state()
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_time'] = now
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_type'] = 'sell'
+                    signal_cache[f"{symbol}_{timeframe}"]['regime_dir'] = current_pos.get('regime_dir')
+                    signal_cache[f"{symbol}_{timeframe}"]['last_regime_bar'] = current_pos.get('last_regime_bar')
+                    signal_cache[f"{symbol}_{timeframe}"]['trend_on_prev'] = bull_mode
+                    signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: EMA EXIT (SHORT) 🔁 Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
                 return
-            if current_price >= current_pos['sl_price']:
+            if np.isfinite(current_price) and current_price >= current_pos['sl_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                    signal_cache[f"{symbol}_{timeframe}"] = {
-                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': None,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
-                        'trend_on_prev': bull_mode,
-                        'used_ob_ids': used_set
-                    }
+                    signal_cache[f"{symbol}_{timeframe}"] = _default_pos_state()
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_time'] = now
+                    signal_cache[f"{symbol}_{timeframe}"]['last_signal_type'] = 'sell'
+                    signal_cache[f"{symbol}_{timeframe}"]['regime_dir'] = current_pos.get('regime_dir')
+                    signal_cache[f"{symbol}_{timeframe}"]['last_regime_bar'] = current_pos.get('last_regime_bar')
+                    signal_cache[f"{symbol}_{timeframe}"]['trend_on_prev'] = bull_mode
+                    signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: STOP SHORT ⛔ Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
                 return
