@@ -24,7 +24,6 @@ import uuid
 import signal
 from dataclasses import dataclass, field
 from typing import Optional
-
 # ================== Sabitler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -158,35 +157,28 @@ DIPTEPE_SEQ_WIN = 3
 DIPTEPE_MIN_SEP = 8
 DIPTEPE_BODY_MIN = 0.30
 DIPTEPE_A_LOOKBACK = 50
-STRONG_TREND_ADX = 28  # 13/34 kesişimi için opsiyonel teyit sınırı
+STRONG_TREND_ADX = 28 # 13/34 kesişimi için opsiyonel teyit sınırı
 # ==== Zaman dilimi sabiti ====
 DEFAULT_TZ = os.getenv("BOT_TZ", "Europe/Istanbul")
-
 # --- MINIMAL RUNTIME PATCH (paste near the top) ---
-
 # Telegram mesaj flood’u için basit throttle ve state kaydı debounce
 MESSAGE_THROTTLE_SECS = 20.0
 STATE_SAVE_DEBOUNCE_SECS = 2.0
-
 # Kilitler / sayaçlar / cache'ler
 _state_lock = threading.Lock()
 _stats_lock = asyncio.Lock()
 _last_state_save = 0.0
-
-_last_message_hashes = {}        # enqueue_message() için
-scan_status = {}                 # tarama durumu özetleri
-crit_total_counts = Counter()    # kriter toplam sayılar
-crit_false_counts = Counter()    # kriter false sayılar
-new_symbol_until = {}            # sembol bazlı cooldown
-
+_last_message_hashes = {} # enqueue_message() için
+scan_status = {} # tarama durumu özetleri
+crit_total_counts = Counter() # kriter toplam sayılar
+crit_false_counts = Counter() # kriter false sayılar
+new_symbol_until = {} # sembol bazlı cooldown
 _ntx_cache_lock = threading.Lock()
-ntx_local_cache = {}             # sembol bazlı NTX local threshold cache
-
+ntx_local_cache = {} # sembol bazlı NTX local threshold cache
 # Basit yardımcılar (main/check_signals çağırıyor)
 async def mark_status(symbol: str, code: str, detail: Optional[str] = None):
     async with _stats_lock:
         scan_status[symbol] = {"code": code, "detail": detail}
-
 async def record_crit_batch(criteria):
     # criteria: list[ (name:str, ok:bool) ]
     for name, ok in criteria:
@@ -194,7 +186,6 @@ async def record_crit_batch(criteria):
         if not ok:
             crit_false_counts[name] += 1
 # --- END PATCH ---
-
 # ================== Logging ==================
 logger = logging.getLogger()
 if not logger.handlers:
@@ -206,7 +197,6 @@ if not logger.handlers:
     file_handler = RotatingFileHandler('bot.log', maxBytes=5_000_000, backupCount=3)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-
 class MinimalInfoFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno != logging.INFO:
@@ -218,33 +208,26 @@ class MinimalInfoFilter(logging.Filter):
             msg.startswith(" (veri yok)") or
             msg.startswith(" - ")
         )
-
 for h in logger.handlers:
     h.addFilter(MinimalInfoFilter())
-
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
-
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'},
     'timeout': 90000
 })
-
 MARKETS = {}
-
 _fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 _rate_lock = asyncio.Lock()
 _last_call_ts = 0.0
 _rate_penalty_ms = 0.0
-
 async def load_markets():
     global MARKETS
     if not MARKETS:
         MARKETS = await asyncio.to_thread(exchange.load_markets)
     return MARKETS
-
 def configure_exchange_session(exchange, pool=50):
     s = requests.Session()
     adapter = HTTPAdapter(
@@ -255,14 +238,11 @@ def configure_exchange_session(exchange, pool=50):
     s.mount('https://', adapter)
     s.mount('http://', adapter)
     exchange.session = s
-
 configure_exchange_session(exchange, pool=50)
-
 telegram_bot = telegram.Bot(
     token=BOT_TOKEN,
     request=HTTPXRequest(connection_pool_size=20, pool_timeout=30.0)
 ) if BOT_TOKEN else None
-
 # ================== Global State ==================
 signal_cache = {}
 message_queue = asyncio.Queue(maxsize=2000)
@@ -271,7 +251,6 @@ _rate_lock = asyncio.Lock()
 _last_call_ts = 0.0
 STATE_FILE = 'positions.json'
 DT_KEYS = {"last_signal_time", "entry_time", "last_bar_time", "last_regime_bar"}
-
 @dataclass
 class PosState:
     signal: Optional[str] = None
@@ -297,15 +276,12 @@ class PosState:
     tp2_pct: float = 0.0
     rest_pct: float = 1.0
     plan_desc: str = ""
-
 def _default_pos_state():
     return PosState().__dict__.copy()
-
 def _json_default(o):
     if isinstance(o, datetime):
         return o.isoformat()
     return str(o)
-
 def _parse_dt(val):
     if isinstance(val, str):
         try:
@@ -313,7 +289,6 @@ def _parse_dt(val):
         except Exception:
             return val
     return val
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -331,7 +306,6 @@ def load_state():
             logger.warning(f"State yüklenemedi: {e}")
             return {}
     return {}
-
 def save_state():
     global _last_state_save
     now = time.time()
@@ -348,42 +322,34 @@ def save_state():
             _last_state_save = now
     except Exception as e:
         logger.warning(f"State kaydedilemedi: {e}")
-
 signal_cache = load_state()
-
 # ================== Util ==================
 def _safe_tz():
     try:
         return pytz.timezone(DEFAULT_TZ)
     except Exception:
         return pytz.UTC
-
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
-
 def ema_smooth(new, old, alpha=0.3):
     if old is None:
         return new
     return old * (1 - alpha) + new * alpha
-
 def rolling_z(series: pd.Series, win: int) -> float:
     s = series.tail(win).astype(float)
     if s.size < 5 or s.std(ddof=0) == 0 or not np.isfinite(s.iloc[-1]):
         return 0.0
     return float((s.iloc[-1] - s.mean()) / (s.std(ddof=0) + 1e-12))
-
 def fmt_sym(symbol, x):
     try:
         return exchange.price_to_precision(symbol, float(x))
     except Exception:
         # son çare
         return f"{float(x):.6f}"
-
 def bars_since(mask: pd.Series, idx: int = -2) -> int:
     s = mask.iloc[: idx + 1]
     rev = s.values[::-1]
     return int(np.argmax(rev)) if rev.any() else len(rev)
-
 def format_signal_msg(symbol: str, timeframe: str, side: str,
                      entry: float, sl: float, tp1: float, tp2: float,
                      reason_line: str = "EMA Cross veya BOS veya Order Block",
@@ -400,7 +366,6 @@ def format_signal_msg(symbol: str, timeframe: str, side: str,
         f"TP2: {fmt_sym(symbol, tp2)}\n"
         f"Tarih: {date_str}"
     )
-
 def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
     if 'pos_ratio_th' in kwargs:
         logger.debug("rising_ema(): 'pos_ratio_th' is deprecated; use 'pos_ratio_thr'.")
@@ -414,7 +379,6 @@ def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr:
     pos_ratio = float((diffs > eps).mean()) if diffs.size else 0.0
     ok = (slope > eps) and (pos_ratio >= pos_ratio_thr)
     return ok, slope, pos_ratio
-
 def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
     if 'pos_ratio_th' in kwargs:
         logger.debug("robust_up(): 'pos_ratio_th' is deprecated; use 'pos_ratio_thr'.")
@@ -427,24 +391,20 @@ def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: 
     pos_ratio = float((np.diff(window_vals) > eps).mean())
     ok = (med_d > eps) and (pos_ratio >= pos_ratio_thr)
     return ok, med_d, pos_ratio
-
 def _last_true_index(s: pd.Series, upto_idx: int) -> int:
     vals = s.iloc[:upto_idx+1].values
     for i in range(len(vals)-1, -1, -1):
         if bool(vals[i]):
             return i
     return -1
-
 def regime_mode_from_adx(adx_last: float) -> str:
     return "trend" if (np.isfinite(adx_last) and adx_last >= ADX_TREND_ON) else "range"
-
 def r_tp_plan(mode: str, is_ob: bool, R: float) -> dict:
     if is_ob:
         return dict(tp1_mult=1.0, tp2_mult=None, tp1_pct=0.50, tp2_pct=0.0, rest_pct=0.50, desc="ob")
     if mode == "trend":
         return dict(tp1_mult=1.5, tp2_mult=3.0, tp1_pct=0.30, tp2_pct=0.30, rest_pct=0.40, desc="trend")
     return dict(tp1_mult=1.2, tp2_mult=None, tp1_pct=0.50, tp2_pct=0.0, rest_pct=0.50, desc="range")
-
 def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float) -> (bool, str):
     if not all(map(np.isfinite, [R, atr, entry, tp1_price])) or atr <= 0 or R <= 0:
         return False, "nan"
@@ -461,13 +421,11 @@ def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: f
     if gap < min_gap:
         return False, f"TP1_gap<{min_gap/atr:.2f}*ATR"
     return True, "ok"
-
 def apply_split_to_state(state: dict, plan: dict):
     state['tp1_pct'] = plan['tp1_pct']
     state['tp2_pct'] = plan.get('tp2_pct', 0.0) or 0.0
     state['rest_pct'] = plan['rest_pct']
     state['plan_desc'] = plan['desc']
-
 def build_reason_text(side: str,
                       cross_up_1334: bool, cross_dn_1334: bool,
                       grace_long: bool, grace_short: bool,
@@ -477,18 +435,17 @@ def build_reason_text(side: str,
     tags = []
     if side == "buy":
         if cross_up_1334: tags.append("EMA 13/34 Cross (Up)")
-        if grace_long:     tags.append("Grace (8 bar)")
-        if structL:        tags.append("BOS Long")
-        if obL_ok:         tags.append("Order Block Long")
-        if dip_recent:     tags.append("Dip onaylı")
+        if grace_long: tags.append("Grace (8 bar)")
+        if structL: tags.append("BOS Long")
+        if obL_ok: tags.append("Order Block Long")
+        if dip_recent: tags.append("Dip onaylı")
     else:
         if cross_dn_1334: tags.append("EMA 13/34 Cross (Down)")
-        if grace_short:    tags.append("Grace (8 bar)")
-        if structS:        tags.append("BOS Short")
-        if obS_ok:         tags.append("Order Block Short")
-        if top_recent:     tags.append("Tepe onaylı")
+        if grace_short: tags.append("Grace (8 bar)")
+        if structS: tags.append("BOS Short")
+        if obS_ok: tags.append("Order Block Short")
+        if top_recent: tags.append("Tepe onaylı")
     return " + ".join(tags) if tags else "N/A"
-
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str, is_retry: bool = False):
     if not BOT_TOKEN or not CHAT_ID or TEST_MODE:
@@ -509,7 +466,6 @@ async def enqueue_message(text: str, is_retry: bool = False):
                 del _last_message_hashes[h]
     except asyncio.QueueFull:
         logger.warning("Mesaj kuyruğu dolu, mesaj düşürüldü.")
-
 async def message_sender():
     while True:
         message = await message_queue.get()
@@ -525,15 +481,12 @@ async def message_sender():
         except Exception as e:
             logger.error(f"Telegram mesaj hatası: {e.__class__.__name__}: {str(e)}")
         message_queue.task_done()
-
 # ================== Rate-limit Dostu Fetch ==================
 async def fetch_ohlcv_async(symbol, timeframe, limit):
     """Semaphor'u asla yeniden yaratma; sadece beklemeyi adaptif arttır."""
     global _last_call_ts, _rate_penalty_ms
-
     max_attempts = 5
-    base_ms = RATE_LIMIT_MS  # 200 ms default
-
+    base_ms = RATE_LIMIT_MS # 200 ms default
     for attempt in range(1, max_attempts + 1):
         try:
             async with _fetch_sem:
@@ -544,15 +497,12 @@ async def fetch_ohlcv_async(symbol, timeframe, limit):
                     if wait > 0:
                         await asyncio.sleep(wait)
                     _last_call_ts = asyncio.get_event_loop().time()
-
                 # gerçek istek
                 data = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
-
             # başarı: ceza kademeli azalsın
             if _rate_penalty_ms > 0:
-                _rate_penalty_ms = max(0.0, _rate_penalty_ms * 0.6)  # yumuşak geri sarma
+                _rate_penalty_ms = max(0.0, _rate_penalty_ms * 0.6) # yumuşak geri sarma
             return data
-
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
             # 429: ceza büyüsün + artan backoff + jitter
             _rate_penalty_ms = min(4000.0, (_rate_penalty_ms * 1.5) + 150.0)
@@ -562,10 +512,8 @@ async def fetch_ohlcv_async(symbol, timeframe, limit):
             # ağ hatası: ılımlı backoff + jitter
             backoff = 0.6 * attempt + random.random() * 0.6
             await asyncio.sleep(backoff)
-
     # tüm denemeler biterse:
     raise ccxt.NetworkError(f"fetch_ohlcv failed after retries: {symbol} {timeframe}")
-
 # ================== Sembol Keşfi ==================
 async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
     global MARKETS
@@ -580,7 +528,6 @@ async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
     syms = sorted(set(syms))
     logger.debug(f"Keşfedilen sembol sayısı: {len(syms)} (linear={linear_only}, quotes={quote_whitelist})")
     return syms
-
 # ================== Volume Kontrol ==================
 def simple_volume_ok(df: pd.DataFrame, side: str) -> (bool, str):
     last = df.iloc[-2]
@@ -598,7 +545,6 @@ def simple_volume_ok(df: pd.DataFrame, side: str) -> (bool, str):
     ok = bool(ratio_ok and vz_ok and d_ok)
     reason = f"ratio={ratio:.2f}{'✓' if ratio_ok else '✗'}, vz={vz:.2f}{'✓' if vz_ok else '✗'}, dvol>q={d_ok}"
     return ok, reason
-
 # ================== İndikatör Fonksiyonları ==================
 def calculate_ema(closes, span):
     k = 2 / (span + 1)
@@ -607,7 +553,6 @@ def calculate_ema(closes, span):
     for i in range(1, len(closes)):
         ema[i] = (closes[i] * k) + (ema[i-1] * (1 - k))
     return ema
-
 def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['high_diff'] = df['high'] - df['high'].shift(1)
     df['low_diff'] = df['low'].shift(1) - df['low']
@@ -627,16 +572,14 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     if VERBOSE_LOG:
         logger.debug(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df
-
 def calculate_bb(df, period=20, mult=2.0):
     mid = df['close'].rolling(period).mean()
     std = df['close'].rolling(period).std(ddof=0)
-    df['bb_mid']   = mid
-    df['bb_std']   = std
+    df['bb_mid'] = mid
+    df['bb_std'] = std
     df['bb_upper'] = mid + mult * std
     df['bb_lower'] = mid - mult * std
     return df
-
 def calc_sqzmom_lb(df: pd.DataFrame, length=20, mult_bb=2.0, lengthKC=20, multKC=1.5, use_true_range=True):
     src = df['close'].astype(float)
     basis = src.rolling(length).mean()
@@ -677,17 +620,15 @@ def calc_sqzmom_lb(df: pd.DataFrame, length=20, mult_bb=2.0, lengthKC=20, multKC
     df['lb_sqz_off'] = sqz_off
     df['lb_sqz_no'] = no_sqz
     return df
-
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
     tr1 = (df['high'] - df['low']).abs()
     tr2 = (df['high'] - df['close'].shift()).abs()
-    tr3 = (df['low']  - df['close'].shift()).abs()
+    tr3 = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['atr'] = tr.ewm(alpha=1/period, adjust=False).mean()
     return df
-
 def calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60):
     close = df['close'].values
     vol = df['volume'].values
@@ -711,7 +652,6 @@ def calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60):
     dvol = (df['close'] * df['volume']).astype(float)
     df['dvol_q'] = dvol.rolling(VOL_WIN).quantile(VOL_Q)
     return df
-
 def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
     df = ensure_atr(df, period=14)
     if len(df) < lookback_atr + 2:
@@ -723,7 +663,6 @@ def get_atr_values(df, lookback_atr=LOOKBACK_ATR):
     atr_value = float(df['atr'].iloc[-2]) if pd.notna(df['atr'].iloc[-2]) else np.nan
     avg_atr_ratio = float(atr_series.mean() / close_last)
     return atr_value, avg_atr_ratio
-
 def _compute_ntx_z(ntx: pd.Series, win_ema: int = 21, win_q: int = 120) -> pd.Series:
     s = pd.to_numeric(ntx, errors='coerce')
     ema = s.ewm(span=win_ema, adjust=False).mean()
@@ -732,14 +671,13 @@ def _compute_ntx_z(ntx: pd.Series, win_ema: int = 21, win_q: int = 120) -> pd.Se
     denom = (q84 - q50).replace(0, np.nan)
     z = (ema - q50) / (denom + 1e-12)
     return z.fillna(0.0)
-
 def calculate_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> pd.DataFrame | None:
     if len(df) < MIN_BARS:
         logger.debug(f"{symbol}: Yetersiz veri ({len(df)} mum), skip.")
         return None
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
     df.set_index('timestamp', inplace=True)
-    df.index = df.index.tz_convert(_safe_tz())  # Europe/Istanbul vb.
+    df.index = df.index.tz_convert(_safe_tz()) # Europe/Istanbul vb.
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, EMA_FAST)
     df['ema34'] = calculate_ema(closes, EMA_MID)
@@ -753,7 +691,6 @@ def calculate_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> pd.Da
     if 'ntx' in df.columns:
         df['ntx_z'] = _compute_ntx_z(df['ntx'])
     return df
-
 def adx_rising_strict(df_adx: pd.Series) -> bool:
     if USE_ROBUST_SLOPE:
         ok, _, _ = robust_up(
@@ -774,7 +711,6 @@ def adx_rising_strict(df_adx: pd.Series) -> bool:
     pos_ratio = (diffs > ADX_RISE_EPS).mean() if diffs.size > 0 else 0.0
     net = window.iloc[-1] - window.iloc[0]
     return (slope > 0) and (net >= ADX_RISE_MIN_NET) and (pos_ratio >= ADX_RISE_POS_RATIO)
-
 def adx_rising_hybrid(df_adx: pd.Series) -> bool:
     if not ADX_RISE_USE_HYBRID or df_adx is None or len(df_adx) < 4:
         return False
@@ -789,12 +725,10 @@ def adx_rising_hybrid(df_adx: pd.Series) -> bool:
     slope, _ = np.polyfit(x, window.values, 1)
     last_diff = window.values[-1] - window.values[-2]
     return (slope > 0) and (last_diff > ADX_RISE_EPS)
-
 def adx_rising(df: pd.DataFrame) -> bool:
     if 'adx' not in df.columns:
         return False
     return adx_rising_strict(df['adx']) or adx_rising_hybrid(df['adx'])
-
 def calc_ntx(df: pd.DataFrame, period: int = NTX_PERIOD, k_eff: int = NTX_K_EFF) -> pd.DataFrame:
     close = df['close'].astype(float)
     atr = df['atr'].astype(float).replace(0, np.nan)
@@ -821,17 +755,14 @@ def calc_ntx(df: pd.DataFrame, period: int = NTX_PERIOD, k_eff: int = NTX_K_EFF)
     df['ntx_raw'] = base
     df['ntx'] = df['ntx_raw'].ewm(alpha=1.0/period, adjust=False).mean() * 100.0
     return df
-
 def ntx_threshold(atr_z: float) -> float:
     a = clamp((atr_z - NTX_ATRZ_LO) / (NTX_ATRZ_HI - NTX_ATRZ_LO + 1e-12), 0.0, 1.0)
     return NTX_THR_LO + a * (NTX_THR_HI - NTX_THR_LO)
-
 def ntx_vote(df: pd.DataFrame, ntx_thr: float) -> bool:
     if 'ntx' not in df.columns:
         return False
     ntx_last = float(df['ntx'].iloc[-2]) if pd.notna(df['ntx'].iloc[-2]) else np.nan
     return bool(np.isfinite(ntx_last) and ntx_last >= ntx_thr)
-
 def compute_dynamic_band_k(df: pd.DataFrame, adx_last: float) -> float:
     band_k_adx = 0.20 if (np.isfinite(adx_last) and adx_last >= 25) else (0.30 if (np.isfinite(adx_last) and adx_last < 18) else REGIME1_BAND_K_DEFAULT)
     c2 = float(df['close'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
@@ -844,7 +775,6 @@ def compute_dynamic_band_k(df: pd.DataFrame, adx_last: float) -> float:
         w_adx, w_vol = 0.4, 0.6
     band_k = w_adx * band_k_adx + w_vol * band_k_vol
     return clamp(band_k, BANDK_MIN, BANDK_MAX)
-
 def compute_ntx_local_thr(df: pd.DataFrame, base_thr: float, symbol: str = None) -> (float, float):
     q_val = None
     tail = df['ntx'].iloc[-(NTX_LOCAL_WIN+2):-2].dropna()
@@ -858,7 +788,6 @@ def compute_ntx_local_thr(df: pd.DataFrame, base_thr: float, symbol: str = None)
     if q_val is None or not np.isfinite(q_val):
         return base_thr, float('nan')
     return max(base_thr, q_val), q_val
-
 def candle_body_wicks(row):
     o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
     rng = max(h - l, 1e-12)
@@ -866,7 +795,6 @@ def candle_body_wicks(row):
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
     return body / rng, upper_wick / rng, lower_wick / rng
-
 def fake_filter_v2(df: pd.DataFrame, side: str, bear_mode: bool) -> (bool, str):
     if len(df) < max(VOL_WIN + 2, OBV_SLOPE_WIN + 2):
         return False, "data_short"
@@ -890,7 +818,6 @@ def fake_filter_v2(df: pd.DataFrame, side: str, bear_mode: bool) -> (bool, str):
         f"obv_slope={obv_slope:.2f} ({'OK' if obv_ok else 'FAIL'})"
     )
     return all_ok, debug
-
 def _bb_prox(last, side="long"):
     if side == "long":
         num = float(last['close'] - last['bb_mid']); den = float(last['bb_upper'] - last['bb_mid'])
@@ -898,7 +825,6 @@ def _bb_prox(last, side="long"):
         num = float(last['bb_mid'] - last['close']); den = float(last['bb_mid'] - last['bb_lower'])
     if not (np.isfinite(num) and np.isfinite(den)) or den <= 0: return 0.0
     return clamp(num/den, 0.0, 1.0)
-
 def _obv_slope_recent(df: pd.DataFrame, win=OBV_SLOPE_WIN) -> float:
     s = df['obv'].iloc[-(win+1):-1].astype(float) if 'obv' in df.columns else pd.Series(dtype=float)
     if s.size < 3 or s.isna().any():
@@ -912,17 +838,14 @@ def _obv_slope_recent(df: pd.DataFrame, win=OBV_SLOPE_WIN) -> float:
     x = np.arange(len(s))
     m, _ = np.polyfit(x, s.values, 1)
     return float(m)
-
 def _is_swing_high(df, i, win=G3_SWING_WIN):
     if i - win < 0 or i + win >= len(df): return False
     h = df['high'].values
     return h[i] == max(h[i-win:i+win+1])
-
 def _is_swing_low(df, i, win=G3_SWING_WIN):
     if i - win < 0 or i + win >= len(df): return False
     l = df['low'].values
     return l[i] == min(l[i-win:i+win+1])
-
 def _last_swing_levels(df, win=G3_SWING_WIN):
     idx_last = len(df) - 2
     sh = None; sl = None
@@ -934,7 +857,6 @@ def _last_swing_levels(df, win=G3_SWING_WIN):
         if sh is not None and sl is not None:
             break
     return sh, sl
-
 def _bos_only(df: pd.DataFrame, side: str,
               lookback: int = G3_BOS_LOOKBACK,
               confirm_bars: int = G3_BOS_CONFIRM_BARS,
@@ -983,7 +905,6 @@ def _bos_only(df: pd.DataFrame, side: str,
             if closes.iloc[j] < lvl_j:
                 ok += 1
         return (ok >= conf_needed), f"bos_only_short conf={ok}/{conf_needed}"
-
 def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
     c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
     c3 = float(df['close'].iloc[-3]); e89_3 = float(df['ema89'].iloc[-3]); atr3 = float(df['atr'].iloc[-3])
@@ -999,7 +920,6 @@ def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
         pct_slope = 0.0
     slope_ok = (pct_slope > slope_thr_pct/100.0) if side=='long' else (pct_slope < -slope_thr_pct/100.0)
     return (band_ok and slope_ok), f"band={band_ok},slope={pct_slope*100:.2f}%"
-
 def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
     band_k = compute_dynamic_band_k(df, adx_last)
@@ -1007,7 +927,6 @@ def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     if not all(map(np.isfinite, [c2, e89, atr2])):
         return False
     return (c2 > e89 + band_k*atr2) if side == "long" else (c2 < e89 - band_k*atr2)
-
 def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode):
     adx_min = 0 if bear_mode else G3_MIN_ADX
     adx_gate = np.isfinite(adx_last) and (adx_last >= adx_min)
@@ -1042,18 +961,15 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode):
     else:
         mom_ok = mom_ok_base
     return mom_ok, dbg
-
 def _quality_ok(df, side, bear_mode):
     fk_ok, fk_dbg = fake_filter_v2(df, side=side, bear_mode=bear_mode)
     last = df.iloc[-2]
     ema13 = float(last['ema13']); close = float(last['close']); atrv = float(last['atr'])
     ema13_ok = np.isfinite(atrv) and (abs(close - ema13) <= G3_ENTRY_DIST_EMA13_ATR * atrv)
     return (fk_ok and ema13_ok), f"ff={fk_ok} ({fk_dbg}), ema13_dist_ok={ema13_ok}"
-
 def _structure_ok(df, side):
     ok, why = _bos_only(df, side=side)
     return ok, why
-
 def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
     if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
         return False, None, None, None, None
@@ -1070,25 +986,21 @@ def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
     reward = abs(tp1 - entry)
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
     return rr >= CLASSIC_MIN_RR, sl, tp1, tp2, rr
-
 def _tr_series(df):
     high_low = (df['high'] - df['low']).astype(float)
     high_close = (df['high'] - df['close'].shift()).abs().astype(float)
-    low_close  = (df['low']  - df['close'].shift()).abs().astype(float)
+    low_close = (df['low'] - df['close'].shift()).abs().astype(float)
     return pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-
 def _true_range(row):
     return max(
         float(row['high'] - row['low']),
         float(abs(row['high'] - row['close_prev'])),
         float(abs(row['low'] - row['close_prev']))
     )
-
 def _ensure_prev_close(df: pd.DataFrame) -> pd.DataFrame:
     if 'close_prev' not in df.columns:
         df['close_prev'] = df['close'].shift(1)
     return df
-
 def _displacement_candle_ok(df: pd.DataFrame, idx: int, side: str) -> bool:
     row = df.iloc[idx]
     if not np.isfinite(row.get('atr', np.nan)):
@@ -1104,7 +1016,6 @@ def _displacement_candle_ok(df: pd.DataFrame, idx: int, side: str) -> bool:
         return disp_ok and (float(row['close']) > float(row['open']))
     else:
         return disp_ok and (float(row['close']) < float(row['open']))
-
 def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR):
     # swing seviyesini kullan
     sh, sl = _last_swing_levels(df)
@@ -1117,16 +1028,18 @@ def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_A
         lvl = sl - min_break_atr * atr.iloc[disp_idx]
         return closes.iloc[disp_idx] < lvl
     return False
-
 def _has_imbalance_next(df, side, k):
     # displacement’tan sonraki 1-2 barda karşı wick’e derin dokunmama
     rng = df.iloc[k+1:k+3]
-    if rng.empty: return True
+    if rng.empty:
+        return True
+    open_k = float(df['open'].iloc[k])
     if side == 'long':
-        return not (rng['low'] < df['open'].iloc[k])  # kabaca
+        touched = (rng['low'] < open_k).any()
+        return not touched
     else:
-        return not (rng['high'] > df['open'].iloc[k])
-
+        touched = (rng['high'] > open_k).any()
+        return not touched
 def _last_opposite_body_zone(df: pd.DataFrame, disp_idx: int, side: str):
     if disp_idx <= 0:
         return None, None, None
@@ -1144,7 +1057,6 @@ def _last_opposite_body_zone(df: pd.DataFrame, disp_idx: int, side: str):
                 z_low = float(min(r['open'], r['close']))
                 return z_high, z_low, i
     return None, None, None
-
 def _ob_first_touch_reject(df: pd.DataFrame, idx_last: int, side: str, z_high: float, z_low: float) -> bool:
     bar = df.iloc[idx_last]
     o, h, l, c = map(float, (bar['open'], bar['high'], bar['low'], bar['close']))
@@ -1156,7 +1068,6 @@ def _ob_first_touch_reject(df: pd.DataFrame, idx_last: int, side: str, z_high: f
         touched = (h >= z_low) and (l <= z_high)
         reject = (c < o) and (c < z_low)
         return bool(touched and reject)
-
 def _find_displacement_ob(df: pd.DataFrame, side: str):
     if len(df) < max(OB_LOOKBACK+5, 50) or 'atr' not in df.columns:
         return False, "ob_data_short", None, None, None
@@ -1164,7 +1075,7 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
     idx_last = len(df) - 2
     for k in range(idx_last-1, max(idx_last-OB_LOOKBACK, 1), -1):
         if _displacement_candle_ok(df, k, side):
-            if not _bos_after_displacement(df, side, k):  # k: disp bar index
+            if not _bos_after_displacement(df, side, k): # k: disp bar index
                 continue
             if not _has_imbalance_next(df, side, k):
                 continue
@@ -1182,7 +1093,6 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
                 dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}]"
                 return True, dbg, z_high, z_low, ob_id
     return False, "no_displacement_ob", None, None, None
-
 def _order_block_cons_fallback(df: pd.DataFrame, side: str, lookback=10) -> (bool, str):
     if not OB_HYBRID:
         return False, "hybrid_off"
@@ -1202,7 +1112,6 @@ def _order_block_cons_fallback(df: pd.DataFrame, side: str, lookback=10) -> (boo
     else:
         brk = c_last < float(win['low'].min())
     return bool(brk), f"cons_ok brk={brk}"
-
 def _ob_rr_ok(df: pd.DataFrame, side: str, z_hi: float, z_lo: float):
     if z_hi is None or z_lo is None:
         return False, None, None
@@ -1224,16 +1133,14 @@ def _ob_rr_ok(df: pd.DataFrame, side: str, z_hi: float, z_lo: float):
     risk = abs(entry - sl)
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
     return (rr >= OB_MIN_RR), (sl, None, None), (entry, rr)
-
 def _score_side(side, ok_gate, struct_ok, adx_last, ntx_last, ff_ok):
     score = 0
-    score += 2 if ok_gate else 0           # G3 gate
-    score += 2 if struct_ok else 0         # BOS/OB yapısı
+    score += 2 if ok_gate else 0 # G3 gate
+    score += 2 if struct_ok else 0 # BOS/OB yapısı
     score += 1 if ((adx_last or 0) >= 23) else 0
     score += 1 if ((ntx_last or 0) >= 50) else 0
-    score += 1 if ff_ok else 0             # kalite filtresi
+    score += 1 if ff_ok else 0 # kalite filtresi
     return score
-
 def _summarize_coverage(all_symbols):
     total = len(all_symbols)
     codes = {s: scan_status.get(s, {}).get('code') for s in all_symbols}
@@ -1252,12 +1159,10 @@ def _summarize_coverage(all_symbols):
         "error": error,
         "missing": missing,
     }
-
 def _adaptive_pause(base, errors, ratelims):
     add = min(30, errors*2 + ratelims*4)
     sub = 0 if (errors+ratelims)>0 else 2
     return max(2, base + add - sub)
-
 def _log_false_breakdown():
     logger.info("Kriter FALSE dökümü (yüksekten düşüğe):")
     if not crit_total_counts:
@@ -1270,7 +1175,6 @@ def _log_false_breakdown():
         f = crit_false_counts[name]
         pct = (f / total * 100.0) if total else 0.0
         logger.info(f" - {name}: {f}/{total} ({pct:.1f}%)")
-
 # ================== Sinyal Döngüsü ==================
 async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None):
     band_k = G3_BAND_K
@@ -1328,7 +1232,6 @@ async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol
                     f"ntx_z_last:{ntx_z_last:.2f}, ntx_z_slope={ntx_z_slope:.2f}}}")
         dbg = f"{dbg} | {dbg_json}"
     return ok, dbg
-
 async def check_signals(symbol: str, timeframe: str = '4h') -> None:
     tz = _safe_tz()
     try:
@@ -1376,7 +1279,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         async with _stats_lock:
             st = signal_cache.setdefault(cur_key, _default_pos_state())
             st['used_ob_ids'] = set(st.get('used_ob_ids', []))
-            used_set = set(st['used_ob_ids'])  # kopya
+            used_set = set(st['used_ob_ids']) # kopya
             st['trend_on_prev'] = bull_mode
             signal_cache[cur_key] = st
         if VERBOSE_LOG:
@@ -1552,11 +1455,11 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         await record_crit_batch(criteria)
         if buy_condition and sell_condition:
             ntx_last = float(df['ntx'].iloc[-2]) if 'ntx' in df.columns and pd.notna(df['ntx'].iloc[-2]) else 0.0
-            buy_score  = _score_side("buy",  okL, structL, adx_last, ntx_last, fk_ok_L)
+            buy_score = _score_side("buy", okL, structL, adx_last, ntx_last, fk_ok_L)
             sell_score = _score_side("sell", okS, structS, adx_last, ntx_last, fk_ok_S)
             if buy_score != sell_score:
                 prefer = "buy" if buy_score > sell_score else "sell"
-                buy_condition  = (prefer == "buy")
+                buy_condition = (prefer == "buy")
                 sell_condition = (prefer == "sell")
             else:
                 # eşitse yine cooldown yap
@@ -1912,13 +1815,10 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
     except Exception as e:
         logger.error(f"{symbol} {timeframe}: Hata: {str(e)}")
         await mark_status(symbol, "error", str(e))
-
 # ================== Ana Döngü ==================
 _stop = asyncio.Event()
-
 def _handle_stop():
     _stop.set()
-
 async def main():
     loop = asyncio.get_running_loop()
     try:
@@ -1926,7 +1826,6 @@ async def main():
             loop.add_signal_handler(s, _handle_stop)
     except NotImplementedError:
         pass
-
     asyncio.create_task(message_sender())
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
@@ -1978,6 +1877,5 @@ async def main():
         except: pass
     save_state()
     logger.info("Cleanup tamamlandı, bot kapatıldı.")
-
 if __name__ == "__main__":
     asyncio.run(main())
