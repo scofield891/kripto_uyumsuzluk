@@ -20,6 +20,10 @@ from logging.handlers import RotatingFileHandler
 import json
 from collections import Counter
 import hashlib
+import uuid
+import signal
+from dataclasses import dataclass, field
+from typing import Optional
 
 # ================== Sabitler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -145,8 +149,51 @@ R_MAX_ATR_MULT_RANGE = 2.5
 R_MAX_ATR_MULT_TREND = 3.0
 TP1_MIN_ATR_GAP_RANGE = 0.8
 TP1_MIN_ATR_GAP_TREND = 1.0
+# ==== Dip-Tepe Parametreleri ====
+DIPTEPE_ATR_LEN = 14
+DIPTEPE_K_ATR = 1.25
+DIPTEPE_BRK_LEN = 4
+DIPTEPE_BRK_BUF_ATR = 0.12
+DIPTEPE_SEQ_WIN = 3
+DIPTEPE_MIN_SEP = 8
+DIPTEPE_BODY_MIN = 0.30
+DIPTEPE_A_LOOKBACK = 50
+STRONG_TREND_ADX = 28  # 13/34 kesişimi için opsiyonel teyit sınırı
 # ==== Zaman dilimi sabiti ====
 DEFAULT_TZ = os.getenv("BOT_TZ", "Europe/Istanbul")
+
+# --- MINIMAL RUNTIME PATCH (paste near the top) ---
+
+# Telegram mesaj flood’u için basit throttle ve state kaydı debounce
+MESSAGE_THROTTLE_SECS = 20.0
+STATE_SAVE_DEBOUNCE_SECS = 2.0
+
+# Kilitler / sayaçlar / cache'ler
+_state_lock = threading.Lock()
+_stats_lock = asyncio.Lock()
+_last_state_save = 0.0
+
+_last_message_hashes = {}        # enqueue_message() için
+scan_status = {}                 # tarama durumu özetleri
+crit_total_counts = Counter()    # kriter toplam sayılar
+crit_false_counts = Counter()    # kriter false sayılar
+new_symbol_until = {}            # sembol bazlı cooldown
+
+_ntx_cache_lock = threading.Lock()
+ntx_local_cache = {}             # sembol bazlı NTX local threshold cache
+
+# Basit yardımcılar (main/check_signals çağırıyor)
+async def mark_status(symbol: str, code: str, detail: Optional[str] = None):
+    async with _stats_lock:
+        scan_status[symbol] = {"code": code, "detail": detail}
+
+async def record_crit_batch(criteria):
+    # criteria: list[ (name:str, ok:bool) ]
+    for name, ok in criteria:
+        crit_total_counts[name] += 1
+        if not ok:
+            crit_false_counts[name] += 1
+# --- END PATCH ---
 
 # ================== Logging ==================
 logger = logging.getLogger()
@@ -186,36 +233,17 @@ exchange = ccxt.bybit({
 })
 
 MARKETS = {}
-new_symbol_until = {}
-_stats_lock = asyncio.Lock()
-scan_status = {}
-crit_false_counts = Counter()
-crit_total_counts = Counter()
-_last_state_save = 0.0
-_last_message_hashes = {}
-MESSAGE_THROTTLE_SECS = 2.0
-STATE_SAVE_DEBOUNCE_SECS = 10.0
-ntx_local_cache = {}
-_ntx_cache_lock = threading.Lock()
 
-if not TEST_MODE and STARTUP_MSG_ENABLED:
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.warning("BOT_TOKEN ve/veya CHAT_ID set edilmemiş; Telegram bildirimleri kapalı.")
-
-async def mark_status(symbol: str, code: str, detail: str = ""):
-    async with _stats_lock:
-        scan_status[symbol] = {'code': code, 'detail': detail}
-
-async def record_crit_batch(items):
-    async with _stats_lock:
-        for name, passed in items:
-            crit_total_counts[name] += 1
-            if not passed:
-                crit_false_counts[name] += 1
+_fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+_rate_lock = asyncio.Lock()
+_last_call_ts = 0.0
+_rate_penalty_ms = 0.0
 
 async def load_markets():
     global MARKETS
-    MARKETS = await asyncio.to_thread(exchange.load_markets)
+    if not MARKETS:
+        MARKETS = await asyncio.to_thread(exchange.load_markets)
+    return MARKETS
 
 def configure_exchange_session(exchange, pool=50):
     s = requests.Session()
@@ -244,32 +272,34 @@ _last_call_ts = 0.0
 STATE_FILE = 'positions.json'
 DT_KEYS = {"last_signal_time", "entry_time", "last_bar_time", "last_regime_bar"}
 
+@dataclass
+class PosState:
+    signal: Optional[str] = None
+    entry_price: Optional[float] = None
+    sl_price: Optional[float] = None
+    tp1_price: Optional[float] = None
+    tp2_price: Optional[float] = None
+    highest_price: Optional[float] = None
+    lowest_price: Optional[float] = None
+    avg_atr_ratio: Optional[float] = None
+    remaining_ratio: float = 1.0
+    last_signal_time: Optional[datetime] = None
+    last_signal_type: Optional[str] = None
+    entry_time: Optional[datetime] = None
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    last_bar_time: Optional[datetime] = None
+    regime_dir: Optional[str] = None
+    last_regime_bar: Optional[datetime] = None
+    trend_on_prev: bool = False
+    used_ob_ids: set = field(default_factory=set)
+    tp1_pct: float = 0.0
+    tp2_pct: float = 0.0
+    rest_pct: float = 1.0
+    plan_desc: str = ""
+
 def _default_pos_state():
-    return {
-        'signal': None,
-        'entry_price': None,
-        'sl_price': None,
-        'tp1_price': None,
-        'tp2_price': None,
-        'highest_price': None,
-        'lowest_price': None,
-        'avg_atr_ratio': None,
-        'remaining_ratio': 1.0,
-        'last_signal_time': None,
-        'last_signal_type': None,
-        'entry_time': None,
-        'tp1_hit': False,
-        'tp2_hit': False,
-        'last_bar_time': None,
-        'regime_dir': None,
-        'last_regime_bar': None,
-        'trend_on_prev': False,
-        'used_ob_ids': set(),
-        'tp1_pct': 0.0,
-        'tp2_pct': 0.0,
-        'rest_pct': 1.0,
-        'plan_desc': ''
-    }
+    return PosState().__dict__.copy()
 
 def _json_default(o):
     if isinstance(o, datetime):
@@ -308,13 +338,14 @@ def save_state():
     if now - _last_state_save < STATE_SAVE_DEBOUNCE_SECS:
         return
     try:
-        payload = dict(signal_cache)
-        for k, v in payload.items():
-            if isinstance(v, dict) and isinstance(v.get('used_ob_ids'), set):
-                v['used_ob_ids'] = list(v['used_ob_ids'])
-        with open(STATE_FILE, 'w') as f:
-            json.dump(payload, f, default=_json_default)
-        _last_state_save = now
+        with _state_lock:
+            payload = dict(signal_cache)
+            for k, v in payload.items():
+                if isinstance(v, dict) and isinstance(v.get('used_ob_ids'), set):
+                    v['used_ob_ids'] = list(v['used_ob_ids'])
+            with open(STATE_FILE, 'w') as f:
+                json.dump(payload, f, default=_json_default)
+            _last_state_save = now
     except Exception as e:
         logger.warning(f"State kaydedilemedi: {e}")
 
@@ -343,16 +374,10 @@ def rolling_z(series: pd.Series, win: int) -> float:
 
 def fmt_sym(symbol, x):
     try:
-        p = MARKETS.get(symbol, {}).get('precision', {}).get('price', 5)
-        if p is None:
-            p = 5
-        p = int(p)
+        return exchange.price_to_precision(symbol, float(x))
     except Exception:
-        p = 5
-    try:
-        return f"{float(x):.{p}f}"
-    except Exception:
-        return str(x)
+        # son çare
+        return f"{float(x):.6f}"
 
 def bars_since(mask: pd.Series, idx: int = -2) -> int:
     s = mask.iloc[: idx + 1]
@@ -420,17 +445,18 @@ def r_tp_plan(mode: str, is_ob: bool, R: float) -> dict:
         return dict(tp1_mult=1.5, tp2_mult=3.0, tp1_pct=0.30, tp2_pct=0.30, rest_pct=0.40, desc="trend")
     return dict(tp1_mult=1.2, tp2_mult=None, tp1_pct=0.50, tp2_pct=0.0, rest_pct=0.50, desc="range")
 
-def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float, side: str) -> (bool, str):
+def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float) -> (bool, str):
     if not all(map(np.isfinite, [R, atr, entry, tp1_price])) or atr <= 0 or R <= 0:
         return False, "nan"
+    r_over_atr = R / atr
     if mode == "trend":
         r_cap = R_MAX_ATR_MULT_TREND
         min_gap = TP1_MIN_ATR_GAP_TREND * atr
     else:
         r_cap = R_MAX_ATR_MULT_RANGE
         min_gap = TP1_MIN_ATR_GAP_RANGE * atr
-    if R > r_cap * atr:
-        return False, f"R>{r_cap}*ATR"
+    if r_over_atr > r_cap:
+        return False, f"R/ATR>{r_cap:.2f}"
     gap = abs(tp1_price - entry)
     if gap < min_gap:
         return False, f"TP1_gap<{min_gap/atr:.2f}*ATR"
@@ -441,6 +467,27 @@ def apply_split_to_state(state: dict, plan: dict):
     state['tp2_pct'] = plan.get('tp2_pct', 0.0) or 0.0
     state['rest_pct'] = plan['rest_pct']
     state['plan_desc'] = plan['desc']
+
+def build_reason_text(side: str,
+                      cross_up_1334: bool, cross_dn_1334: bool,
+                      grace_long: bool, grace_short: bool,
+                      structL: bool, structS: bool,
+                      obL_ok: bool, obS_ok: bool,
+                      dip_recent: bool, top_recent: bool) -> str:
+    tags = []
+    if side == "buy":
+        if cross_up_1334: tags.append("EMA 13/34 Cross (Up)")
+        if grace_long:     tags.append("Grace (8 bar)")
+        if structL:        tags.append("BOS Long")
+        if obL_ok:         tags.append("Order Block Long")
+        if dip_recent:     tags.append("Dip onaylı")
+    else:
+        if cross_dn_1334: tags.append("EMA 13/34 Cross (Down)")
+        if grace_short:    tags.append("Grace (8 bar)")
+        if structS:        tags.append("BOS Short")
+        if obS_ok:         tags.append("Order Block Short")
+        if top_recent:     tags.append("Tepe onaylı")
+    return " + ".join(tags) if tags else "N/A"
 
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str, is_retry: bool = False):
@@ -481,30 +528,48 @@ async def message_sender():
 
 # ================== Rate-limit Dostu Fetch ==================
 async def fetch_ohlcv_async(symbol, timeframe, limit):
-    global _last_call_ts
-    for attempt in range(4):
+    """Semaphor'u asla yeniden yaratma; sadece beklemeyi adaptif arttır."""
+    global _last_call_ts, _rate_penalty_ms
+
+    max_attempts = 5
+    base_ms = RATE_LIMIT_MS  # 200 ms default
+
+    for attempt in range(1, max_attempts + 1):
         try:
             async with _fetch_sem:
+                # global hız sınırlaması
                 async with _rate_lock:
                     now = asyncio.get_event_loop().time()
-                    wait = max(0.0, (_last_call_ts + RATE_LIMIT_MS/1000.0) - now)
+                    wait = max(0.0, (_last_call_ts + (base_ms + _rate_penalty_ms)/1000.0) - now)
                     if wait > 0:
                         await asyncio.sleep(wait)
                     _last_call_ts = asyncio.get_event_loop().time()
-                return await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
+
+                # gerçek istek
+                data = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
+
+            # başarı: ceza kademeli azalsın
+            if _rate_penalty_ms > 0:
+                _rate_penalty_ms = max(0.0, _rate_penalty_ms * 0.6)  # yumuşak geri sarma
+            return data
+
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-            backoff = (2 ** attempt) * 1.5
-            logger.debug(f"Rate limit {symbol} {timeframe}, backoff {backoff:.1f}s ({e.__class__.__name__})")
+            # 429: ceza büyüsün + artan backoff + jitter
+            _rate_penalty_ms = min(4000.0, (_rate_penalty_ms * 1.5) + 150.0)
+            backoff = 0.8 * attempt + random.random() * 0.6
             await asyncio.sleep(backoff)
         except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
-            backoff = 1.0 + attempt
-            logger.debug(f"Network/Timeout {symbol} {timeframe}, retry in {backoff:.1f}s ({e.__class__.__name__})")
+            # ağ hatası: ılımlı backoff + jitter
+            backoff = 0.6 * attempt + random.random() * 0.6
             await asyncio.sleep(backoff)
+
+    # tüm denemeler biterse:
     raise ccxt.NetworkError(f"fetch_ohlcv failed after retries: {symbol} {timeframe}")
 
 # ================== Sembol Keşfi ==================
 async def discover_bybit_symbols(linear_only=True, quote_whitelist=("USDT",)):
-    markets = await asyncio.to_thread(exchange.load_markets)
+    global MARKETS
+    markets = MARKETS or await load_markets()
     syms = []
     for s, m in markets.items():
         if not m.get('active', True): continue
@@ -557,17 +622,19 @@ def calculate_adx(df, symbol, period=ADX_PERIOD):
     df['di_plus'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     df['di_minus'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / tr_ema.replace(0, np.nan)).fillna(0)
     denom = (df['di_plus'] + df['di_minus']).clip(lower=1e-9)
-    df['DX'] = (100 * (df['di_plus'] - df['di_minus']).abs() / denom).fillna(0)
-    df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean().fillna(0)
+    df['DX'] = (100 * (df['di_plus'] - df['di_minus']).abs() / denom).replace([np.inf, -np.inf], np.nan)
+    df['adx'] = df['DX'].ewm(alpha=alpha, adjust=False).mean()
     if VERBOSE_LOG:
         logger.debug(f"ADX calculated: {df['adx'].iloc[-2]:.2f} for {symbol} at {df.index[-2]}")
     return df
 
 def calculate_bb(df, period=20, mult=2.0):
-    df['bb_mid'] = df['close'].rolling(period).mean()
-    df['bb_std'] = df['close'].rolling(period).std()
-    df['bb_upper'] = df['bb_mid'] + mult * df['bb_std']
-    df['bb_lower'] = df['bb_mid'] - mult * df['bb_std']
+    mid = df['close'].rolling(period).mean()
+    std = df['close'].rolling(period).std(ddof=0)
+    df['bb_mid']   = mid
+    df['bb_std']   = std
+    df['bb_upper'] = mid + mult * std
+    df['bb_lower'] = mid - mult * std
     return df
 
 def calc_sqzmom_lb(df: pd.DataFrame, length=20, mult_bb=2.0, lengthKC=20, multKC=1.5, use_true_range=True):
@@ -614,11 +681,11 @@ def calc_sqzmom_lb(df: pd.DataFrame, length=20, mult_bb=2.0, lengthKC=20, multKC
 def ensure_atr(df, period=14):
     if 'atr' in df.columns:
         return df
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(window=period).mean()
+    tr1 = (df['high'] - df['low']).abs()
+    tr2 = (df['high'] - df['close'].shift()).abs()
+    tr3 = (df['low']  - df['close'].shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1/period, adjust=False).mean()
     return df
 
 def calculate_obv_and_volma(df, vol_ma_window=20, spike_window=60):
@@ -666,13 +733,13 @@ def _compute_ntx_z(ntx: pd.Series, win_ema: int = 21, win_q: int = 120) -> pd.Se
     z = (ema - q50) / (denom + 1e-12)
     return z.fillna(0.0)
 
-def calculate_indicators(df, symbol, timeframe):
+def calculate_indicators(df: pd.DataFrame, symbol: str, timeframe: str) -> pd.DataFrame | None:
     if len(df) < MIN_BARS:
         logger.debug(f"{symbol}: Yetersiz veri ({len(df)} mum), skip.")
         return None
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
-        df.set_index('timestamp', inplace=True)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    df.set_index('timestamp', inplace=True)
+    df.index = df.index.tz_convert(_safe_tz())  # Europe/Istanbul vb.
     closes = df['close'].values.astype(np.float64)
     df['ema13'] = calculate_ema(closes, EMA_FAST)
     df['ema34'] = calculate_ema(closes, EMA_MID)
@@ -1004,6 +1071,12 @@ def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
     return rr >= CLASSIC_MIN_RR, sl, tp1, tp2, rr
 
+def _tr_series(df):
+    high_low = (df['high'] - df['low']).astype(float)
+    high_close = (df['high'] - df['close'].shift()).abs().astype(float)
+    low_close  = (df['low']  - df['close'].shift()).abs().astype(float)
+    return pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+
 def _true_range(row):
     return max(
         float(row['high'] - row['low']),
@@ -1031,6 +1104,28 @@ def _displacement_candle_ok(df: pd.DataFrame, idx: int, side: str) -> bool:
         return disp_ok and (float(row['close']) > float(row['open']))
     else:
         return disp_ok and (float(row['close']) < float(row['open']))
+
+def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR):
+    # swing seviyesini kullan
+    sh, sl = _last_swing_levels(df)
+    atr = df['atr']
+    closes = df['close']
+    if side == 'long' and sh is not None:
+        lvl = sh + min_break_atr * atr.iloc[disp_idx]
+        return closes.iloc[disp_idx] > lvl
+    if side == 'short' and sl is not None:
+        lvl = sl - min_break_atr * atr.iloc[disp_idx]
+        return closes.iloc[disp_idx] < lvl
+    return False
+
+def _has_imbalance_next(df, side, k):
+    # displacement’tan sonraki 1-2 barda karşı wick’e derin dokunmama
+    rng = df.iloc[k+1:k+3]
+    if rng.empty: return True
+    if side == 'long':
+        return not (rng['low'] < df['open'].iloc[k])  # kabaca
+    else:
+        return not (rng['high'] > df['open'].iloc[k])
 
 def _last_opposite_body_zone(df: pd.DataFrame, disp_idx: int, side: str):
     if disp_idx <= 0:
@@ -1069,6 +1164,10 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
     idx_last = len(df) - 2
     for k in range(idx_last-1, max(idx_last-OB_LOOKBACK, 1), -1):
         if _displacement_candle_ok(df, k, side):
+            if not _bos_after_displacement(df, side, k):  # k: disp bar index
+                continue
+            if not _has_imbalance_next(df, side, k):
+                continue
             z_high, z_low, opp_idx = _last_opposite_body_zone(df, k, side)
             if z_high is None:
                 continue
@@ -1126,6 +1225,15 @@ def _ob_rr_ok(df: pd.DataFrame, side: str, z_hi: float, z_lo: float):
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
     return (rr >= OB_MIN_RR), (sl, None, None), (entry, rr)
 
+def _score_side(side, ok_gate, struct_ok, adx_last, ntx_last, ff_ok):
+    score = 0
+    score += 2 if ok_gate else 0           # G3 gate
+    score += 2 if struct_ok else 0         # BOS/OB yapısı
+    score += 1 if ((adx_last or 0) >= 23) else 0
+    score += 1 if ((ntx_last or 0) >= 50) else 0
+    score += 1 if ff_ok else 0             # kalite filtresi
+    return score
+
 def _summarize_coverage(all_symbols):
     total = len(all_symbols)
     codes = {s: scan_status.get(s, {}).get('code') for s in all_symbols}
@@ -1144,6 +1252,11 @@ def _summarize_coverage(all_symbols):
         "error": error,
         "missing": missing,
     }
+
+def _adaptive_pause(base, errors, ratelims):
+    add = min(30, errors*2 + ratelims*4)
+    sub = 0 if (errors+ratelims)>0 else 2
+    return max(2, base + add - sub)
 
 def _log_false_breakdown():
     logger.info("Kriter FALSE dökümü (yüksekten düşüğe):")
@@ -1216,7 +1329,7 @@ async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol
         dbg = f"{dbg} | {dbg_json}"
     return ok, dbg
 
-async def check_signals(symbol, timeframe='4h'):
+async def check_signals(symbol: str, timeframe: str = '4h') -> None:
     tz = _safe_tz()
     try:
         await mark_status(symbol, "started")
@@ -1262,14 +1375,10 @@ async def check_signals(symbol, timeframe='4h'):
         cur_key = f"{symbol}_{timeframe}"
         async with _stats_lock:
             st = signal_cache.setdefault(cur_key, _default_pos_state())
-            base = _default_pos_state()
-            for k, v in base.items():
-                st.setdefault(k, v)
-            if not isinstance(st.get('used_ob_ids'), set):
-                st['used_ob_ids'] = set(st.get('used_ob_ids', []))
+            st['used_ob_ids'] = set(st.get('used_ob_ids', []))
+            used_set = set(st['used_ob_ids'])  # kopya
             st['trend_on_prev'] = bull_mode
             signal_cache[cur_key] = st
-            used_set = st['used_ob_ids']
         if VERBOSE_LOG:
             logger.debug(f"MODE bull={bull_mode} | ADX={adx_last:.1f} | ON={BEAR_ADX_ON} OFF={BEAR_ADX_OFF}")
         ntx_thr = ntx_threshold(atr_z)
@@ -1383,9 +1492,9 @@ async def check_signals(symbol, timeframe='4h'):
                 logger.debug(f"{symbol} {timeframe}: RR={b_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (buy_classic)")
             if (allow_short or structS) and smi_open_red and is_red and okS and not classic_sell_rr_ok:
                 logger.debug(f"{symbol} {timeframe}: RR={s_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (sell_classic)")
-            if obL_ok and not obL_rr_ok:
+            if obL_ok and not obL_rr_ok and obL_entry_rr:
                 logger.debug(f"{symbol} {timeframe}: RR={obL_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_buy_standalone)")
-            if obS_ok and not obS_rr_ok:
+            if obS_ok and not obS_rr_ok and obS_entry_rr:
                 logger.debug(f"{symbol} {timeframe}: RR={obS_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_sell_standalone)")
         reason = ""
         if buy_condition:
@@ -1442,10 +1551,18 @@ async def check_signals(symbol, timeframe='4h'):
         ]
         await record_crit_batch(criteria)
         if buy_condition and sell_condition:
-            new_symbol_until[symbol] = now + timedelta(minutes=NEW_SYMBOL_COOLDOWN_MIN)
-            await mark_status(symbol, "skip", "conflicting_signals")
-            logger.warning(f"{symbol} {timeframe}: Çakışan sinyaller, işlem yapılmadı. Cooldown uygulandı.")
-            return
+            ntx_last = float(df['ntx'].iloc[-2]) if 'ntx' in df.columns and pd.notna(df['ntx'].iloc[-2]) else 0.0
+            buy_score  = _score_side("buy",  okL, structL, adx_last, ntx_last, fk_ok_L)
+            sell_score = _score_side("sell", okS, structS, adx_last, ntx_last, fk_ok_S)
+            if buy_score != sell_score:
+                prefer = "buy" if buy_score > sell_score else "sell"
+                buy_condition  = (prefer == "buy")
+                sell_condition = (prefer == "sell")
+            else:
+                # eşitse yine cooldown yap
+                new_symbol_until[symbol] = now + timedelta(minutes=NEW_SYMBOL_COOLDOWN_MIN)
+                await mark_status(symbol, "skip", "conflicting_signals_tie")
+                return
         now = datetime.now(tz)
         bar_time = df.index[-2]
         if not isinstance(bar_time, (pd.Timestamp, datetime)):
@@ -1457,6 +1574,8 @@ async def check_signals(symbol, timeframe='4h'):
                 current_pos.setdefault(k, v)
             if not isinstance(current_pos.get('used_ob_ids'), set):
                 current_pos['used_ob_ids'] = set(current_pos.get('used_ob_ids', []))
+        same_bar = (pd.Timestamp(current_pos.get('last_bar_time')).value
+                    == pd.Timestamp(bar_time).value) if current_pos.get('last_bar_time') else False
         exit_cross_long = (pd.notna(e13_prev) and pd.notna(e34_prev) and pd.notna(e13_last) and pd.notna(e34_last)
                            and (e13_prev >= e34_prev) and (e13_last < e34_last))
         exit_cross_short = (pd.notna(e13_prev) and pd.notna(e34_prev) and pd.notna(e13_last) and pd.notna(e34_last)
@@ -1487,7 +1606,7 @@ async def check_signals(symbol, timeframe='4h'):
                 (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES) and
                 (APPLY_COOLDOWN_BOTH_DIRECTIONS or current_pos['last_signal_type'] == 'buy')
             )
-            if cooldown_active or current_pos.get('last_bar_time') == bar_time:
+            if cooldown_active or same_bar:
                 if VERBOSE_LOG:
                     logger.debug(f"{symbol} {timeframe}: BUY atlandı (cooldown veya aynı bar) 🚫")
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
@@ -1505,7 +1624,7 @@ async def check_signals(symbol, timeframe='4h'):
                 tp1_price = entry_price + plan['tp1_mult'] * R
                 tp2_price = (entry_price + plan['tp2_mult'] * R) if plan['tp2_mult'] else None
                 ok_guard, why_guard = r_plan_guards_ok(
-                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, side="buy"
+                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price
                 )
                 if not ok_guard:
                     if VERBOSE_LOG:
@@ -1522,7 +1641,9 @@ async def check_signals(symbol, timeframe='4h'):
                     await mark_status(symbol, "skip", "invalid_current_price")
                     logger.debug(f"Geçersiz mevcut fiyat ({symbol} {timeframe}), skip.")
                     return
-                if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
+                tr_med = _tr_series(df).rolling(20).median().iloc[-2]
+                instant_pad = max(INSTANT_SL_BUFFER * atr_value, 0.4 * tr_med)
+                if current_price <= sl_price + instant_pad:
                     if VERBOSE_LOG:
                         logger.debug(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
                     await mark_status(symbol, "skip", "instant_sl_risk")
@@ -1553,10 +1674,15 @@ async def check_signals(symbol, timeframe='4h'):
                     apply_split_to_state(current_pos, plan)
                     if ob_buy_standalone and obL_id:
                         used_set.add(obL_id)
-                    signal_cache[f"{symbol}_{timeframe}"] = current_pos
+                    st = signal_cache.get(cur_key, _default_pos_state())
+                    st.update(current_pos if 'current_pos' in locals() else {})
+                    st['used_ob_ids'] = set(used_set)
+                    signal_cache[cur_key] = st
                 plan_tag = plan['desc']
-                msg_reason = (reason + f" | Plan: {plan_tag}, R={R:.4g}, TP1={plan['tp1_mult']}R"
-                              + ("" if not plan['tp2_mult'] else f", TP2={plan['tp2_mult']}R"))
+                msg_reason = ("Order Block" if ob_buy_standalone else build_reason_text(
+                    "buy", cross_up_1334, cross_dn_1334, grace_long, grace_short,
+                    structL, structS, obL_ok, obS_ok, False, False
+                ))
                 await enqueue_message(
                     format_signal_msg(symbol, timeframe, "buy",
                                       entry_price, sl_price,
@@ -1570,7 +1696,7 @@ async def check_signals(symbol, timeframe='4h'):
                 (now - current_pos['last_signal_time']) < timedelta(minutes=COOLDOWN_MINUTES) and
                 (APPLY_COOLDOWN_BOTH_DIRECTIONS or current_pos['last_signal_type'] == 'sell')
             )
-            if cooldown_active or current_pos.get('last_bar_time') == bar_time:
+            if cooldown_active or same_bar:
                 if VERBOSE_LOG:
                     logger.debug(f"{symbol} {timeframe}: SELL atlandı (cooldown veya aynı bar) 🚫")
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
@@ -1588,7 +1714,7 @@ async def check_signals(symbol, timeframe='4h'):
                 tp1_price = entry_price - plan['tp1_mult'] * R
                 tp2_price = (entry_price - plan['tp2_mult'] * R) if plan['tp2_mult'] else None
                 ok_guard, why_guard = r_plan_guards_ok(
-                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, side="sell"
+                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price
                 )
                 if not ok_guard:
                     if VERBOSE_LOG:
@@ -1605,7 +1731,9 @@ async def check_signals(symbol, timeframe='4h'):
                     await mark_status(symbol, "skip", "invalid_current_price")
                     logger.debug(f"Geçersiz mevcut fiyat ({symbol} {timeframe}), skip.")
                     return
-                if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
+                tr_med = _tr_series(df).rolling(20).median().iloc[-2]
+                instant_pad = max(INSTANT_SL_BUFFER * atr_value, 0.4 * tr_med)
+                if current_price >= sl_price - instant_pad:
                     if VERBOSE_LOG:
                         logger.debug(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
                     await mark_status(symbol, "skip", "instant_sl_risk")
@@ -1636,10 +1764,15 @@ async def check_signals(symbol, timeframe='4h'):
                     apply_split_to_state(current_pos, plan)
                     if ob_sell_standalone and obS_id:
                         used_set.add(obS_id)
-                    signal_cache[f"{symbol}_{timeframe}"] = current_pos
+                    st = signal_cache.get(cur_key, _default_pos_state())
+                    st.update(current_pos if 'current_pos' in locals() else {})
+                    st['used_ob_ids'] = set(used_set)
+                    signal_cache[cur_key] = st
                 plan_tag = plan['desc']
-                msg_reason = (reason + f" | Plan: {plan_tag}, R={R:.4g}, TP1={plan['tp1_mult']}R"
-                              + ("" if not plan['tp2_mult'] else f", TP2={plan['tp2_mult']}R"))
+                msg_reason = ("Order Block" if ob_sell_standalone else build_reason_text(
+                    "sell", cross_up_1334, cross_dn_1334, grace_long, grace_short,
+                    structL, structS, obL_ok, obS_ok, False, False
+                ))
                 await enqueue_message(
                     format_signal_msg(symbol, timeframe, "sell",
                                       entry_price, sl_price,
@@ -1781,12 +1914,24 @@ async def check_signals(symbol, timeframe='4h'):
         await mark_status(symbol, "error", str(e))
 
 # ================== Ana Döngü ==================
+_stop = asyncio.Event()
+
+def _handle_stop():
+    _stop.set()
+
 async def main():
+    loop = asyncio.get_running_loop()
+    try:
+        for s in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(s, _handle_stop)
+    except NotImplementedError:
+        pass
+
     asyncio.create_task(message_sender())
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
     await load_markets()
-    while True:
+    while not _stop.is_set():
         try:
             async with _stats_lock:
                 scan_status.clear()
@@ -1797,10 +1942,12 @@ async def main():
             shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
             t_start = time.time()
             for i, shard in enumerate(shards, start=1):
-                logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
+                run_id = uuid.uuid4().hex[:6]
+                logger.info(f"[{run_id}] Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
                 tasks = [check_signals(symbol, timeframe='4h') for symbol in shard]
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await asyncio.sleep(INTER_BATCH_SLEEP)
+                logger.debug(f"[{run_id}] Shard bitti")
             cov = _summarize_coverage(symbols)
             logger.debug(
                 "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
@@ -1814,21 +1961,23 @@ async def main():
                     elapsed=elapsed, wait=float(SCAN_PAUSE_SEC), **cov
                 )
             )
-            await asyncio.sleep(SCAN_PAUSE_SEC)
+            wait_s = _adaptive_pause(SCAN_PAUSE_SEC, cov['error'], crit_false_counts.get('rate_limit', 0))
+            await asyncio.sleep(wait_s)
         except asyncio.CancelledError:
-            logger.info("Bot durduruluyor, cleanup başlıyor...")
-            await message_queue.join()
-            if getattr(exchange, "session", None):
-                try:
-                    exchange.session.close()
-                except Exception:
-                    pass
-            save_state()
-            logger.info("Cleanup tamamlandı, bot kapatıldı.")
             break
         except Exception as e:
             logger.exception(f"Tur genel hatası: {e}")
             await asyncio.sleep(SCAN_PAUSE_SEC)
+    # kapanış
+    await message_queue.join()
+    if getattr(exchange, "session", None):
+        try: exchange.session.close()
+        except: pass
+    if telegram_bot:
+        try: await telegram_bot.close()
+        except: pass
+    save_state()
+    logger.info("Cleanup tamamlandı, bot kapatıldı.")
 
 if __name__ == "__main__":
     asyncio.run(main())
