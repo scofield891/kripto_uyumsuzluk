@@ -246,9 +246,6 @@ telegram_bot = telegram.Bot(
 # ================== Global State ==================
 signal_cache = {}
 message_queue = asyncio.Queue(maxsize=2000)
-_fetch_sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
-_rate_lock = asyncio.Lock()
-_last_call_ts = 0.0
 STATE_FILE = 'positions.json'
 DT_KEYS = {"last_signal_time", "entry_time", "last_bar_time", "last_regime_bar"}
 @dataclass
@@ -392,9 +389,11 @@ def robust_up(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: 
     ok = (med_d > eps) and (pos_ratio >= pos_ratio_thr)
     return ok, med_d, pos_ratio
 def _last_true_index(s: pd.Series, upto_idx: int) -> int:
-    vals = s.iloc[:upto_idx+1].values
+    vals = s.iloc[:upto_idx+1]
+    # bool değerlendirilemeyenleri False’a indir:
+    vals = vals.fillna(False).astype(bool).values
     for i in range(len(vals)-1, -1, -1):
-        if bool(vals[i]):
+        if vals[i]:
             return i
     return -1
 def regime_mode_from_adx(adx_last: float) -> str:
@@ -1029,17 +1028,16 @@ def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_A
         return closes.iloc[disp_idx] < lvl
     return False
 def _has_imbalance_next(df, side, k):
-    # displacement’tan sonraki 1-2 barda karşı wick’e derin dokunmama
     rng = df.iloc[k+1:k+3]
     if rng.empty:
         return True
     open_k = float(df['open'].iloc[k])
     if side == 'long':
         touched = (rng['low'] < open_k).any()
-        return not touched
+        return not bool(touched)
     else:
         touched = (rng['high'] > open_k).any()
-        return not touched
+        return not bool(touched)
 def _last_opposite_body_zone(df: pd.DataFrame, disp_idx: int, side: str):
     if disp_idx <= 0:
         return None, None, None
@@ -1813,7 +1811,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 signal_cache[f"{symbol}_{timeframe}"] = current_pos
         await mark_status(symbol, "completed")
     except Exception as e:
-        logger.error(f"{symbol} {timeframe}: Hata: {str(e)}")
+        logger.exception(f"{symbol} {timeframe}: Hata")
         await mark_status(symbol, "error", str(e))
 # ================== Ana Döngü ==================
 _stop = asyncio.Event()
@@ -1841,12 +1839,10 @@ async def main():
             shards = [symbols[i::N_SHARDS] for i in range(N_SHARDS)]
             t_start = time.time()
             for i, shard in enumerate(shards, start=1):
-                run_id = uuid.uuid4().hex[:6]
-                logger.info(f"[{run_id}] Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
+                logger.info(f"Shard {i}/{len(shards)} -> {len(shard)} sembol taranacak")
                 tasks = [check_signals(symbol, timeframe='4h') for symbol in shard]
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await asyncio.sleep(INTER_BATCH_SLEEP)
-                logger.debug(f"[{run_id}] Shard bitti")
             cov = _summarize_coverage(symbols)
             logger.debug(
                 "Coverage: total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
