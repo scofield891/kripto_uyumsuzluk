@@ -31,10 +31,10 @@ TEST_MODE = False
 VERBOSE_LOG = True
 STARTUP_MSG_ENABLED = True
 LOOKBACK_ATR = 18
-SL_MULTIPLIER = 1.8
-TP_MULTIPLIER1 = 2.2
-TP_MULTIPLIER2 = 3.5
-SL_BUFFER = 0.3
+SL_MULTIPLIER = 1.4
+TP_MULTIPLIER1 = None
+TP_MULTIPLIER2 = None
+SL_BUFFER = 0.15
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.04
 ADX_PERIOD = 14
@@ -100,9 +100,14 @@ G3_FF_MIN_SCORE = 3
 G3_FF_MIN_SCORE_BEAR = 4
 USE_ROBUST_SLOPE = True
 SCAN_PAUSE_SEC = 120
-BEAR_ADX_ON = 23
-BEAR_ADX_OFF = 20
+BEAR_ADX_ON = 23  # trend ON/OFF eşiği
+BEAR_ADX_OFF = 20  # trend ON/OFF eşiği
 CLASSIC_MIN_RR = 1.0
+# ==== SQZ Breakout Ayarları ====
+SQZ_OFF_LOOKBACK = 6 # son kaç bar içinde 'off' olmalı
+SQZ_MOM_SLOPE_WIN = 2 # lb_sqz_val eğim kontrolü için kısa pencere
+SQZ_RANGE_REQUIRE_RETEST = True # range'de retest iste
+SQZ_RETEST_MAX_BARS = 3 # off sonrası kaç bar içinde retest kabul
 # ====== ORDER BLOCK (OB) Ayarları ======
 USE_OB_STANDALONE = True
 OB_REQUIRE_SMI = False
@@ -144,8 +149,8 @@ NTX_LOCAL_Q = 0.60
 NTX_Z_EWMA_ALPHA = 0.02
 # ==== R-tabanlı TP/SL planı ====
 ADX_TREND_ON = 23
-R_MAX_ATR_MULT_RANGE = 2.5
-R_MAX_ATR_MULT_TREND = 3.0
+R_MAX_ATR_MULT_RANGE = 1.6
+R_MAX_ATR_MULT_TREND = 2.2
 TP1_MIN_ATR_GAP_RANGE = 0.8
 TP1_MIN_ATR_GAP_TREND = 1.0
 # ==== Dip-Tepe Parametreleri ====
@@ -348,21 +353,23 @@ def bars_since(mask: pd.Series, idx: int = -2) -> int:
     rev = s.values[::-1]
     return int(np.argmax(rev)) if rev.any() else len(rev)
 def format_signal_msg(symbol: str, timeframe: str, side: str,
-                     entry: float, sl: float, tp1: float, tp2: float,
+                     entry: float, sl: float, tp1: float, tp2: float | None,
                      reason_line: str = "EMA Cross veya BOS veya Order Block",
                      tz_name: str = DEFAULT_TZ) -> str:
     tz = _safe_tz()
     date_str = datetime.now(tz).strftime("%d.%m.%Y")
     title = "BUY (LONG) 🚀" if side == "buy" else "SELL (SHORT) 📉"
-    return (
-        f"{symbol} {timeframe}: {title}\n"
-        f"Sebep: {reason_line}\n"
-        f"Entry: {fmt_sym(symbol, entry)}\n"
-        f"SL: {fmt_sym(symbol, sl)}\n"
-        f"TP1: {fmt_sym(symbol, tp1)}\n"
-        f"TP2: {fmt_sym(symbol, tp2)}\n"
-        f"Tarih: {date_str}"
-    )
+    lines = [
+        f"{symbol} {timeframe}: {title}",
+        f"Sebep: {reason_line}",
+        f"Entry: {fmt_sym(symbol, entry)}",
+        f"SL: {fmt_sym(symbol, sl)}",
+        f"TP1: {fmt_sym(symbol, tp1)}",
+    ]
+    if tp2 is not None and abs(tp2 - tp1) > 1e-12:
+        lines.append(f"TP2: {fmt_sym(symbol, tp2)}")
+    lines.append(f"Tarih: {date_str}")
+    return "\n".join(lines)
 def rising_ema(series: pd.Series, win: int = 5, eps: float = 0.0, pos_ratio_thr: float = 0.55, **kwargs):
     if 'pos_ratio_th' in kwargs:
         logger.debug("rising_ema(): 'pos_ratio_th' is deprecated; use 'pos_ratio_thr'.")
@@ -399,11 +406,18 @@ def _last_true_index(s: pd.Series, upto_idx: int) -> int:
 def regime_mode_from_adx(adx_last: float) -> str:
     return "trend" if (np.isfinite(adx_last) and adx_last >= ADX_TREND_ON) else "range"
 def r_tp_plan(mode: str, is_ob: bool, R: float) -> dict:
+    """
+    R-tabanlı TP/SL planı (kullanıcının istediği paylar):
+      - Trend modu (ADX ≥ 23):  TP1=1.0R (%30), TP2=2.0R (%30), kalan %40
+      - Range modu (ADX < 23):  TP1=0.8R (%40), TP2=1.2R (%30), kalan %30
+      - OB standalone:          TP1=1.0R (%40), TP2=1.5R (%30), kalan %30
+    """
     if is_ob:
-        return dict(tp1_mult=1.0, tp2_mult=None, tp1_pct=0.50, tp2_pct=0.0, rest_pct=0.50, desc="ob")
+        return dict(tp1_mult=1.0, tp2_mult=1.5, tp1_pct=0.40, tp2_pct=0.30, rest_pct=0.30, desc="ob")
     if mode == "trend":
-        return dict(tp1_mult=1.5, tp2_mult=3.0, tp1_pct=0.30, tp2_pct=0.30, rest_pct=0.40, desc="trend")
-    return dict(tp1_mult=1.2, tp2_mult=None, tp1_pct=0.50, tp2_pct=0.0, rest_pct=0.50, desc="range")
+        return dict(tp1_mult=1.0, tp2_mult=2.0, tp1_pct=0.30, tp2_pct=0.30, rest_pct=0.40, desc="trend")
+    # range
+    return dict(tp1_mult=0.8, tp2_mult=1.2, tp1_pct=0.40, tp2_pct=0.30, rest_pct=0.30, desc="range")
 def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float) -> (bool, str):
     if not all(map(np.isfinite, [R, atr, entry, tp1_price])) or atr <= 0 or R <= 0:
         return False, "nan"
@@ -449,27 +463,23 @@ def build_reason_text(side: str,
 def get_regime_bucket(adx_last: float) -> str:
     if np.isfinite(adx_last):
         if adx_last >= 28:
-            return "strong"   # güçlü trend
+            return "strong" # güçlü trend
         elif adx_last >= 20:
-            return "neutral"  # erken/nötr trend
-    return "range"            # chop/range
-
+            return "neutral" # erken/nötr trend
+    return "range" # chop/range
 # --- Simple Dip/Tepe detector (lightweight) ---
 def _is_local_low(df: pd.DataFrame, i: int, win: int = DIPTEPE_SEQ_WIN) -> bool:
     if i - win < 0 or i + win >= len(df): return False
     lows = df['low'].values
     return lows[i] == np.min(lows[i-win:i+win+1])
-
 def _is_local_high(df: pd.DataFrame, i: int, win: int = DIPTEPE_SEQ_WIN) -> bool:
     if i - win < 0 or i + win >= len(df): return False
     highs = df['high'].values
     return highs[i] == np.max(highs[i-win:i+win+1])
-
 def _bar_body_ratio(row) -> float:
     o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
     rng = max(h - l, 1e-12)
     return abs(c - o) / rng
-
 def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
     """
     Basit dip/tepe teyidi:
@@ -479,12 +489,10 @@ def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
     """
     if len(df) < max(DIPTEPE_A_LOOKBACK, DIPTEPE_BRK_LEN + 3) or 'atr' not in df.columns:
         return False, False, "dt_data_short"
-
     idx_last = len(df) - 2
     atr = float(df['atr'].iloc[idx_last])
     if not np.isfinite(atr) or atr <= 0:
         return False, False, "dt_nan_atr"
-
     # arka pencerede pivot ara
     start = max(5, idx_last - DIPTEPE_A_LOOKBACK)
     dip_i = top_i = None
@@ -495,10 +503,8 @@ def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
             top_i = i
         if dip_i is not None and top_i is not None:
             break
-
     dip_ok = top_ok = False
     note = []
-
     # DIP (long desteği): pivot low sonrası yukarı kırılım + min body + ATR buffer
     if dip_i is not None:
         # son DIPTEPE_BRK_LEN bar içinde pivot low'un high'ını aşma
@@ -509,7 +515,6 @@ def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
             body_ok = (_bar_body_ratio(df.iloc[idx_last]) >= DIPTEPE_BODY_MIN)
             dip_ok = bool(crossed and body_ok)
             if dip_ok: note.append("DIP")
-
     # TEPE (short desteği): pivot high sonrası aşağı kırılım + min body + ATR buffer
     if top_i is not None:
         ref_level = float(df['low'].iloc[top_i])
@@ -519,7 +524,6 @@ def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
             body_ok = (_bar_body_ratio(df.iloc[idx_last]) >= DIPTEPE_BODY_MIN)
             top_ok = bool(crossed and body_ok)
             if top_ok: note.append("TEPE")
-
     return dip_ok, top_ok, "+".join(note) if note else "none"
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str, is_retry: bool = False):
@@ -913,6 +917,85 @@ def _obv_slope_recent(df: pd.DataFrame, win=OBV_SLOPE_WIN) -> float:
     x = np.arange(len(s))
     m, _ = np.polyfit(x, s.values, 1)
     return float(m)
+def _recent_sqz_off(df: pd.DataFrame, lookback=SQZ_OFF_LOOKBACK) -> bool:
+    if 'lb_sqz_off' not in df.columns or len(df) < lookback + 2:
+        return False
+    window = df['lb_sqz_off'].iloc[-(lookback+1):-1]
+    return bool(window.any())
+def _lb_val_momentum(df: pd.DataFrame, side: str, win=SQZ_MOM_SLOPE_WIN) -> bool:
+    if 'lb_sqz_val' not in df.columns or len(df) < win + 3:
+        return False
+    v_now = float(df['lb_sqz_val'].iloc[-2])
+    v_prev = float(df['lb_sqz_val'].iloc[-3])
+    if not (np.isfinite(v_now) and np.isfinite(v_prev)):
+        return False
+    if side == "long":
+        return (v_now > 0) and (v_now > v_prev)
+    else:
+        return (v_now < 0) and (v_now < v_prev)
+def _range_retest_ok(df: pd.DataFrame, side: str, max_bars=SQZ_RETEST_MAX_BARS) -> bool:
+    """SQZ 'off' olduktan hemen sonra bb_mid civarı hafif geri çekilip yeniden yön alma."""
+    if not SQZ_RANGE_REQUIRE_RETEST:
+        return True
+    if 'bb_mid' not in df.columns:
+        return False
+    # son max_bars içinde bb_mid'e yaklaşım ve yön teyidi
+    rng = df.iloc[-(max_bars+1):-1]
+    if rng.empty:
+        return False
+    for i in range(len(rng)):
+        row = rng.iloc[i]
+        # bb_mid yakınlığı (normalize)
+        mid = float(row['bb_mid']); c = float(row['close'])
+        if not (np.isfinite(mid) and np.isfinite(c)):
+            continue
+        prox = abs(c - mid) / max(abs(mid), 1e-12)
+        # çok gevşek: %0.5 yakınlık eşik gibi
+        if prox <= 0.005:
+            # retest mumundan sonra yön teyidi (kapanış rengi)
+            next_row = df.iloc[-2] # son mum
+            if side == "long":
+                return float(next_row['close']) > float(next_row['open'])
+            else:
+                return float(next_row['close']) < float(next_row['open'])
+    return False
+def is_sqz_breakout(df: pd.DataFrame, side: str, regime: str, adx_last: float, bear_mode: bool) -> (bool, str):
+    """Volatilite rejim kırılımı: SQZ off + lb_sqz_val momentum + trend bandı + kalite filtresi + (range'de retest)."""
+    if len(df) < 60 or 'lb_sqz_off' not in df.columns or 'lb_sqz_val' not in df.columns:
+        return False, "sqz_data_short"
+    # 1) Sıkışma 'off' yakın zamanda
+    off_ok = _recent_sqz_off(df, lookback=SQZ_OFF_LOOKBACK)
+    if not off_ok:
+        return False, "sqz_not_off"
+    # 2) Momentum yönü ve eğimi
+    mom_ok = _lb_val_momentum(df, side=side, win=SQZ_MOM_SLOPE_WIN)
+    if not mom_ok:
+        return False, "lb_val_mom_fail"
+    # 3) Trend bandı (dinamik band_k)
+    band_k = compute_dynamic_band_k(df, adx_last)
+    trend_ok, t_dbg = _trend_ok(df, side, band_k, G3_SLOPE_WIN, G3_SLOPE_THR_PCT)
+    if not trend_ok:
+        return False, f"trend_fail({t_dbg})"
+    # 4) Kalite filtresi
+    fk_ok, fk_dbg = fake_filter_v2(df, side=side, bear_mode=bear_mode)
+    if regime == "range":
+        # range'te zaten check_signals içinde sıkılaştırıyoruz; burada ek sertlik istemiyoruz.
+        pass
+    if not fk_ok:
+        return False, f"ff_fail({fk_dbg})"
+    # 5) Range rejiminde retest iste (opsiyonel ayarlı)
+    if regime == "range":
+        if not _range_retest_ok(df, side=side, max_bars=SQZ_RETEST_MAX_BARS):
+            return False, "retest_fail"
+    # 6) RR kontrolü (klasik)
+    entry = float(df['close'].iloc[-2])
+    atrv = float(df['atr'].iloc[-2]) if 'atr' in df.columns and pd.notna(df['atr'].iloc[-2]) else np.nan
+    if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
+        return False, "rr_nan"
+    ok_rr, _, _, _, rr = _classic_rr_ok(df, "buy" if side=="long" else "sell", atrv, entry)
+    if not ok_rr:
+        return False, f"rr<{CLASSIC_MIN_RR}"
+    return True, "ok"
 def _is_swing_high(df, i, win=G3_SWING_WIN):
     if i - win < 0 or i + win >= len(df): return False
     h = df['high'].values
@@ -958,7 +1041,6 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime: str =
     adx_min = 0 if bear_mode else G3_MIN_ADX
     adx_gate = np.isfinite(adx_last) and (adx_last >= adx_min)
     ntx_gate = vote_ntx
-
     s = df['ntx'] if 'ntx' in df.columns else None
     if s is None:
         ntx_trend_ok = False
@@ -968,7 +1050,6 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime: str =
         ok2, slope2, pr2 = robust_up(s, win=G3_NTX_SLOPE_WIN, eps=0.0, pos_ratio_thr=0.55)
         ntx_trend_ok = ok1 or ok2
         ntx_trend_dbg = f"r_ema={ok1}|r_med={ok2}"
-
     # --- REJİME GÖRE ---
     if regime == "range":
         # chop'ta daha sert: ikisi de şart
@@ -977,10 +1058,8 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime: str =
         # eski kural: 3 koşuldan en az 2'si
         score = int(adx_gate) + int(ntx_gate) + int(ntx_trend_ok)
         mom_ok_base = (score >= 2)
-
     dbg = (f"adx>={adx_min}={adx_gate}, ntx_thr={ntx_thr:.1f}/{float(df['ntx'].iloc[-2]) if 'ntx' in df.columns and pd.notna(df['ntx'].iloc[-2]) else float('nan'):.1f}->{ntx_gate}, "
            f"ntx_trend={ntx_trend_ok} [{ntx_trend_dbg}]")
-
     if DYNAMIC_MODE:
         # mevcut dinamik kısmı koruyoruz
         adx_trend_ok = rising_ema(df['adx'], win=6, pos_ratio_thr=0.6)[0] or robust_up(df['adx'], win=6, pos_ratio_thr=0.6)[0]
@@ -988,7 +1067,6 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime: str =
         mom_ok = bool(mom_ok_base or (adx_trend_ok and (ntx_gate or ntx_trend2_ok)) or (ntx_trend2_ok and adx_gate))
     else:
         mom_ok = mom_ok_base
-
     return mom_ok, dbg
 def _quality_ok(df, side, bear_mode):
     fk_ok, fk_dbg = fake_filter_v2(df, side=side, bear_mode=bear_mode)
@@ -996,22 +1074,10 @@ def _quality_ok(df, side, bear_mode):
     ema13 = float(last['ema13']); close = float(last['close']); atrv = float(last['atr'])
     ema13_ok = np.isfinite(atrv) and (abs(close - ema13) <= G3_ENTRY_DIST_EMA13_ATR * atrv)
     return (fk_ok and ema13_ok), f"ff={fk_ok} ({fk_dbg}), ema13_dist_ok={ema13_ok}"
-def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
-    if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
-        return False, None, None, None, None
+def _classic_sl_only(df, side: str, atrv: float, entry: float):
     sl_abs = (SL_MULTIPLIER + SL_BUFFER) * atrv
-    if side == "buy":
-        sl = entry - sl_abs
-        tp1 = entry + (TP_MULTIPLIER1 * atrv)
-        tp2 = entry + (TP_MULTIPLIER2 * atrv)
-    else:
-        sl = entry + sl_abs
-        tp1 = entry - (TP_MULTIPLIER1 * atrv)
-        tp2 = entry - (TP_MULTIPLIER2 * atrv)
-    risk = abs(entry - sl)
-    reward = abs(tp1 - entry)
-    rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
-    return rr >= CLASSIC_MIN_RR, sl, tp1, tp2, rr
+    sl = entry - sl_abs if side == "buy" else entry + sl_abs
+    return sl
 def _tr_series(df):
     high_low = (df['high'] - df['low']).astype(float)
     high_close = (df['high'] - df['close'].shift()).abs().astype(float)
@@ -1118,74 +1184,89 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
                 dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}]"
                 return True, dbg, z_high, z_low, ob_id
     return False, "no_displacement_ob", None, None, None
+def _ob_rr_ok(df: pd.DataFrame, side: str, z_high: float | None, z_low: float | None):
+    """
+    OB bölgesi için basit RR kontrolü.
+    - entry: son kapanış (close[-2])
+    - stop: long -> zone_low - buffer*ATR, short -> zone_high + buffer*ATR
+    - rr: OB planında TP1=1R kabul edildiği için asgari 1.0 baz alınır (r_tp_plan is_ob=True -> tp1_mult=1.0).
+    Dönenler:
+      ok(bool), (sl_price, None, None), (entry, rr)
+    """
+    if z_high is None or z_low is None or 'atr' not in df.columns or len(df) < 3:
+        return False, None, None
+
+    entry = float(df['close'].iloc[-2])
+    atrv  = float(df['atr'].iloc[-2])
+    if not (np.isfinite(entry) and np.isfinite(atrv) and atrv > 0):
+        return False, None, None
+
+    buf = OB_STOP_ATR_BUFFER * atrv
+
+    if side == "long":
+        sl_price = float(z_low) - buf
+        R = abs(entry - sl_price)
+    else:
+        sl_price = float(z_high) + buf
+        R = abs(entry - sl_price)
+
+    if not np.isfinite(R) or R <= 0:
+        return False, None, None
+
+    # OB için baz RR = 1.0 (TP1=1R). İstersen burada daha sıkı kural koyabilirsin.
+    rr = 1.0
+    ok = (rr >= OB_MIN_RR)
+
+    return ok, (sl_price, None, None), (entry, rr)
 def _order_block_cons_fallback(df: pd.DataFrame, side: str, lookback=10) -> (bool, str):
     if not OB_HYBRID:
         return False, "hybrid_off"
     if len(df) < lookback + 3 or 'atr' not in df.columns or 'volume' not in df.columns:
         return False, "cons_data_short"
+
     idx_last = len(df) - 2
     win = df.iloc[idx_last - lookback:idx_last]
+
     atr_mean = float(win['atr'].mean())
     vol_mean = float(win['volume'].mean())
+
+    # --- KÜÇÜK DÜZELTME: konsolidasyonda hacim düşük olmalı ---
     atr_ok = (win['atr'] <= OB_CONS_ATR_THR * atr_mean).mean() >= 0.7
-    vol_ok = (win['volume'] >= OB_CONS_VOL_THR * vol_mean).mean() >= 0.7
-    if not (atr_ok and vol_ok):
-        return False, f"cons_fail atr_ok={atr_ok} vol_ok={vol_ok}"
+    vol_ok_low = (win['volume'] <= OB_CONS_VOL_THR * vol_mean).mean() >= 0.7
+
+    if not (atr_ok and vol_ok_low):
+        return False, f"cons_fail atr_ok={atr_ok} vol_low_ok={vol_ok_low}"
+
     c_last = float(df['close'].iloc[idx_last])
     if side == 'long':
         brk = c_last > float(win['high'].max())
     else:
         brk = c_last < float(win['low'].min())
+
     return bool(brk), f"cons_ok brk={brk}"
-def _ob_rr_ok(df: pd.DataFrame, side: str, z_hi: float, z_lo: float):
-    if z_hi is None or z_lo is None:
-        return False, None, None
-    entry = float(df['close'].iloc[-2])
-    atrv = float(df['atr'].iloc[-2])
-    if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
-        return False, None, None
-    if side == 'long':
-        sl = z_lo - OB_STOP_ATR_BUFFER * atrv
-        R = abs(entry - sl)
-        tp1_r = entry + 1.0 * R
-    else:
-        sl = z_hi + OB_STOP_ATR_BUFFER * atrv
-        R = abs(entry - sl)
-        tp1_r = entry - 1.0 * R
-    if R <= 0 or not np.isfinite(tp1_r):
-        return False, None, None
-    reward = abs(tp1_r - entry)
-    risk = abs(entry - sl)
-    rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
-    return (rr >= OB_MIN_RR), (sl, None, None), (entry, rr)
 def _tighten_fake_filter_range(df: pd.DataFrame, side: str, fk_ok: bool) -> (bool, str):
     """
     Chop'ta ekstra sıkı koşullar: gövde min, fitil max, hacim eşiği, BB yakınlık
     """
     if not fk_ok:
         return False, "ff_base_fail"
-
     last = df.iloc[-2]
     body, up, low = candle_body_wicks(last)
-
     # önerilen sıkı eşikler:
     body_min = max(FF_BODY_MIN, 0.50)
     up_max = min(FF_UPWICK_MAX, 0.30)
     dn_max = min(FF_DNWICK_MAX, 0.30)
     bb_min = max(FF_BB_MIN, 0.30)
-
     bb_prox = _bb_prox(last, side='long' if side == 'long' else 'short')
     body_ok = (body >= body_min)
     wick_ok = (up <= up_max) if side == "long" else (low <= dn_max)
     bb_ok = (bb_prox >= bb_min)
-
     vol_ok_extra = True
     if 'vol_ma' in df.columns:
         vol = float(last['volume']); vol_ma = float(last['vol_ma']) if pd.notna(last['vol_ma']) else np.nan
         if np.isfinite(vol) and np.isfinite(vol_ma) and vol_ma > 0:
             vol_ratio = vol / vol_ma
             vol_ok_extra = vol_ratio >= max(1.10, VOL_MA_RATIO_MIN)
-
     tight_ok = bool(body_ok and wick_ok and bb_ok and vol_ok_extra)
     dbg = f"tight(body={body:.2f}/{body_min}, wick={(up if side=='long' else low):.2f}/{up_max if side=='long' else dn_max}, bb={bb_prox:.2f}/{bb_min}, vol_extra={vol_ok_extra})"
     return tight_ok, dbg
@@ -1238,7 +1319,7 @@ async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol
     adx_trend_ok = False
     ntx_trend_ok = False
 
-    # >>> EKLE: vote_ntx_orig/dyn default'ları (DYNAMIC_MODE kapalıyken hata olmasın)
+    # --- mevcut DYNAMIC init ---
     vote_ntx_orig = bool(vote_ntx)
     vote_ntx_dyn = vote_ntx_orig
     ntx_z_last, ntx_z_slope = float('nan'), float('nan')
@@ -1248,16 +1329,27 @@ async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol
         ntx_thr, ntx_q = compute_ntx_local_thr(df, base_thr=ntx_thr, symbol=symbol)
         adx_trend_ok = rising_ema(df['adx'], win=6, pos_ratio_thr=0.6)[0] or robust_up(df['adx'], win=6, pos_ratio_thr=0.6)[0]
         ntx_trend_ok = rising_ema(df['ntx'], win=5, pos_ratio_thr=0.6)[0] or robust_up(df['ntx'], win=5, pos_ratio_thr=0.6)[0]
-        # ... mevcut DYNAMIC blok aynı, sadece vote_ntx_orig zaten var
 
+    # --- önce momentum'u hesapla ---
+    mom_ok_base, m_dbg = _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime=regime)
+
+    # --- sonra trend ve kaliteyi değerlendir ---
     trend_ok, t_dbg = _trend_ok(df, side, band_k, G3_SLOPE_WIN, G3_SLOPE_THR_PCT)
     quality_ok, q_dbg = _quality_ok(df, side, bear_mode)
 
-    # >>> DEĞİŞ: regime'yi _momentum_ok ve _structure_ok'a geçir
-    mom_ok_base, m_dbg = _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime=regime)
-    structure_ok,  s_dbg = False, "bos_disabled"
-    ok  = mom_ok_base
-    dbg = f"{'bear_mode ' if bear_mode else ''}momentum={mom_ok_base} ({m_dbg}); BOS=disabled"
+    # --- gate'i gerçekten "gate" yap ---
+    ok_base = mom_ok_base and trend_ok and quality_ok
+
+    # BOS kapalıysa şimdilik yapı kontrolü yok
+    structure_ok, s_dbg = False, "bos_disabled"
+
+    ok  = ok_base
+    dbg = (
+        f"{'bear_mode ' if bear_mode else ''}"
+        f"momentum={mom_ok_base} ({m_dbg}); "
+        f"trend={trend_ok} ({t_dbg}); quality={quality_ok} ({q_dbg}); BOS=disabled"
+    )
+
     if DYNAMIC_MODE and VERBOSE_LOG:
         try:
             dbg_payload = {
@@ -1274,6 +1366,7 @@ async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol
         dbg_json = (f"DYNDBG {{band_k:{band_k:.3f}, ntx_thr:{ntx_thr:.1f}, "
                     f"ntx_z_last:{ntx_z_last:.2f}, ntx_z_slope={ntx_z_slope:.2f}}}")
         dbg = f"{dbg} | {dbg_json}"
+
     return ok, dbg
 async def check_signals(symbol: str, timeframe: str = '4h') -> None:
     tz = _safe_tz()
@@ -1312,7 +1405,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"Geçersiz ATR ({symbol} {timeframe}), skip.")
             return
         adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
-        regime = get_regime_bucket(adx_last)  # "strong" | "neutral" | "range"
+        regime = get_regime_bucket(adx_last) # "strong" | "neutral" | "range"
         atr_z = rolling_z(df['atr'], LOOKBACK_ATR) if 'atr' in df else 0.0
         async with _stats_lock:
             trend_prev = signal_cache.get(f"{symbol}_{timeframe}", _default_pos_state()).get('trend_on_prev', False)
@@ -1367,12 +1460,10 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         if regime == "range":
             ob_req_gate = True
             ob_req_smi = True
-
         okL, whyL = await entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
         okS, whyS = await entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
-
-        obL_smi_ok  = (not ob_req_smi)  or (smi_open_green and is_green)
-        obS_smi_ok  = (not ob_req_smi)  or (smi_open_red   and is_red)
+        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
+        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
         obL_gate_ok = (not ob_req_gate) or okL
         obS_gate_ok = (not ob_req_gate) or okS
         obL_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obL_id and (obL_id not in used_set))
@@ -1384,6 +1475,12 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"{symbol} {timeframe} OB_SHORT {obS_ok} | {obS_dbg} | rr_ok={obS_rr_ok} | smi_ok={obS_smi_ok} | gate_ok={obS_gate_ok} | touch_ok={obS_touch_ok} | trend_ok={obS_trend_ok}")
         ob_buy_standalone = USE_OB_STANDALONE and obL_ok and obL_rr_ok and obL_smi_ok and obL_gate_ok and obL_touch_ok and obL_trend_ok
         ob_sell_standalone = USE_OB_STANDALONE and obS_ok and obS_rr_ok and obS_smi_ok and obS_gate_ok and obS_touch_ok and obS_trend_ok
+        # === SQZ Breakout tespiti ===
+        sqzL_ok, sqzL_dbg = is_sqz_breakout(df, side="long", regime=regime, adx_last=adx_last, bear_mode=bear_mode)
+        sqzS_ok, sqzS_dbg = is_sqz_breakout(df, side="short", regime=regime, adx_last=adx_last, bear_mode=bear_mode)
+        if VERBOSE_LOG:
+            logger.debug(f"{symbol} {timeframe} SQZ_LONG {sqzL_ok} | {sqzL_dbg}")
+            logger.debug(f"{symbol} {timeframe} SQZ_SHORT {sqzS_ok} | {sqzS_dbg}")
         if REGIME1_ADX_ADAPTIVE_BAND and np.isfinite(adx_last):
             band_k = 0.20 if adx_last >= 25 else (0.30 if adx_last < 18 else REGIME1_BAND_K_DEFAULT)
         else:
@@ -1440,49 +1537,60 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         allow_short = (cross_dn_1334) or grace_short
         structL, structS = False, False
         entry_price_c = float(df['close'].iloc[-2])
-        classic_buy_rr_ok, b_sl, b_tp1, b_tp2, b_rr = _classic_rr_ok(df, "buy", atr_value, entry_price_c)
-        classic_sell_rr_ok, s_sl, s_tp1, s_tp2, s_rr = _classic_rr_ok(df, "sell", atr_value, entry_price_c)
+        b_sl = _classic_sl_only(df, "buy", atr_value, entry_price_c)
+        s_sl = _classic_sl_only(df, "sell", atr_value, entry_price_c)
         dip_gate_ok = True
         top_gate_ok = True
         if regime == "range":
-            dip_gate_ok = bool(dip_ok)   # long için AND
-            top_gate_ok = bool(top_ok)   # short için AND
-        buy_classic = (allow_long  and smi_open_green and is_green and okL and classic_buy_rr_ok and dip_gate_ok)
-        sell_classic = (allow_short and smi_open_red   and is_red   and okS and classic_sell_rr_ok and top_gate_ok)
-        buy_condition = bool(buy_classic or ob_buy_standalone)
-        sell_condition = bool(sell_classic or ob_sell_standalone)
+            dip_gate_ok = bool(dip_ok) # long için AND
+            top_gate_ok = bool(top_ok) # short için AND
+        # --- EMA Classic gate (EMA Cross/Grace + kalite + trend bandı + RR) ---
+        buy_classic = (
+            allow_long and smi_open_green and is_green and okL and
+            fk_ok_L and long_band_ok and (pct_slope > slope_thr)
+        )
+        sell_classic = (
+            allow_short and smi_open_red and is_red and okS and
+            fk_ok_S and short_band_ok and (pct_slope < -slope_thr)
+        )
+        # === ÖNCELİK: OB > SQZ > EMA ===
+        # 1) OB standalone
+        buy_ob = ob_buy_standalone
+        sell_ob = ob_sell_standalone
+        # 2) SQZ Breakout
+        buy_sqz = (not buy_ob) and sqzL_ok
+        sell_sqz = (not sell_ob) and sqzS_ok
+        # 3) EMA Cross/Grace (classic)
+        buy_ema = (not buy_ob) and (not buy_sqz) and buy_classic
+        sell_ema = (not sell_ob) and (not sell_sqz) and sell_classic
+        buy_condition = bool(buy_ob or buy_sqz or buy_ema)
+        sell_condition = bool(sell_ob or sell_sqz or sell_ema)
         if VERBOSE_LOG:
-            if allow_long and smi_open_green and is_green and okL and not classic_buy_rr_ok:
-                logger.debug(f"{symbol} {timeframe}: RR={b_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (buy_classic)")
-            if allow_short and smi_open_red and is_red and okS and not classic_sell_rr_ok:
-                logger.debug(f"{symbol} {timeframe}: RR={s_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (sell_classic)")
+            if allow_long and smi_open_green and is_green and okL:
+                logger.debug(f"{symbol} {timeframe}: EMA classic BUY geçer")
+            if allow_short and smi_open_red and is_red and okS:
+                logger.debug(f"{symbol} {timeframe}: EMA classic SELL geçer")
             if obL_ok and not obL_rr_ok and obL_entry_rr:
                 logger.debug(f"{symbol} {timeframe}: RR={obL_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_buy_standalone)")
             if obS_ok and not obS_rr_ok and obS_entry_rr:
                 logger.debug(f"{symbol} {timeframe}: RR={obS_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_sell_standalone)")
-        reason = ""
+        # === Mesajdaki "Sebep" sade: sadece üç etiketten biri ===
         if buy_condition:
-            if ob_buy_standalone:
-                reason = f"Order Block (RR={obL_entry_rr[1]:.2f})"
-                if OB_REQUIRE_SMI:
-                    reason += " + SMI"
-                if OB_REQUIRE_G3_GATE:
-                    reason += " + G3"
-                if OB_TREND_FILTER and obL_trend_ok:
-                    reason += " 🟢 Trend"
+            if buy_ob:
+                reason = "Order Block"
+            elif buy_sqz:
+                reason = "SQZ Breakout"
             else:
-                reason = f"EMA Cross/Grace (RR={b_rr:.2f})"
+                reason = "EMA Cross/Grace"
         elif sell_condition:
-            if ob_sell_standalone:
-                reason = f"Order Block (RR={obS_entry_rr[1]:.2f})"
-                if OB_REQUIRE_SMI:
-                    reason += " + SMI"
-                if OB_REQUIRE_G3_GATE:
-                    reason += " + G3"
-                if OB_TREND_FILTER and obS_trend_ok:
-                    reason += " 🟢 Trend"
+            if sell_ob:
+                reason = "Order Block"
+            elif sell_sqz:
+                reason = "SQZ Breakout"
             else:
-                reason = f"EMA Cross/Grace (RR={s_rr:.2f})"
+                reason = "EMA Cross/Grace"
+        else:
+            reason = "N/A"
         if VERBOSE_LOG and (buy_condition or sell_condition):
             logger.debug(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
@@ -1504,10 +1612,10 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             ("allow_short", allow_short),
             ("order_block_long", obL_ok),
             ("order_block_short", obS_ok),
-            ("classic_buy_rr_ok", classic_buy_rr_ok),
-            ("classic_sell_rr_ok", classic_sell_rr_ok),
             ("ob_buy_trend_ok", obL_trend_ok),
             ("ob_sell_trend_ok", obS_trend_ok),
+            ("sqz_long", sqzL_ok),
+            ("sqz_short", sqzS_ok),
         ]
         await record_crit_batch(criteria)
         if buy_condition and sell_condition:
@@ -1515,8 +1623,8 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             buy_score = _score_side("buy", okL, structL, adx_last, ntx_last, fk_ok_L)
             sell_score = _score_side("sell", okS, structS, adx_last, ntx_last, fk_ok_S)
             if regime == "neutral":
-                if dip_ok:  buy_score  += 1
-                if top_ok:  sell_score += 1
+                if dip_ok: buy_score += 1
+                if top_ok: sell_score += 1
             if buy_score != sell_score:
                 prefer = "buy" if buy_score > sell_score else "sell"
                 buy_condition = (prefer == "buy")
@@ -1582,7 +1690,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     if obL_low is not None:
                         sl_price = min(sl_price, obL_low - OB_STOP_ATR_BUFFER * atr_value)
                 else:
-                    sl_price = b_sl
+                    sl_price = _classic_sl_only(df, "buy", atr_value, entry_price)
                 R = abs(entry_price - sl_price)
                 mode = regime_mode_from_adx(adx_last)
                 plan = r_tp_plan(mode=mode, is_ob=ob_buy_standalone, R=R)
@@ -1643,16 +1751,11 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     st.update(current_pos if 'current_pos' in locals() else {})
                     st['used_ob_ids'] = set(used_set)
                     signal_cache[cur_key] = st
-                plan_tag = plan['desc']
-                msg_reason = ("Order Block" if ob_buy_standalone else build_reason_text(
-                    "buy", cross_up_1334, cross_dn_1334, grace_long, grace_short,
-                    structL, structS, obL_ok, obS_ok, False, False
-                ))
                 await enqueue_message(
                     format_signal_msg(symbol, timeframe, "buy",
                                       entry_price, sl_price,
-                                      tp1_price, (tp2_price if tp2_price is not None else tp1_price),
-                                      reason_line=msg_reason, tz_name=DEFAULT_TZ)
+                                      tp1_price, tp2_price,
+                                      reason_line=reason, tz_name=DEFAULT_TZ)
                 )
                 save_state()
         elif sell_condition and current_pos['signal'] != 'sell':
@@ -1672,7 +1775,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     if obS_high is not None:
                         sl_price = max(sl_price, obS_high + OB_STOP_ATR_BUFFER * atr_value)
                 else:
-                    sl_price = s_sl
+                    sl_price = _classic_sl_only(df, "sell", atr_value, entry_price)
                 R = abs(entry_price - sl_price)
                 mode = regime_mode_from_adx(adx_last)
                 plan = r_tp_plan(mode=mode, is_ob=ob_sell_standalone, R=R)
@@ -1733,16 +1836,11 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     st.update(current_pos if 'current_pos' in locals() else {})
                     st['used_ob_ids'] = set(used_set)
                     signal_cache[cur_key] = st
-                plan_tag = plan['desc']
-                msg_reason = ("Order Block" if ob_sell_standalone else build_reason_text(
-                    "sell", cross_up_1334, cross_dn_1334, grace_long, grace_short,
-                    structL, structS, obL_ok, obS_ok, False, False
-                ))
                 await enqueue_message(
                     format_signal_msg(symbol, timeframe, "sell",
                                       entry_price, sl_price,
-                                      tp1_price, (tp2_price if tp2_price is not None else tp1_price),
-                                      reason_line=msg_reason, tz_name=DEFAULT_TZ)
+                                      tp1_price, tp2_price,
+                                      reason_line=reason, tz_name=DEFAULT_TZ)
                 )
                 save_state()
         if current_pos['signal'] == 'buy':
@@ -1882,7 +1980,7 @@ _stop = asyncio.Event()
 def _handle_stop():
     _stop.set()
 async def main():
-    loop = asyncio.get_running_loop()
+    loop = asyncio.get_event_loop()
     try:
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, _handle_stop)
