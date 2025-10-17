@@ -112,20 +112,33 @@ SQZ_MOM_SLOPE_WIN = 2 # lb_sqz_val eğim kontrolü için kısa pencere
 SQZ_RANGE_REQUIRE_RETEST = True # range'de retest iste
 SQZ_RETEST_MAX_BARS = 3 # off sonrası kaç bar içinde retest kabul
 # ====== ORDER BLOCK (OB) Ayarları ======
+# ====== ORDER BLOCK (OB) – SIKI PROFİL ======
+ONLY_OB_MODE = True          # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
 USE_OB_STANDALONE = True
-OB_REQUIRE_SMI = False
-OB_REQUIRE_G3_GATE = False
 OB_MIN_RR = 1.0
-OB_FIRST_TOUCH_ONLY = True
+
+# Zorunlu teyitler
+OB_REQUIRE_SMI = True        # SMI yön teyidi
+OB_REQUIRE_G3_GATE = True    # Gate + kalite + trend iç teyidi
+OB_TREND_FILTER = True       # ADX≥23 + EMA89 bandı
+
+# OB yapısal kurallar
 OB_LOOKBACK = 30
-OB_DISPLACEMENT_ATR = 1.25
+OB_DISPLACEMENT_ATR = 1.50   # displacement bar TR >= 1.5*ATR
 OB_BODY_RATIO_MIN = 0.60
-OB_RETEST_REQUIRED = False
+OB_FIRST_TOUCH_ONLY = True
+
+# Retest (first-touch rejection)
+OB_RETEST_REQUIRED = True
+OB_RETEST_MAX_BARS = 3
 OB_STOP_ATR_BUFFER = 0.10
-OB_HYBRID = False
+
+# Retest fallback eşiği (OB_HYBRID True ise)
 OB_CONS_ATR_THR = 0.50
 OB_CONS_VOL_THR = 1.80
-OB_TREND_FILTER = True
+
+# R/ATR alt sınırı (OB için)
+OB_MIN_R_OVER_ATR = 0.80     # 0.8–1.0 arası sıkı
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -168,6 +181,8 @@ DIPTEPE_A_LOOKBACK = 50
 STRONG_TREND_ADX = 28 # 13/34 kesişimi için opsiyonel teyit sınırı
 # ==== Zaman dilimi sabiti ====
 DEFAULT_TZ = os.getenv("BOT_TZ", "Europe/Istanbul")
+# --- Messaging prefs ---
+SEND_REJECT_MSG = False   # reddedildi mesajları ASLA gönderilmesin
 # --- MINIMAL RUNTIME PATCH (paste near the top) ---
 # Telegram mesaj flood’u için basit throttle ve state kaydı debounce
 MESSAGE_THROTTLE_SECS = 20.0
@@ -436,7 +451,7 @@ def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: f
     r_over_atr = R / atr
     # Rejim bazlı minimumlar
     if is_ob:
-        r_min = 0.60
+        r_min = 0.80
     else:
         if mode == "trend":
             r_min = 1.00
@@ -1152,11 +1167,32 @@ def _displacement_candle_ok(df: pd.DataFrame, i: int, side: str) -> bool:
     body = abs(float(row['close'] - row['open']))
     body_ratio = body / rng
     tr = _true_range(row)
-    disp_ok = (tr >= OB_DISPLACEMENT_ATR * float(row['atr'])) and (body_ratio >= OB_BODY_RATIO_MIN)
-    if side == 'long':
-        return disp_ok and (float(row['close']) > float(row['open']))
-    else:
-        return disp_ok and (float(row['close']) < float(row['open']))
+
+    # 1) Güç ve gövde oranı
+    if not (tr >= OB_DISPLACEMENT_ATR * float(row['atr']) and body_ratio >= OB_BODY_RATIO_MIN):
+        return False
+
+    # 2) Mum rengi yönle uyumlu
+    if side == 'long' and not (row['close'] > row['open']):
+        return False
+    if side == 'short' and not (row['close'] < row['open']):
+        return False
+
+    # 3) Likidite süpürme (önceki mumun high/low)
+    if not _swept_prev_liquidity(df, i, side):
+        return False
+
+    return True
+def _swept_prev_liquidity(df: pd.DataFrame, i: int, side: str) -> bool:
+    """Displacement mumunun bir önceki mumun likiditesini süpürmesi şartı."""
+    if i-1 < 0: 
+        return False
+    prev_h = float(df['high'].iloc[i-1]); prev_l = float(df['low'].iloc[i-1])
+    this_h = float(df['high'].iloc[i]);   this_l = float(df['low'].iloc[i])
+    if side == 'long':   # Buy OB: önceki low süpürmülsün
+        return np.isfinite(this_l) and np.isfinite(prev_l) and (this_l < prev_l)
+    else:                # Sell OB: önceki high süpürmülsün
+        return np.isfinite(this_h) and np.isfinite(prev_h) and (this_h > prev_h)
 def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR, confirm_bars=G3_BOS_CONFIRM_BARS):
     sh, sl = _last_swing_levels(df)
     if sh is None and sl is None: 
@@ -1280,32 +1316,30 @@ def _zone_too_wide(z_high: float, z_low: float, atrv: float, max_atr_mult: float
     return (abs(z_high - z_low) > max_atr_mult * atrv)
 def _ob_rr_ok(df: pd.DataFrame, side: str, z_high: float | None, z_low: float | None):
     """
-    OB bölgesi için basit RR kontrolü.
-    - entry: son kapanış (close[-2])
-    - stop: long -> zone_low - buffer*ATR, short -> zone_high + buffer*ATR
-    - rr: OB planında TP1=1R kabul edildiği için asgari 1.0 baz alınır (r_tp_plan is_ob=True -> tp1_mult=1.0).
-    Dönenler:
-      ok(bool), (sl_price, None, None), (entry, rr)
+    OB bölgesi için RR kontrolü:
+      - entry : close[-2]
+      - stop  : long -> zone_low - buf*ATR; short -> zone_high + buf*ATR
+      - şart  : R/ATR ≥ OB_MIN_R_OVER_ATR (örn 0.80)
     """
     if z_high is None or z_low is None or 'atr' not in df.columns or len(df) < 3:
         return False, None, None
     entry = float(df['close'].iloc[-2])
-    atrv = float(df['atr'].iloc[-2])
+    atrv  = float(df['atr'].iloc[-2])
     if not (np.isfinite(entry) and np.isfinite(atrv) and atrv > 0):
         return False, None, None
     buf = OB_STOP_ATR_BUFFER * atrv
     if side == "long":
         sl_price = float(z_low) - buf
-        R = abs(entry - sl_price)
     else:
         sl_price = float(z_high) + buf
-        R = abs(entry - sl_price)
+    R = abs(entry - sl_price)
     if not np.isfinite(R) or R <= 0:
         return False, None, None
-    # OB için baz RR = 1.0 (TP1=1R). İstersen burada daha sıkı kural koyabilirsin.
-    rr = 1.0
-    ok = (rr >= OB_MIN_RR)
-    return ok, (sl_price, None, None), (entry, rr)
+    r_over_atr = R / atrv
+    if r_over_atr < OB_MIN_R_OVER_ATR:
+        return False, None, None
+    # OB planında TP1=1.0R; min RR kontrolünü ayrıca tutmak istersen:
+    return True, (sl_price, None, None), (entry, 1.0)
 def _order_block_cons_fallback(df: pd.DataFrame, side: str, lookback=10) -> (bool, str):
     if not OB_HYBRID:
         return False, "hybrid_off"
@@ -1514,6 +1548,16 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         smi_open_red = smi_negative and smi_down
         is_green = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] > df['open'].iloc[-2]))
         is_red = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] < df['open'].iloc[-2]))
+        okL, dbg_gateL = await entry_gate_v3(df, side="long",  adx_last=adx_last,
+                                     vote_ntx=vote_ntx, ntx_thr=ntx_thr,
+                                     bear_mode=bear_mode, symbol=symbol, regime=regime)
+
+okS, dbg_gateS = await entry_gate_v3(df, side="short", adx_last=adx_last,
+                                     vote_ntx=vote_ntx, ntx_thr=ntx_thr,
+                                     bear_mode=bear_mode, symbol=symbol, regime=regime)
+        # OB isteklerine karşılık alias (NameError fix)
+        ob_req_smi  = OB_REQUIRE_SMI
+        ob_req_gate = OB_REQUIRE_G3_GATE
         obL_ok, obL_dbg, obL_high, obL_low, obL_id = _find_displacement_ob(df, side="long")
         obS_ok, obS_dbg, obS_high, obS_low, obS_id = _find_displacement_ob(df, side="short")
         if OB_HYBRID and not obL_ok:
@@ -1528,10 +1572,13 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         obS_rr_ok, obS_prices, obS_entry_rr = _ob_rr_ok(df, "short", obS_high, obS_low)
         obL_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "long")
         obS_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "short")
-        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
-        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
-        obL_gate_ok = (not ob_req_gate) or okL
-        obS_gate_ok = (not ob_req_gate) or okS
+        # SMI teyidi
+        obL_smi_ok = (not ob_req_smi)  or (smi_open_green and is_green)
+        obS_smi_ok = (not ob_req_smi)  or (smi_open_red   and is_red)
+
+# G3 Gate teyidi
+obL_gate_ok = (not ob_req_gate) or okL
+obS_gate_ok = (not ob_req_gate) or okS
         obL_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obL_id and (obL_id not in used_set))
         obS_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obS_id and (obS_id not in used_set))
         if VERBOSE_LOG:
