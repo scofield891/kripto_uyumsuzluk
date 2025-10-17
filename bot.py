@@ -422,21 +422,38 @@ def r_tp_plan(mode: str, is_ob: bool, R: float) -> dict:
         return dict(tp1_mult=1.0, tp2_mult=2.0, tp1_pct=0.30, tp2_pct=0.30, rest_pct=0.40, desc="trend")
     # range
     return dict(tp1_mult=0.8, tp2_mult=1.2, tp1_pct=0.40, tp2_pct=0.30, rest_pct=0.30, desc="range")
-def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float) -> (bool, str):
+def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float, *, is_ob: bool = False) -> (bool, str):
+    """
+    RR guard: R/ATR eşiği ve minimal TP1 gap kontrolü.
+    - Trend:  R/ATR >= 1.0
+    - Range:  R/ATR >= 0.9
+    - OB:     R/ATR >= 0.6  (OB'lerde SL çoğu zaman dar)
+    Not: TP1_gap>=…*ATR kontrolü matematiksel olarak R>=ATR'a indirgeniyordu; onu kaldırıp sadece R/ATR eşiklerine baktık.
+    """
+    # NaN guard
     if not all(map(np.isfinite, [R, atr, entry, tp1_price])) or atr <= 0 or R <= 0:
         return False, "nan"
+
     r_over_atr = R / atr
-    if mode == "trend":
-        r_cap = R_MAX_ATR_MULT_TREND
-        min_gap = TP1_MIN_ATR_GAP_TREND * atr
+
+    # Rejim bazlı minimumlar
+    if is_ob:
+        r_min = 0.60
     else:
-        r_cap = R_MAX_ATR_MULT_RANGE
-        min_gap = TP1_MIN_ATR_GAP_RANGE * atr
-    if r_over_atr > r_cap:
-        return False, f"R/ATR>{r_cap:.2f}"
+        if mode == "trend":
+            r_min = 1.00
+        else:
+            r_min = 0.90
+
+    if r_over_atr < r_min:
+        return False, f"R/ATR<{r_min:.2f} (got {r_over_atr:.2f})"
+
+    # Debug amaçlı bilgi: tp1 gap'ini yine hesapla ama reddetme sebebi yapma
     gap = abs(tp1_price - entry)
-    if gap < min_gap:
-        return False, f"TP1_gap<{min_gap/atr:.2f}*ATR"
+    gap_over_atr = gap / atr
+    # İstersen VERBOSE_LOG ile logger.debug(...) atabilirsin:
+    # logger.debug(f"GUARD OK: mode={mode} is_ob={is_ob} R/ATR={r_over_atr:.2f} TP1_gap/ATR={gap_over_atr:.2f}")
+
     return True, "ok"
 def apply_split_to_state(state: dict, plan: dict):
     state['tp1_pct'] = plan['tp1_pct']
@@ -1714,7 +1731,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 tp1_price = entry_price + plan['tp1_mult'] * R
                 tp2_price = (entry_price + plan['tp2_mult'] * R) if plan['tp2_mult'] else None
                 ok_guard, why_guard = r_plan_guards_ok(
-                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price
+                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, is_ob=ob_buy_standalone
                 )
                 if not ok_guard:
                     if VERBOSE_LOG:
@@ -1799,7 +1816,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 tp1_price = entry_price - plan['tp1_mult'] * R
                 tp2_price = (entry_price - plan['tp2_mult'] * R) if plan['tp2_mult'] else None
                 ok_guard, why_guard = r_plan_guards_ok(
-                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price
+                    mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, is_ob=ob_sell_standalone
                 )
                 if not ok_guard:
                     if VERBOSE_LOG:
