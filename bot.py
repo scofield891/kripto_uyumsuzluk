@@ -425,17 +425,15 @@ def r_tp_plan(mode: str, is_ob: bool, R: float) -> dict:
 def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: float, *, is_ob: bool = False) -> (bool, str):
     """
     RR guard: R/ATR eşiği ve minimal TP1 gap kontrolü.
-    - Trend:  R/ATR >= 1.0
-    - Range:  R/ATR >= 0.9
-    - OB:     R/ATR >= 0.6  (OB'lerde SL çoğu zaman dar)
+    - Trend: R/ATR >= 1.0
+    - Range: R/ATR >= 0.9
+    - OB: R/ATR >= 0.6 (OB'lerde SL çoğu zaman dar)
     Not: TP1_gap>=…*ATR kontrolü matematiksel olarak R>=ATR'a indirgeniyordu; onu kaldırıp sadece R/ATR eşiklerine baktık.
     """
     # NaN guard
     if not all(map(np.isfinite, [R, atr, entry, tp1_price])) or atr <= 0 or R <= 0:
         return False, "nan"
-
     r_over_atr = R / atr
-
     # Rejim bazlı minimumlar
     if is_ob:
         r_min = 0.60
@@ -444,16 +442,13 @@ def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: f
             r_min = 1.00
         else:
             r_min = 0.90
-
     if r_over_atr < r_min:
         return False, f"R/ATR<{r_min:.2f} (got {r_over_atr:.2f})"
-
     # Debug amaçlı bilgi: tp1 gap'ini yine hesapla ama reddetme sebebi yapma
     gap = abs(tp1_price - entry)
     gap_over_atr = gap / atr
     # İstersen VERBOSE_LOG ile logger.debug(...) atabilirsin:
     # logger.debug(f"GUARD OK: mode={mode} is_ob={is_ob} R/ATR={r_over_atr:.2f} TP1_gap/ATR={gap_over_atr:.2f}")
-
     return True, "ok"
 def apply_split_to_state(state: dict, plan: dict):
     state['tp1_pct'] = plan['tp1_pct']
@@ -992,24 +987,21 @@ def _classic_rr_ok(df, side: str, atrv: float, entry: float,
     import numpy as np
     if not (np.isfinite(entry) and np.isfinite(atrv) and atrv > 0):
         return False, None, None, None, None
-
     TP1_DEF, TP2_DEF = 1.0, 2.0
     # global’ler sayı değilse (None dâhil) varsayılanı kullan
     if tp1_mult is None:
         tp1_mult = (TP_MULTIPLIER1 if isinstance(TP_MULTIPLIER1, (int, float)) else TP1_DEF)
     if tp2_mult is None:
         tp2_mult = (TP_MULTIPLIER2 if isinstance(TP_MULTIPLIER2, (int, float)) else TP2_DEF)
-
     sl_abs = (SL_MULTIPLIER + SL_BUFFER) * atrv
     if side == "buy":
-        sl  = entry - sl_abs
+        sl = entry - sl_abs
         tp1 = entry + (tp1_mult * atrv)
         tp2 = entry + (tp2_mult * atrv) if tp2_mult is not None else None
     else:
-        sl  = entry + sl_abs
+        sl = entry + sl_abs
         tp1 = entry - (tp1_mult * atrv)
         tp2 = entry - (tp2_mult * atrv) if tp2_mult is not None else None
-
     risk = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
@@ -1087,6 +1079,8 @@ def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
     return (band_ok and slope_ok), f"band={band_ok},slope={pct_slope*100:.2f}%"
 def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
+    if not np.isfinite(adx_last) or adx_last < 23:  # ADX≥23
+        return False
     band_k = compute_dynamic_band_k(df, adx_last)
     c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
     if not all(map(np.isfinite, [c2, e89, atr2])):
@@ -1148,8 +1142,8 @@ def _ensure_prev_close(df: pd.DataFrame) -> pd.DataFrame:
     if 'close_prev' not in df.columns:
         df['close_prev'] = df['close'].shift(1)
     return df
-def _displacement_candle_ok(df: pd.DataFrame, idx: int, side: str) -> bool:
-    row = df.iloc[idx]
+def _displacement_candle_ok(df: pd.DataFrame, i: int, side: str) -> bool:
+    row = df.iloc[i]
     if not np.isfinite(row.get('atr', np.nan)):
         return False
     rng = float(row['high'] - row['low'])
@@ -1163,17 +1157,20 @@ def _displacement_candle_ok(df: pd.DataFrame, idx: int, side: str) -> bool:
         return disp_ok and (float(row['close']) > float(row['open']))
     else:
         return disp_ok and (float(row['close']) < float(row['open']))
-def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR):
-    # swing seviyesini kullan
+def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR, confirm_bars=G3_BOS_CONFIRM_BARS):
     sh, sl = _last_swing_levels(df)
-    atr = df['atr']
-    closes = df['close']
+    if sh is None and sl is None: 
+        return False
+    rng = df.iloc[disp_idx+1 : disp_idx+1+max(1, confirm_bars)]
+    if rng.empty: 
+        return False
+    atr_ref = float(df['atr'].iloc[disp_idx]) if pd.notna(df['atr'].iloc[disp_idx]) else 0.0
     if side == 'long' and sh is not None:
-        lvl = sh + min_break_atr * atr.iloc[disp_idx]
-        return closes.iloc[disp_idx] > lvl
+        lvl = sh + min_break_atr * atr_ref
+        return bool((rng['close'] > lvl).any())
     if side == 'short' and sl is not None:
-        lvl = sl - min_break_atr * atr.iloc[disp_idx]
-        return closes.iloc[disp_idx] < lvl
+        lvl = sl - min_break_atr * atr_ref
+        return bool((rng['close'] < lvl).any())
     return False
 def _has_imbalance_next(df, side, k):
     rng = df.iloc[k+1:k+3]
@@ -1206,39 +1203,81 @@ def _last_opposite_body_zone(df: pd.DataFrame, disp_idx: int, side: str):
 def _ob_first_touch_reject(df: pd.DataFrame, idx_last: int, side: str, z_high: float, z_low: float) -> bool:
     bar = df.iloc[idx_last]
     o, h, l, c = map(float, (bar['open'], bar['high'], bar['low'], bar['close']))
+    touched = (l <= z_high and h >= z_low) if side=='long' else (h >= z_low and l <= z_high)
+    if not touched:
+        return False
+    # reject: zone’dan uzak yönde kapanış + kapanış zone içinde değil
     if side == 'long':
-        touched = (l <= z_high) and (h >= z_low)
-        reject = (c > o) and (c > z_high)
-        return bool(touched and reject)
+        return (c > o) and (c > z_high)
     else:
-        touched = (h >= z_low) and (l <= z_high)
-        reject = (c < o) and (c < z_low)
-        return bool(touched and reject)
+        return (c < o) and (c < z_low)
 def _find_displacement_ob(df: pd.DataFrame, side: str):
-    if len(df) < max(OB_LOOKBACK+5, 50) or 'atr' not in df.columns:
+    if len(df) < max(OB_LOOKBACK+5, 60) or 'atr' not in df.columns:
         return False, "ob_data_short", None, None, None
+
     df = _ensure_prev_close(df)
     idx_last = len(df) - 2
-    for k in range(idx_last-1, max(idx_last-OB_LOOKBACK, 1), -1):
-        if _displacement_candle_ok(df, k, side):
-            if not _bos_after_displacement(df, side, k): # k: disp bar index
+    atr_series = df['atr']
+
+    for k in range(idx_last-2, max(idx_last-OB_LOOKBACK, 2), -1):
+        # 1) Güçlü displacement + gövde oranı
+        if not _displacement_candle_ok(df, k, side):
+            continue
+
+        # 2) Displacement SONRASI FVG var mı?
+        if not _has_fvg_after(df, k, side):
+            continue
+
+        # 3) BOS onayı (k’dan sonra)
+        if not _bos_after_displacement(df, side, k):
+            continue
+
+        # 4) Zone: displacement’tan önceki son karşıt gövdeli mum
+        z_high, z_low, opp_idx = _last_opposite_body_zone(df, k, side)
+        if z_high is None:
+            continue
+
+        # 5) Zone genişliğini sınırla (too wide -> çöp)
+        atrv_k = float(atr_series.iloc[k]) if pd.notna(atr_series.iloc[k]) else np.nan
+        if _zone_too_wide(z_high, z_low, atrv_k, max_atr_mult=0.60):
+            continue
+
+        # 6) Retest şartı: son bar (idx_last) zone’a dokunup zıt yönde net kapanış (reject)
+        if not _ob_first_touch_reject(df, idx_last, side, z_high, z_low):
+            continue
+
+        # 7) İlk dokunuş (mitigation) kontrolü
+        if OB_FIRST_TOUCH_ONLY:
+            # zone’a daha önce bar dokunmuş mu?
+            post = df.iloc[k+1:idx_last]   # retest barından önce
+            if side == 'long' and ((post['low'] <= z_high) & (post['high'] >= z_low)).any():
                 continue
-            if not _has_imbalance_next(df, side, k):
+            if side == 'short' and ((post['high'] >= z_low) & (post['low'] <= z_high)).any():
                 continue
-            z_high, z_low, opp_idx = _last_opposite_body_zone(df, k, side)
-            if z_high is None:
-                continue
-            if OB_RETEST_REQUIRED:
-                post = df.iloc[k+1:idx_last+1]
-                if side == 'long' and not (post['low'] <= z_high).any():
-                    continue
-                if side == 'short' and not (post['high'] >= z_low).any():
-                    continue
-            if _ob_first_touch_reject(df, idx_last, side, z_high, z_low):
-                ob_id = f"{int(df.index[k].value)}_{side}_{round(z_high,6)}_{round(z_low,6)}"
-                dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}]"
-                return True, dbg, z_high, z_low, ob_id
-    return False, "no_displacement_ob", None, None, None
+
+        ob_id = f"{int(df.index[k].value)}_{side}_{round(z_high,6)}_{round(z_low,6)}"
+        dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}] FVG+BOS+retest+first_touch"
+        return True, dbg, z_high, z_low, ob_id
+
+    return False, "no_strict_ob", None, None, None
+def _has_fvg_after(df: pd.DataFrame, k: int, side: str) -> bool:
+    """
+    Displacement barı k; FVG (imbalance) k ve k+1 arasında oluşmalı.
+    Long: low[k+1] > high[k-1]
+    Short: high[k+1] < low[k-1]
+    """
+    if k-1 < 0 or k+1 >= len(df):
+        return False
+    h_prev = float(df['high'].iloc[k-1]); l_prev = float(df['low'].iloc[k-1])
+    h_next = float(df['high'].iloc[k+1]); l_next = float(df['low'].iloc[k+1])
+    if side == 'long':
+        return np.isfinite(l_next) and np.isfinite(h_prev) and (l_next > h_prev)
+    else:
+        return np.isfinite(h_next) and np.isfinite(l_prev) and (h_next < l_prev)
+def _zone_too_wide(z_high: float, z_low: float, atrv: float, max_atr_mult: float = 0.60) -> bool:
+    if not all(map(np.isfinite, [z_high, z_low, atrv])) or atrv <= 0:
+        return True
+    return (abs(z_high - z_low) > max_atr_mult * atrv)
 def _ob_rr_ok(df: pd.DataFrame, side: str, z_high: float | None, z_low: float | None):
     """
     OB bölgesi için basit RR kontrolü.
@@ -1489,13 +1528,6 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         obS_rr_ok, obS_prices, obS_entry_rr = _ob_rr_ok(df, "short", obS_high, obS_low)
         obL_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "long")
         obS_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "short")
-        ob_req_gate = OB_REQUIRE_G3_GATE
-        ob_req_smi = OB_REQUIRE_SMI
-        if regime == "range":
-            ob_req_gate = True
-            ob_req_smi = True
-        okL, whyL = await entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
-        okS, whyS = await entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
         obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
         obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
         obL_gate_ok = (not ob_req_gate) or okL
@@ -1597,34 +1629,29 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         # 3) EMA Cross/Grace (classic)
         buy_ema = (not buy_ob) and (not buy_sqz) and buy_classic
         sell_ema = (not sell_ob) and (not sell_sqz) and sell_classic
-        buy_condition = bool(buy_ob or buy_sqz or buy_ema)
-        sell_condition = bool(sell_ob or sell_sqz or sell_ema)
-        if VERBOSE_LOG:
-            if allow_long and smi_open_green and is_green and okL:
-                logger.debug(f"{symbol} {timeframe}: EMA classic BUY geçer")
-            if allow_short and smi_open_red and is_red and okS:
-                logger.debug(f"{symbol} {timeframe}: EMA classic SELL geçer")
-            if obL_ok and not obL_rr_ok and obL_entry_rr:
-                logger.debug(f"{symbol} {timeframe}: RR={obL_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_buy_standalone)")
-            if obS_ok and not obS_rr_ok and obS_entry_rr:
-                logger.debug(f"{symbol} {timeframe}: RR={obS_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_sell_standalone)")
-        # === Mesajdaki "Sebep" sade: sadece üç etiketten biri ===
-        if buy_condition:
-            if buy_ob:
-                reason = "Order Block"
-            elif buy_sqz:
-                reason = "SQZ Breakout"
-            else:
-                reason = "EMA Cross/Grace"
-        elif sell_condition:
-            if sell_ob:
-                reason = "Order Block"
-            elif sell_sqz:
-                reason = "SQZ Breakout"
-            else:
-                reason = "EMA Cross/Grace"
+        if ONLY_OB_MODE:
+            buy_condition  = ob_buy_standalone
+            sell_condition = ob_sell_standalone
+            reason = "Order Block" if (buy_condition or sell_condition) else "N/A"
         else:
-            reason = "N/A"
+            buy_condition = bool(buy_ob or buy_sqz or buy_ema)
+            sell_condition = bool(sell_ob or sell_sqz or sell_ema)
+            if buy_condition:
+                if buy_ob:
+                    reason = "Order Block"
+                elif buy_sqz:
+                    reason = "SQZ Breakout"
+                else:
+                    reason = "EMA Cross/Grace"
+            elif sell_condition:
+                if sell_ob:
+                    reason = "Order Block"
+                elif sell_sqz:
+                    reason = "SQZ Breakout"
+                else:
+                    reason = "EMA Cross/Grace"
+            else:
+                reason = "N/A"
         if VERBOSE_LOG and (buy_condition or sell_condition):
             logger.debug(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
@@ -1733,10 +1760,12 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 ok_guard, why_guard = r_plan_guards_ok(
                     mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, is_ob=ob_buy_standalone
                 )
+                # BUY guard fail bloğu
                 if not ok_guard:
                     if VERBOSE_LOG:
                         logger.debug(f"{symbol} {timeframe}: BUY guard fail: {why_guard}")
-                        await enqueue_message(f"{symbol} {timeframe}: BUY reddedildi (guard: {why_guard})")
+                        if SEND_REJECT_MSG:
+                            await enqueue_message(f"{symbol} {timeframe}: BUY reddedildi (guard: {why_guard})")
                     await mark_status(symbol, "skip", f"r_guard_fail: {why_guard}")
                     return
                 if not (np.isfinite(entry_price) and np.isfinite(sl_price) and np.isfinite(atr_value)):
@@ -1818,10 +1847,12 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 ok_guard, why_guard = r_plan_guards_ok(
                     mode=mode, R=R, atr=atr_value, entry=entry_price, tp1_price=tp1_price, is_ob=ob_sell_standalone
                 )
+                # SELL guard fail bloğu
                 if not ok_guard:
                     if VERBOSE_LOG:
                         logger.debug(f"{symbol} {timeframe}: SELL guard fail: {why_guard}")
-                        await enqueue_message(f"{symbol} {timeframe}: SELL reddedildi (guard: {why_guard})")
+                        if SEND_REJECT_MSG:
+                            await enqueue_message(f"{symbol} {timeframe}: SELL reddedildi (guard: {why_guard})")
                     await mark_status(symbol, "skip", f"r_guard_fail: {why_guard}")
                     return
                 if not (np.isfinite(entry_price) and np.isfinite(sl_price) and np.isfinite(atr_value)):
