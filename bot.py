@@ -34,6 +34,9 @@ LOOKBACK_ATR = 18
 SL_MULTIPLIER = 1.4
 TP_MULTIPLIER1 = None
 TP_MULTIPLIER2 = None
+# Güvenli defaults
+TP_MULTIPLIER1 = 1.0 if 'TP_MULTIPLIER1' not in globals() or TP_MULTIPLIER1 is None else TP_MULTIPLIER1
+TP_MULTIPLIER2 = 2.0 if 'TP_MULTIPLIER2' not in globals() or TP_MULTIPLIER2 is None else TP_MULTIPLIER2
 SL_BUFFER = 0.15
 COOLDOWN_MINUTES = 60
 INSTANT_SL_BUFFER = 0.04
@@ -217,6 +220,7 @@ for h in logger.handlers:
     h.addFilter(MinimalInfoFilter())
 logging.getLogger('telegram').setLevel(logging.ERROR)
 logging.getLogger('httpx').setLevel(logging.ERROR)
+logger.info(f"TP_MULTIPLIER1={TP_MULTIPLIER1}, TP_MULTIPLIER2={TP_MULTIPLIER2}")
 # ================== Borsa & Bot ==================
 exchange = ccxt.bybit({
     'enableRateLimit': True,
@@ -960,42 +964,39 @@ def _range_retest_ok(df: pd.DataFrame, side: str, max_bars=SQZ_RETEST_MAX_BARS) 
                 return float(next_row['close']) < float(next_row['open'])
     return False
 # --- Classic RR helper (DROP-IN PATCH) ---
-def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
+def _classic_rr_ok(df, side: str, atrv: float, entry: float,
+                   tp1_mult: float | None = None,
+                   tp2_mult: float | None = None):
     """
-    Klasik R/R kontrolü:
-      SL = entry ± (SL_MULTIPLIER + SL_BUFFER) * ATR
-      TP1 = entry ± TP_MULTIPLIER1 * ATR
-      TP2 = entry ± TP_MULTIPLIER2 * ATR
-    Döner: (ok(bool), sl, tp1, tp2, rr)
+    Klasik RR kontrolü.
+    - tp1_mult/tp2_mult verilmezse güvenli varsayılanlar kullanılır (1.0R / 2.0R).
+    - Global TP_MULTIPLIER1/2 sayıysa onları tercih eder.
     """
-    if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
+    import numpy as np
+    if not (np.isfinite(entry) and np.isfinite(atrv) and atrv > 0):
         return False, None, None, None, None
 
-    sl_abs = (SL_MULTIPLIER + SL_BUFFER) * atrv
+    TP1_DEF, TP2_DEF = 1.0, 2.0
+    # global’ler sayı değilse (None dâhil) varsayılanı kullan
+    if tp1_mult is None:
+        tp1_mult = (TP_MULTIPLIER1 if isinstance(TP_MULTIPLIER1, (int, float)) else TP1_DEF)
+    if tp2_mult is None:
+        tp2_mult = (TP_MULTIPLIER2 if isinstance(TP_MULTIPLIER2, (int, float)) else TP2_DEF)
 
+    sl_abs = (SL_MULTIPLIER + SL_BUFFER) * atrv
     if side == "buy":
         sl  = entry - sl_abs
-        tp1 = entry + (TP_MULTIPLIER1 * atrv)
-        tp2 = entry + (TP_MULTIPLIER2 * atrv)
+        tp1 = entry + (tp1_mult * atrv)
+        tp2 = entry + (tp2_mult * atrv) if tp2_mult is not None else None
     else:
         sl  = entry + sl_abs
-        tp1 = entry - (TP_MULTIPLIER1 * atrv)
-        tp2 = entry - (TP_MULTIPLIER2 * atrv)
+        tp1 = entry - (tp1_mult * atrv)
+        tp2 = entry - (tp2_mult * atrv) if tp2_mult is not None else None
 
-    risk   = abs(entry - sl)
+    risk = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
-
     return rr >= CLASSIC_MIN_RR, sl, tp1, tp2, rr
-
-# (Opsiyonel) Eski isimle kalmış kodlar için geçici alias:
-try:
-    _classic_sl_only  # varsa dokunma
-except NameError:
-    def _classic_sl_only(df: pd.DataFrame, side: str, atrv: float, entry: float):
-        # Eski kod bunu çağırdıysa en azından aynı çıktıyı verelim
-        ok, sl, tp1, tp2, rr = _classic_rr_ok(df, side, atrv, entry)
-        return ok, sl, tp1, tp2, rr
 def is_sqz_breakout(df: pd.DataFrame, side: str, regime: str, adx_last: float, bear_mode: bool) -> (bool, str):
     """Volatilite rejim kırılımı: SQZ off + lb_sqz_val momentum + trend bandı + kalite filtresi + (range'de retest)."""
     if len(df) < 60 or 'lb_sqz_off' not in df.columns or 'lb_sqz_val' not in df.columns:
