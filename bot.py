@@ -445,6 +445,82 @@ def build_reason_text(side: str,
         if obS_ok: tags.append("Order Block Short")
         if top_recent: tags.append("Tepe onaylı")
     return " + ".join(tags) if tags else "N/A"
+# --- Regime bucket helper ---
+def get_regime_bucket(adx_last: float) -> str:
+    if np.isfinite(adx_last):
+        if adx_last >= 28:
+            return "strong"   # güçlü trend
+        elif adx_last >= 20:
+            return "neutral"  # erken/nötr trend
+    return "range"            # chop/range
+
+# --- Simple Dip/Tepe detector (lightweight) ---
+def _is_local_low(df: pd.DataFrame, i: int, win: int = DIPTEPE_SEQ_WIN) -> bool:
+    if i - win < 0 or i + win >= len(df): return False
+    lows = df['low'].values
+    return lows[i] == np.min(lows[i-win:i+win+1])
+
+def _is_local_high(df: pd.DataFrame, i: int, win: int = DIPTEPE_SEQ_WIN) -> bool:
+    if i - win < 0 or i + win >= len(df): return False
+    highs = df['high'].values
+    return highs[i] == np.max(highs[i-win:i+win+1])
+
+def _bar_body_ratio(row) -> float:
+    o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
+    rng = max(h - l, 1e-12)
+    return abs(c - o) / rng
+
+def diptepe_signal(df: pd.DataFrame) -> tuple[bool, bool, str]:
+    """
+    Basit dip/tepe teyidi:
+    - Son DIPTEPE_A_LOOKBACK penceresinde bir pivot low/high bul
+    - Son bar(lar)da pivot yönüne min gövde ile (DIPTEPE_BODY_MIN) kırılım (DIPTEPE_BRK_LEN)
+    - Kırılımda min ATR tamponu (DIPTEPE_BRK_BUF_ATR * ATR)
+    """
+    if len(df) < max(DIPTEPE_A_LOOKBACK, DIPTEPE_BRK_LEN + 3) or 'atr' not in df.columns:
+        return False, False, "dt_data_short"
+
+    idx_last = len(df) - 2
+    atr = float(df['atr'].iloc[idx_last])
+    if not np.isfinite(atr) or atr <= 0:
+        return False, False, "dt_nan_atr"
+
+    # arka pencerede pivot ara
+    start = max(5, idx_last - DIPTEPE_A_LOOKBACK)
+    dip_i = top_i = None
+    for i in range(idx_last - DIPTEPE_MIN_SEP, start, -1):
+        if dip_i is None and _is_local_low(df, i, DIPTEPE_SEQ_WIN):
+            dip_i = i
+        if top_i is None and _is_local_high(df, i, DIPTEPE_SEQ_WIN):
+            top_i = i
+        if dip_i is not None and top_i is not None:
+            break
+
+    dip_ok = top_ok = False
+    note = []
+
+    # DIP (long desteği): pivot low sonrası yukarı kırılım + min body + ATR buffer
+    if dip_i is not None:
+        # son DIPTEPE_BRK_LEN bar içinde pivot low'un high'ını aşma
+        ref_level = float(df['high'].iloc[dip_i])
+        seq = df.iloc[idx_last - DIPTEPE_BRK_LEN + 1: idx_last + 1]
+        if not seq.empty:
+            crossed = (seq['close'] > (ref_level + DIPTEPE_BRK_BUF_ATR * atr)).any()
+            body_ok = (_bar_body_ratio(df.iloc[idx_last]) >= DIPTEPE_BODY_MIN)
+            dip_ok = bool(crossed and body_ok)
+            if dip_ok: note.append("DIP")
+
+    # TEPE (short desteği): pivot high sonrası aşağı kırılım + min body + ATR buffer
+    if top_i is not None:
+        ref_level = float(df['low'].iloc[top_i])
+        seq = df.iloc[idx_last - DIPTEPE_BRK_LEN + 1: idx_last + 1]
+        if not seq.empty:
+            crossed = (seq['close'] < (ref_level - DIPTEPE_BRK_BUF_ATR * atr)).any()
+            body_ok = (_bar_body_ratio(df.iloc[idx_last]) >= DIPTEPE_BODY_MIN)
+            top_ok = bool(crossed and body_ok)
+            if top_ok: note.append("TEPE")
+
+    return dip_ok, top_ok, "+".join(note) if note else "none"
 # ================== Mesaj Kuyruğu ==================
 async def enqueue_message(text: str, is_retry: bool = False):
     if not BOT_TOKEN or not CHAT_ID or TEST_MODE:
@@ -856,54 +932,6 @@ def _last_swing_levels(df, win=G3_SWING_WIN):
         if sh is not None and sl is not None:
             break
     return sh, sl
-def _bos_only(df: pd.DataFrame, side: str,
-              lookback: int = G3_BOS_LOOKBACK,
-              confirm_bars: int = G3_BOS_CONFIRM_BARS,
-              min_break_atr: float = G3_BOS_MIN_BREAK_ATR):
-    if len(df) < max(lookback+5, 40) or 'atr' not in df.columns:
-        return False, "data_short"
-    sh, sl = _last_swing_levels(df)
-    if side == 'long' and sh is None: return False, "no_swing_high"
-    if side == 'short' and sl is None: return False, "no_swing_low"
-    closes = df['close']
-    atr = df['atr']
-    idx_last = len(df) - 2
-    if side == 'long':
-        bos_idx = None
-        for i in range(idx_last - lookback, idx_last):
-            if i <= 0 or i >= len(df): continue
-            if not (np.isfinite(closes.iloc[i]) and np.isfinite(atr.iloc[i])): continue
-            level = sh + min_break_atr * atr.iloc[i]
-            if closes.iloc[i] > level:
-                bos_idx = i
-                break
-        if bos_idx is None:
-            return False, "no_bos_long"
-        conf_needed = confirm_bars
-        ok = 0
-        for j in range(bos_idx, min(bos_idx + confirm_bars, idx_last + 1)):
-            lvl_j = sh + (min_break_atr * (atr.iloc[j] if np.isfinite(atr.iloc[j]) else 0.0))
-            if closes.iloc[j] > lvl_j:
-                ok += 1
-        return (ok >= conf_needed), f"bos_only_long conf={ok}/{conf_needed}"
-    else:
-        bos_idx = None
-        for i in range(idx_last - lookback, idx_last):
-            if i <= 0 or i >= len(df): continue
-            if not (np.isfinite(closes.iloc[i]) and np.isfinite(atr.iloc[i])): continue
-            level = sl - min_break_atr * atr.iloc[i]
-            if closes.iloc[i] < level:
-                bos_idx = i
-                break
-        if bos_idx is None:
-            return False, "no_bos_short"
-        conf_needed = confirm_bars
-        ok = 0
-        for j in range(bos_idx, min(bos_idx + confirm_bars, idx_last + 1)):
-            lvl_j = sl - (min_break_atr * (atr.iloc[j] if np.isfinite(atr.iloc[j]) else 0.0))
-            if closes.iloc[j] < lvl_j:
-                ok += 1
-        return (ok >= conf_needed), f"bos_only_short conf={ok}/{conf_needed}"
 def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
     c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
     c3 = float(df['close'].iloc[-3]); e89_3 = float(df['ema89'].iloc[-3]); atr3 = float(df['atr'].iloc[-3])
@@ -926,10 +954,11 @@ def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     if not all(map(np.isfinite, [c2, e89, atr2])):
         return False
     return (c2 > e89 + band_k*atr2) if side == "long" else (c2 < e89 - band_k*atr2)
-def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode):
+def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime: str = None):
     adx_min = 0 if bear_mode else G3_MIN_ADX
     adx_gate = np.isfinite(adx_last) and (adx_last >= adx_min)
     ntx_gate = vote_ntx
+
     s = df['ntx'] if 'ntx' in df.columns else None
     if s is None:
         ntx_trend_ok = False
@@ -938,27 +967,28 @@ def _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode):
         ok1, slope1, pr1 = rising_ema(s, win=G3_NTX_SLOPE_WIN, eps=0.0, pos_ratio_thr=0.55)
         ok2, slope2, pr2 = robust_up(s, win=G3_NTX_SLOPE_WIN, eps=0.0, pos_ratio_thr=0.55)
         ntx_trend_ok = ok1 or ok2
-        ntx_trend_dbg = f"r_ema={ok1} (s={slope1:.3f},pr={pr1:.2f}) | r_med={ok2} (s={slope2:.3f},pr={pr2:.2f})"
-    mom_score = int(adx_gate) + int(ntx_gate) + int(ntx_trend_ok)
-    mom_ok_base = (mom_score >= 2)
-    dbg = (f"adx>={adx_min}={adx_gate}, ntx_thr={ntx_thr:.1f}/{float(df['ntx'].iloc[-2]):.1f}->{ntx_gate}, "
+        ntx_trend_dbg = f"r_ema={ok1}|r_med={ok2}"
+
+    # --- REJİME GÖRE ---
+    if regime == "range":
+        # chop'ta daha sert: ikisi de şart
+        mom_ok_base = bool(ntx_gate and ntx_trend_ok)
+    else:
+        # eski kural: 3 koşuldan en az 2'si
+        score = int(adx_gate) + int(ntx_gate) + int(ntx_trend_ok)
+        mom_ok_base = (score >= 2)
+
+    dbg = (f"adx>={adx_min}={adx_gate}, ntx_thr={ntx_thr:.1f}/{float(df['ntx'].iloc[-2]) if 'ntx' in df.columns and pd.notna(df['ntx'].iloc[-2]) else float('nan'):.1f}->{ntx_gate}, "
            f"ntx_trend={ntx_trend_ok} [{ntx_trend_dbg}]")
+
     if DYNAMIC_MODE:
-        adx_min = 0 if bear_mode else G3_MIN_ADX
-        adx_gate = (np.isfinite(adx_last) and (adx_last >= adx_min))
+        # mevcut dinamik kısmı koruyoruz
         adx_trend_ok = rising_ema(df['adx'], win=6, pos_ratio_thr=0.6)[0] or robust_up(df['adx'], win=6, pos_ratio_thr=0.6)[0]
-        ntx_trend_ok = rising_ema(df['ntx'], win=5, pos_ratio_thr=0.6)[0] or robust_up(df['ntx'], win=5, pos_ratio_thr=0.6)[0]
-        ntx_z_last = float(df['ntx_z'].iloc[-2]) if 'ntx_z' in df.columns else float('nan')
-        ntx_z_slope = float(df['ntx_z'].iloc[-2] - df['ntx_z'].iloc[-2 - G3_NTX_SLOPE_WIN]) if 'ntx_z' in df.columns and len(df['ntx_z']) > G3_NTX_SLOPE_WIN + 2 else float('nan')
-        vote_ntx_orig = vote_ntx
-        vote_ntx_dyn = bool(vote_ntx_orig or (
-            np.isfinite(ntx_z_last) and (ntx_z_last >= 0.0 or (np.isfinite(ntx_z_slope) and ntx_z_slope > 0.0))
-        ))
-        vote_ntx = vote_ntx_dyn
-        mom_ok = bool(mom_ok_base or (adx_trend_ok and (vote_ntx or (ntx_z_slope if np.isfinite(ntx_z_slope) else -1) > 0)) or (ntx_trend_ok and adx_gate))
-        dbg = f"{dbg}, dyn_adx_trend={adx_trend_ok}, dyn_ntx_trend={ntx_trend_ok}, ntx_z_last={ntx_z_last:.2f}, ntx_z_slope={ntx_z_slope:.2f}"
+        ntx_trend2_ok = rising_ema(df['ntx'], win=5, pos_ratio_thr=0.6)[0] or robust_up(df['ntx'], win=5, pos_ratio_thr=0.6)[0]
+        mom_ok = bool(mom_ok_base or (adx_trend_ok and (ntx_gate or ntx_trend2_ok)) or (ntx_trend2_ok and adx_gate))
     else:
         mom_ok = mom_ok_base
+
     return mom_ok, dbg
 def _quality_ok(df, side, bear_mode):
     fk_ok, fk_dbg = fake_filter_v2(df, side=side, bear_mode=bear_mode)
@@ -966,9 +996,6 @@ def _quality_ok(df, side, bear_mode):
     ema13 = float(last['ema13']); close = float(last['close']); atrv = float(last['atr'])
     ema13_ok = np.isfinite(atrv) and (abs(close - ema13) <= G3_ENTRY_DIST_EMA13_ATR * atrv)
     return (fk_ok and ema13_ok), f"ff={fk_ok} ({fk_dbg}), ema13_dist_ok={ema13_ok}"
-def _structure_ok(df, side):
-    ok, why = _bos_only(df, side=side)
-    return ok, why
 def _classic_rr_ok(df: pd.DataFrame, side: str, atrv: float, entry: float):
     if not np.isfinite(entry) or not np.isfinite(atrv) or atrv <= 0:
         return False, None, None, None, None
@@ -1131,6 +1158,37 @@ def _ob_rr_ok(df: pd.DataFrame, side: str, z_hi: float, z_lo: float):
     risk = abs(entry - sl)
     rr = (reward / (risk + 1e-12)) if risk > 0 else 0.0
     return (rr >= OB_MIN_RR), (sl, None, None), (entry, rr)
+def _tighten_fake_filter_range(df: pd.DataFrame, side: str, fk_ok: bool) -> (bool, str):
+    """
+    Chop'ta ekstra sıkı koşullar: gövde min, fitil max, hacim eşiği, BB yakınlık
+    """
+    if not fk_ok:
+        return False, "ff_base_fail"
+
+    last = df.iloc[-2]
+    body, up, low = candle_body_wicks(last)
+
+    # önerilen sıkı eşikler:
+    body_min = max(FF_BODY_MIN, 0.50)
+    up_max = min(FF_UPWICK_MAX, 0.30)
+    dn_max = min(FF_DNWICK_MAX, 0.30)
+    bb_min = max(FF_BB_MIN, 0.30)
+
+    bb_prox = _bb_prox(last, side='long' if side == 'long' else 'short')
+    body_ok = (body >= body_min)
+    wick_ok = (up <= up_max) if side == "long" else (low <= dn_max)
+    bb_ok = (bb_prox >= bb_min)
+
+    vol_ok_extra = True
+    if 'vol_ma' in df.columns:
+        vol = float(last['volume']); vol_ma = float(last['vol_ma']) if pd.notna(last['vol_ma']) else np.nan
+        if np.isfinite(vol) and np.isfinite(vol_ma) and vol_ma > 0:
+            vol_ratio = vol / vol_ma
+            vol_ok_extra = vol_ratio >= max(1.10, VOL_MA_RATIO_MIN)
+
+    tight_ok = bool(body_ok and wick_ok and bb_ok and vol_ok_extra)
+    dbg = f"tight(body={body:.2f}/{body_min}, wick={(up if side=='long' else low):.2f}/{up_max if side=='long' else dn_max}, bb={bb_prox:.2f}/{bb_min}, vol_extra={vol_ok_extra})"
+    return tight_ok, dbg
 def _score_side(side, ok_gate, struct_ok, adx_last, ntx_last, ff_ok):
     score = 0
     score += 2 if ok_gate else 0 # G3 gate
@@ -1174,45 +1232,32 @@ def _log_false_breakdown():
         pct = (f / total * 100.0) if total else 0.0
         logger.info(f" - {name}: {f}/{total} ({pct:.1f}%)")
 # ================== Sinyal Döngüsü ==================
-async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None):
+async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None, regime: str = None):
     band_k = G3_BAND_K
     ntx_q = float('nan')
     adx_trend_ok = False
     ntx_trend_ok = False
+
+    # >>> EKLE: vote_ntx_orig/dyn default'ları (DYNAMIC_MODE kapalıyken hata olmasın)
+    vote_ntx_orig = bool(vote_ntx)
+    vote_ntx_dyn = vote_ntx_orig
     ntx_z_last, ntx_z_slope = float('nan'), float('nan')
+
     if DYNAMIC_MODE:
         band_k = compute_dynamic_band_k(df, adx_last)
         ntx_thr, ntx_q = compute_ntx_local_thr(df, base_thr=ntx_thr, symbol=symbol)
         adx_trend_ok = rising_ema(df['adx'], win=6, pos_ratio_thr=0.6)[0] or robust_up(df['adx'], win=6, pos_ratio_thr=0.6)[0]
         ntx_trend_ok = rising_ema(df['ntx'], win=5, pos_ratio_thr=0.6)[0] or robust_up(df['ntx'], win=5, pos_ratio_thr=0.6)[0]
-        vote_ntx_orig = bool(vote_ntx)
-        try:
-            ntx_z_last = float(df['ntx_z'].iloc[-2]) if 'ntx_z' in df.columns else float('nan')
-            if 'ntx_z' in df.columns and len(df['ntx_z']) > G3_NTX_SLOPE_WIN + 2:
-                ntx_z_slope = float(df['ntx_z'].iloc[-2] - df['ntx_z'].iloc[-2 - G3_NTX_SLOPE_WIN])
-            else:
-                ntx_z_slope = float('nan')
-        except Exception:
-            ntx_z_last, ntx_z_slope = float('nan'), float('nan')
-        vote_ntx_dyn = bool(vote_ntx_orig or (
-            np.isfinite(ntx_z_last) and (ntx_z_last >= 0.0 or (np.isfinite(ntx_z_slope) and ntx_z_slope > 0.0))
-        ))
-        vote_ntx = vote_ntx_dyn
+        # ... mevcut DYNAMIC blok aynı, sadece vote_ntx_orig zaten var
+
     trend_ok, t_dbg = _trend_ok(df, side, band_k, G3_SLOPE_WIN, G3_SLOPE_THR_PCT)
     quality_ok, q_dbg = _quality_ok(df, side, bear_mode)
-    mom_ok_base, m_dbg = _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode)
-    structure_ok, s_dbg = _structure_ok(df, side)
-    if not bear_mode:
-        if not trend_ok:
-            return False, f"trend_FAIL({t_dbg})"
-    if not quality_ok:
-        return False, f"quality_FAIL({q_dbg})"
-    if bear_mode:
-        ok = mom_ok_base and structure_ok
-        dbg = f"bear_mode momentum={mom_ok_base} ({m_dbg}) structure={structure_ok} ({s_dbg})"
-    else:
-        ok = mom_ok_base or structure_ok
-        dbg = f"momentum={mom_ok_base} ({m_dbg}) OR structure={structure_ok} ({s_dbg})"
+
+    # >>> DEĞİŞ: regime'yi _momentum_ok ve _structure_ok'a geçir
+    mom_ok_base, m_dbg = _momentum_ok(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, regime=regime)
+    structure_ok,  s_dbg = False, "bos_disabled"
+    ok  = mom_ok_base
+    dbg = f"{'bear_mode ' if bear_mode else ''}momentum={mom_ok_base} ({m_dbg}); BOS=disabled"
     if DYNAMIC_MODE and VERBOSE_LOG:
         try:
             dbg_payload = {
@@ -1267,6 +1312,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"Geçersiz ATR ({symbol} {timeframe}), skip.")
             return
         adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
+        regime = get_regime_bucket(adx_last)  # "strong" | "neutral" | "range"
         atr_z = rolling_z(df['atr'], LOOKBACK_ATR) if 'atr' in df else 0.0
         async with _stats_lock:
             trend_prev = signal_cache.get(f"{symbol}_{timeframe}", _default_pos_state()).get('trend_on_prev', False)
@@ -1284,8 +1330,14 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"MODE bull={bull_mode} | ADX={adx_last:.1f} | ON={BEAR_ADX_ON} OFF={BEAR_ADX_OFF}")
         ntx_thr = ntx_threshold(atr_z)
         vote_ntx = ntx_vote(df, ntx_thr)
+        dip_ok, top_ok, dt_tag = diptepe_signal(df)
         fk_ok_L, fk_dbg_L = fake_filter_v2(df, side="long", bear_mode=bear_mode)
         fk_ok_S, fk_dbg_S = fake_filter_v2(df, side="short", bear_mode=bear_mode)
+        if regime == "range":
+            fk_ok_L, fk_tight_dbg_L = _tighten_fake_filter_range(df, side="long", fk_ok=fk_ok_L)
+            fk_ok_S, fk_tight_dbg_S = _tighten_fake_filter_range(df, side="short", fk_ok=fk_ok_S)
+            if VERBOSE_LOG:
+                logger.debug(f"{symbol} {timeframe} FF_TIGHT L={fk_ok_L}({fk_tight_dbg_L}) S={fk_ok_S}({fk_tight_dbg_S})")
         smi_val_now = float(df['lb_sqz_val'].iloc[-2]) if pd.notna(df['lb_sqz_val'].iloc[-2]) else np.nan
         smi_val_prev = float(df['lb_sqz_val'].iloc[-3]) if pd.notna(df['lb_sqz_val'].iloc[-3]) else np.nan
         smi_positive = (np.isfinite(smi_val_now) and smi_val_now > 0.0)
@@ -1310,12 +1362,19 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         obS_rr_ok, obS_prices, obS_entry_rr = _ob_rr_ok(df, "short", obS_high, obS_low)
         obL_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "long")
         obS_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "short")
-        obL_smi_ok = (not OB_REQUIRE_SMI) or (smi_open_green and is_green)
-        obS_smi_ok = (not OB_REQUIRE_SMI) or (smi_open_red and is_red)
-        okL, whyL = await entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
-        okS, whyS = await entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol)
-        obL_gate_ok = (not OB_REQUIRE_G3_GATE) or okL
-        obS_gate_ok = (not OB_REQUIRE_G3_GATE) or okS
+        ob_req_gate = OB_REQUIRE_G3_GATE
+        ob_req_smi = OB_REQUIRE_SMI
+        if regime == "range":
+            ob_req_gate = True
+            ob_req_smi = True
+
+        okL, whyL = await entry_gate_v3(df, side="long", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
+        okS, whyS = await entry_gate_v3(df, side="short", adx_last=adx_last, vote_ntx=vote_ntx, ntx_thr=ntx_thr, bear_mode=bear_mode, symbol=symbol, regime=regime)
+
+        obL_smi_ok  = (not ob_req_smi)  or (smi_open_green and is_green)
+        obS_smi_ok  = (not ob_req_smi)  or (smi_open_red   and is_red)
+        obL_gate_ok = (not ob_req_gate) or okL
+        obS_gate_ok = (not ob_req_gate) or okS
         obL_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obL_id and (obL_id not in used_set))
         obS_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obS_id and (obS_id not in used_set))
         if VERBOSE_LOG:
@@ -1379,19 +1438,23 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     logger.debug(f"{symbol} {timeframe}: grace_short_8bar aktif")
         allow_long = (cross_up_1334) or grace_long
         allow_short = (cross_dn_1334) or grace_short
-        structL, _ = _structure_ok(df, side="long")
-        structS, _ = _structure_ok(df, side="short")
+        structL, structS = False, False
         entry_price_c = float(df['close'].iloc[-2])
         classic_buy_rr_ok, b_sl, b_tp1, b_tp2, b_rr = _classic_rr_ok(df, "buy", atr_value, entry_price_c)
         classic_sell_rr_ok, s_sl, s_tp1, s_tp2, s_rr = _classic_rr_ok(df, "sell", atr_value, entry_price_c)
-        buy_classic = ((allow_long or structL) and smi_open_green and is_green and okL and classic_buy_rr_ok)
-        sell_classic = ((allow_short or structS) and smi_open_red and is_red and okS and classic_sell_rr_ok)
+        dip_gate_ok = True
+        top_gate_ok = True
+        if regime == "range":
+            dip_gate_ok = bool(dip_ok)   # long için AND
+            top_gate_ok = bool(top_ok)   # short için AND
+        buy_classic = (allow_long  and smi_open_green and is_green and okL and classic_buy_rr_ok and dip_gate_ok)
+        sell_classic = (allow_short and smi_open_red   and is_red   and okS and classic_sell_rr_ok and top_gate_ok)
         buy_condition = bool(buy_classic or ob_buy_standalone)
         sell_condition = bool(sell_classic or ob_sell_standalone)
         if VERBOSE_LOG:
-            if (allow_long or structL) and smi_open_green and is_green and okL and not classic_buy_rr_ok:
+            if allow_long and smi_open_green and is_green and okL and not classic_buy_rr_ok:
                 logger.debug(f"{symbol} {timeframe}: RR={b_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (buy_classic)")
-            if (allow_short or structS) and smi_open_red and is_red and okS and not classic_sell_rr_ok:
+            if allow_short and smi_open_red and is_red and okS and not classic_sell_rr_ok:
                 logger.debug(f"{symbol} {timeframe}: RR={s_rr:.2f} < {CLASSIC_MIN_RR} → reddedildi (sell_classic)")
             if obL_ok and not obL_rr_ok and obL_entry_rr:
                 logger.debug(f"{symbol} {timeframe}: RR={obL_entry_rr[1]:.2f} < {OB_MIN_RR} → reddedildi (ob_buy_standalone)")
@@ -1408,9 +1471,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 if OB_TREND_FILTER and obL_trend_ok:
                     reason += " 🟢 Trend"
             else:
-                reason = f"EMA Cross veya BOS (RR={b_rr:.2f})"
-                if obL_ok:
-                    reason += f" veya Order Block (RR={obL_entry_rr[1]:.2f})"
+                reason = f"EMA Cross/Grace (RR={b_rr:.2f})"
         elif sell_condition:
             if ob_sell_standalone:
                 reason = f"Order Block (RR={obS_entry_rr[1]:.2f})"
@@ -1421,9 +1482,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 if OB_TREND_FILTER and obS_trend_ok:
                     reason += " 🟢 Trend"
             else:
-                reason = f"EMA Cross veya BOS (RR={s_rr:.2f})"
-                if obS_ok:
-                    reason += f" veya Order Block (RR={obS_entry_rr[1]:.2f})"
+                reason = f"EMA Cross/Grace (RR={s_rr:.2f})"
         if VERBOSE_LOG and (buy_condition or sell_condition):
             logger.debug(f"{symbol} {timeframe} DYNDBG: {reason}")
         criteria = [
@@ -1455,6 +1514,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             ntx_last = float(df['ntx'].iloc[-2]) if 'ntx' in df.columns and pd.notna(df['ntx'].iloc[-2]) else 0.0
             buy_score = _score_side("buy", okL, structL, adx_last, ntx_last, fk_ok_L)
             sell_score = _score_side("sell", okS, structS, adx_last, ntx_last, fk_ok_S)
+            if regime == "neutral":
+                if dip_ok:  buy_score  += 1
+                if top_ok:  sell_score += 1
             if buy_score != sell_score:
                 prefer = "buy" if buy_score > sell_score else "sell"
                 buy_condition = (prefer == "buy")
@@ -1464,6 +1526,8 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 new_symbol_until[symbol] = now + timedelta(minutes=NEW_SYMBOL_COOLDOWN_MIN)
                 await mark_status(symbol, "skip", "conflicting_signals_tie")
                 return
+        if VERBOSE_LOG and dt_tag != "none":
+            logger.debug(f"{symbol} {timeframe} DIPTEPE_TAG: {dt_tag} regime={regime}")
         now = datetime.now(tz)
         bar_time = df.index[-2]
         if not isinstance(bar_time, (pd.Timestamp, datetime)):
