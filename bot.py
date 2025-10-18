@@ -113,7 +113,7 @@ SQZ_RANGE_REQUIRE_RETEST = True # range'de retest iste
 SQZ_RETEST_MAX_BARS = 3 # off sonrası kaç bar içinde retest kabul
 # ====== ORDER BLOCK (OB) Ayarları ======
 # ====== ORDER BLOCK (OB) – SIKI PROFİL ======
-ONLY_OB_MODE = True # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
+ONLY_OB_MODE = False # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
 USE_OB_STANDALONE = True
 OB_MIN_RR = 1.0
 # Zorunlu teyitler
