@@ -113,32 +113,27 @@ SQZ_RANGE_REQUIRE_RETEST = True # range'de retest iste
 SQZ_RETEST_MAX_BARS = 3 # off sonrası kaç bar içinde retest kabul
 # ====== ORDER BLOCK (OB) Ayarları ======
 # ====== ORDER BLOCK (OB) – SIKI PROFİL ======
-ONLY_OB_MODE = True          # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
+ONLY_OB_MODE = True # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
 USE_OB_STANDALONE = True
 OB_MIN_RR = 1.0
-
 # Zorunlu teyitler
-OB_REQUIRE_SMI = True        # SMI yön teyidi
-OB_REQUIRE_G3_GATE = True    # Gate + kalite + trend iç teyidi
-OB_TREND_FILTER = True       # ADX≥23 + EMA89 bandı
-
+OB_REQUIRE_SMI = True # SMI yön teyidi
+OB_REQUIRE_G3_GATE = True # Gate + kalite + trend iç teyidi
+OB_TREND_FILTER = True # ADX≥23 + EMA89 bandı
 # OB yapısal kurallar
 OB_LOOKBACK = 30
-OB_DISPLACEMENT_ATR = 1.50   # displacement bar TR >= 1.5*ATR
+OB_DISPLACEMENT_ATR = 1.50 # displacement bar TR >= 1.5*ATR
 OB_BODY_RATIO_MIN = 0.60
 OB_FIRST_TOUCH_ONLY = True
-
 # Retest (first-touch rejection)
 OB_RETEST_REQUIRED = True
 OB_RETEST_MAX_BARS = 3
 OB_STOP_ATR_BUFFER = 0.10
-
-# Retest fallback eşiği (OB_HYBRID True ise)
+# Konsolidasyon fallback eşiği (OB_HYBRID True ise)
 OB_CONS_ATR_THR = 0.50
 OB_CONS_VOL_THR = 1.80
-
 # R/ATR alt sınırı (OB için)
-OB_MIN_R_OVER_ATR = 0.80     # 0.8–1.0 arası sıkı
+OB_MIN_R_OVER_ATR = 0.80 # 0.8–1.0 arası sıkı
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -182,7 +177,7 @@ STRONG_TREND_ADX = 28 # 13/34 kesişimi için opsiyonel teyit sınırı
 # ==== Zaman dilimi sabiti ====
 DEFAULT_TZ = os.getenv("BOT_TZ", "Europe/Istanbul")
 # --- Messaging prefs ---
-SEND_REJECT_MSG = False   # reddedildi mesajları ASLA gönderilmesin
+SEND_REJECT_MSG = False # reddedildi mesajları ASLA gönderilmesin
 # --- MINIMAL RUNTIME PATCH (paste near the top) ---
 # Telegram mesaj flood’u için basit throttle ve state kaydı debounce
 MESSAGE_THROTTLE_SECS = 20.0
@@ -1094,7 +1089,7 @@ def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
     return (band_ok and slope_ok), f"band={band_ok},slope={pct_slope*100:.2f}%"
 def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
-    if not np.isfinite(adx_last) or adx_last < 23:  # ADX≥23
+    if not np.isfinite(adx_last) or adx_last < 23: # ADX≥23
         return False
     band_k = compute_dynamic_band_k(df, adx_last)
     c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
@@ -1167,38 +1162,34 @@ def _displacement_candle_ok(df: pd.DataFrame, i: int, side: str) -> bool:
     body = abs(float(row['close'] - row['open']))
     body_ratio = body / rng
     tr = _true_range(row)
-
     # 1) Güç ve gövde oranı
     if not (tr >= OB_DISPLACEMENT_ATR * float(row['atr']) and body_ratio >= OB_BODY_RATIO_MIN):
         return False
-
     # 2) Mum rengi yönle uyumlu
     if side == 'long' and not (row['close'] > row['open']):
         return False
     if side == 'short' and not (row['close'] < row['open']):
         return False
-
     # 3) Likidite süpürme (önceki mumun high/low)
     if not _swept_prev_liquidity(df, i, side):
         return False
-
     return True
 def _swept_prev_liquidity(df: pd.DataFrame, i: int, side: str) -> bool:
     """Displacement mumunun bir önceki mumun likiditesini süpürmesi şartı."""
-    if i-1 < 0: 
+    if i-1 < 0:
         return False
     prev_h = float(df['high'].iloc[i-1]); prev_l = float(df['low'].iloc[i-1])
-    this_h = float(df['high'].iloc[i]);   this_l = float(df['low'].iloc[i])
-    if side == 'long':   # Buy OB: önceki low süpürmülsün
+    this_h = float(df['high'].iloc[i]); this_l = float(df['low'].iloc[i])
+    if side == 'long': # Buy OB: önceki low süpürmülsün
         return np.isfinite(this_l) and np.isfinite(prev_l) and (this_l < prev_l)
-    else:                # Sell OB: önceki high süpürmülsün
+    else: # Sell OB: önceki high süpürmülsün
         return np.isfinite(this_h) and np.isfinite(prev_h) and (this_h > prev_h)
 def _bos_after_displacement(df, side, disp_idx, min_break_atr=G3_BOS_MIN_BREAK_ATR, confirm_bars=G3_BOS_CONFIRM_BARS):
     sh, sl = _last_swing_levels(df)
-    if sh is None and sl is None: 
+    if sh is None and sl is None:
         return False
     rng = df.iloc[disp_idx+1 : disp_idx+1+max(1, confirm_bars)]
-    if rng.empty: 
+    if rng.empty:
         return False
     atr_ref = float(df['atr'].iloc[disp_idx]) if pd.notna(df['atr'].iloc[disp_idx]) else 0.0
     if side == 'long' and sh is not None:
@@ -1250,51 +1241,41 @@ def _ob_first_touch_reject(df: pd.DataFrame, idx_last: int, side: str, z_high: f
 def _find_displacement_ob(df: pd.DataFrame, side: str):
     if len(df) < max(OB_LOOKBACK+5, 60) or 'atr' not in df.columns:
         return False, "ob_data_short", None, None, None
-
     df = _ensure_prev_close(df)
     idx_last = len(df) - 2
     atr_series = df['atr']
-
     for k in range(idx_last-2, max(idx_last-OB_LOOKBACK, 2), -1):
         # 1) Güçlü displacement + gövde oranı
         if not _displacement_candle_ok(df, k, side):
             continue
-
         # 2) Displacement SONRASI FVG var mı?
         if not _has_fvg_after(df, k, side):
             continue
-
         # 3) BOS onayı (k’dan sonra)
         if not _bos_after_displacement(df, side, k):
             continue
-
         # 4) Zone: displacement’tan önceki son karşıt gövdeli mum
         z_high, z_low, opp_idx = _last_opposite_body_zone(df, k, side)
         if z_high is None:
             continue
-
         # 5) Zone genişliğini sınırla (too wide -> çöp)
         atrv_k = float(atr_series.iloc[k]) if pd.notna(atr_series.iloc[k]) else np.nan
         if _zone_too_wide(z_high, z_low, atrv_k, max_atr_mult=0.60):
             continue
-
         # 6) Retest şartı: son bar (idx_last) zone’a dokunup zıt yönde net kapanış (reject)
         if not _ob_first_touch_reject(df, idx_last, side, z_high, z_low):
             continue
-
         # 7) İlk dokunuş (mitigation) kontrolü
         if OB_FIRST_TOUCH_ONLY:
             # zone’a daha önce bar dokunmuş mu?
-            post = df.iloc[k+1:idx_last]   # retest barından önce
+            post = df.iloc[k+1:idx_last] # retest barından önce
             if side == 'long' and ((post['low'] <= z_high) & (post['high'] >= z_low)).any():
                 continue
             if side == 'short' and ((post['high'] >= z_low) & (post['low'] <= z_high)).any():
                 continue
-
         ob_id = f"{int(df.index[k].value)}_{side}_{round(z_high,6)}_{round(z_low,6)}"
         dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}] FVG+BOS+retest+first_touch"
         return True, dbg, z_high, z_low, ob_id
-
     return False, "no_strict_ob", None, None, None
 def _has_fvg_after(df: pd.DataFrame, k: int, side: str) -> bool:
     """
@@ -1318,13 +1299,13 @@ def _ob_rr_ok(df: pd.DataFrame, side: str, z_high: float | None, z_low: float | 
     """
     OB bölgesi için RR kontrolü:
       - entry : close[-2]
-      - stop  : long -> zone_low - buf*ATR; short -> zone_high + buf*ATR
-      - şart  : R/ATR ≥ OB_MIN_R_OVER_ATR (örn 0.80)
+      - stop : long -> zone_low - buf*ATR; short -> zone_high + buf*ATR
+      - şart : R/ATR ≥ OB_MIN_R_OVER_ATR (örn 0.80)
     """
     if z_high is None or z_low is None or 'atr' not in df.columns or len(df) < 3:
         return False, None, None
     entry = float(df['close'].iloc[-2])
-    atrv  = float(df['atr'].iloc[-2])
+    atrv = float(df['atr'].iloc[-2])
     if not (np.isfinite(entry) and np.isfinite(atrv) and atrv > 0):
         return False, None, None
     buf = OB_STOP_ATR_BUFFER * atrv
@@ -1548,16 +1529,27 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         smi_open_red = smi_negative and smi_down
         is_green = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] > df['open'].iloc[-2]))
         is_red = (pd.notna(df['close'].iloc[-2]) and pd.notna(df['open'].iloc[-2]) and (df['close'].iloc[-2] < df['open'].iloc[-2]))
-        okL, dbg_gateL = await entry_gate_v3(df, side="long",  adx_last=adx_last,
-                                     vote_ntx=vote_ntx, ntx_thr=ntx_thr,
-                                     bear_mode=bear_mode, symbol=symbol, regime=regime)
+        # --- G3 Gate teyidi (tek ve tutarlı) ---
+        okL, dbg_gateL = await entry_gate_v3(
+            df, side="long", adx_last=adx_last,
+            vote_ntx=vote_ntx, ntx_thr=ntx_thr,
+            bear_mode=bear_mode, symbol=symbol, regime=regime
+        )
+        okS, dbg_gateS = await entry_gate_v3(
+            df, side="short", adx_last=adx_last,
+            vote_ntx=vote_ntx, ntx_thr=ntx_thr,
+            bear_mode=bear_mode, symbol=symbol, regime=regime
+        )
 
-okS, dbg_gateS = await entry_gate_v3(df, side="short", adx_last=adx_last,
-                                     vote_ntx=vote_ntx, ntx_thr=ntx_thr,
-                                     bear_mode=bear_mode, symbol=symbol, regime=regime)
-        # OB isteklerine karşılık alias (NameError fix)
-        ob_req_smi  = OB_REQUIRE_SMI
-        ob_req_gate = OB_REQUIRE_G3_GATE
+        # --- OB gereksinim bayrakları (tek tanım) ---
+        ob_req_smi  = bool(OB_REQUIRE_SMI)
+        ob_req_gate = bool(OB_REQUIRE_G3_GATE)
+
+        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
+        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
+        obL_gate_ok = (not ob_req_gate) or okL
+        obS_gate_ok = (not ob_req_gate) or okS
+        # OB bulun
         obL_ok, obL_dbg, obL_high, obL_low, obL_id = _find_displacement_ob(df, side="long")
         obS_ok, obS_dbg, obS_high, obS_low, obS_id = _find_displacement_ob(df, side="short")
         if OB_HYBRID and not obL_ok:
@@ -1568,17 +1560,16 @@ okS, dbg_gateS = await entry_gate_v3(df, side="short", adx_last=adx_last,
             hy_ok, hy_dbg = _order_block_cons_fallback(df, side="short", lookback=10)
             if hy_ok:
                 obS_ok, obS_dbg = True, f"{obS_dbg}+hybrid({hy_dbg})"
+        # RR ve Trend doğrulaması
         obL_rr_ok, obL_prices, obL_entry_rr = _ob_rr_ok(df, "long", obL_high, obL_low)
         obS_rr_ok, obS_prices, obS_entry_rr = _ob_rr_ok(df, "short", obS_high, obS_low)
         obL_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "long")
         obS_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "short")
-        # SMI teyidi
-        obL_smi_ok = (not ob_req_smi)  or (smi_open_green and is_green)
-        obS_smi_ok = (not ob_req_smi)  or (smi_open_red   and is_red)
-
-# G3 Gate teyidi
-obL_gate_ok = (not ob_req_gate) or okL
-obS_gate_ok = (not ob_req_gate) or okS
+        # SMI, Gate, Touch doğrulaması
+        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
+        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
+        obL_gate_ok = (not ob_req_gate) or okL
+        obS_gate_ok = (not ob_req_gate) or okS
         obL_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obL_id and (obL_id not in used_set))
         obS_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obS_id and (obS_id not in used_set))
         if VERBOSE_LOG:
@@ -1677,7 +1668,7 @@ obS_gate_ok = (not ob_req_gate) or okS
         buy_ema = (not buy_ob) and (not buy_sqz) and buy_classic
         sell_ema = (not sell_ob) and (not sell_sqz) and sell_classic
         if ONLY_OB_MODE:
-            buy_condition  = ob_buy_standalone
+            buy_condition = ob_buy_standalone
             sell_condition = ob_sell_standalone
             reason = "Order Block" if (buy_condition or sell_condition) else "N/A"
         else:
