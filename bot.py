@@ -134,6 +134,12 @@ OB_CONS_ATR_THR = 0.50
 OB_CONS_VOL_THR = 1.80
 # R/ATR alt sınırı (OB için)
 OB_MIN_R_OVER_ATR = 0.80 # 0.8–1.0 arası sıkı
+# ---- SAFE DEFAULTS (config sabitlerinin hemen ALTINA koy) ----
+ONLY_OB_MODE      = bool(globals().get("ONLY_OB_MODE", False))
+SEND_REJECT_MSG   = bool(globals().get("SEND_REJECT_MSG", False))   # "SELL reddedildi" vb. mesajları kapatır
+OB_HYBRID         = bool(globals().get("OB_HYBRID", False))         # konsolidasyon fallback aktif/pasif
+OB_REQUIRE_SMI    = bool(globals().get("OB_REQUIRE_SMI", False))    # OB için SMI şartı
+OB_REQUIRE_G3_GATE= bool(globals().get("OB_REQUIRE_G3_GATE", False))# OB için Gate şartı
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -1545,18 +1551,15 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         ob_req_smi  = bool(OB_REQUIRE_SMI)
         ob_req_gate = bool(OB_REQUIRE_G3_GATE)
 
-        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
-        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
-        obL_gate_ok = (not ob_req_gate) or okL
-        obS_gate_ok = (not ob_req_gate) or okS
         # OB bulun
         obL_ok, obL_dbg, obL_high, obL_low, obL_id = _find_displacement_ob(df, side="long")
         obS_ok, obS_dbg, obS_high, obS_low, obS_id = _find_displacement_ob(df, side="short")
-        if OB_HYBRID and not obL_ok:
+        ob_hybrid = bool(globals().get("OB_HYBRID", False))
+        if ob_hybrid and not obL_ok:
             hy_ok, hy_dbg = _order_block_cons_fallback(df, side="long", lookback=10)
             if hy_ok:
                 obL_ok, obL_dbg = True, f"{obL_dbg}+hybrid({hy_dbg})"
-        if OB_HYBRID and not obS_ok:
+        if ob_hybrid and not obS_ok:
             hy_ok, hy_dbg = _order_block_cons_fallback(df, side="short", lookback=10)
             if hy_ok:
                 obS_ok, obS_dbg = True, f"{obS_dbg}+hybrid({hy_dbg})"
