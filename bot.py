@@ -107,10 +107,10 @@ BEAR_ADX_ON = 23 # trend ON/OFF eşiği
 BEAR_ADX_OFF = 20 # trend ON/OFF eşiği
 CLASSIC_MIN_RR = 1.0
 # ==== SQZ Breakout Ayarları ====
-SQZ_OFF_LOOKBACK = 6 # son kaç bar içinde 'off' olmalı
-SQZ_MOM_SLOPE_WIN = 2 # lb_sqz_val eğim kontrolü için kısa pencere
-SQZ_RANGE_REQUIRE_RETEST = True # range'de retest iste
-SQZ_RETEST_MAX_BARS = 3 # off sonrası kaç bar içinde retest kabul
+SQZ_OFF_LOOKBACK = 12 # son 12 bar içinde 'off' olmalı (eskisi 6 çok dardı)
+SQZ_MOM_SLOPE_WIN = 3 # lb_sqz_val eğim kontrolü için pencere (eskisi 2)
+SQZ_RANGE_REQUIRE_RETEST = False # range'de retest KAPATILDI (çok kısıtlayıcıydı)
+SQZ_RETEST_MAX_BARS = 5 # off sonrası kaç bar içinde retest kabul
 # ====== ORDER BLOCK (OB) Ayarları ======
 # ====== ORDER BLOCK (OB) – SIKI PROFİL ======
 ONLY_OB_MODE = False # sadece OB sinyali at (EMA/SQZ kapıdan geçmez)
@@ -121,25 +121,24 @@ OB_REQUIRE_SMI = True # SMI yön teyidi
 OB_REQUIRE_G3_GATE = True # Gate + kalite + trend iç teyidi
 OB_TREND_FILTER = True # ADX≥23 + EMA89 bandı
 # OB yapısal kurallar
-OB_LOOKBACK = 30
-OB_DISPLACEMENT_ATR = 1.50 # displacement bar TR >= 1.5*ATR
-OB_BODY_RATIO_MIN = 0.60
-OB_FIRST_TOUCH_ONLY = True
+OB_LOOKBACK = 40
+OB_DISPLACEMENT_ATR = 1.20 # displacement bar TR >= 1.2*ATR (eskisi 1.5 çok katıydı)
+OB_BODY_RATIO_MIN = 0.50   # body ratio min %50 (eskisi %60 çok katıydı)
+OB_FIRST_TOUCH_ONLY = False # ilk dokunuş zorunlu değil (daha fazla sinyal)
 # Retest (first-touch rejection)
 OB_RETEST_REQUIRED = True
-OB_RETEST_MAX_BARS = 3
-OB_STOP_ATR_BUFFER = 0.10
+OB_RETEST_MAX_BARS = 5   # 5 bar içinde retest kabul (eskisi 3 çok dardı)
+OB_STOP_ATR_BUFFER = 0.15 # SL için biraz daha buffer
 # Konsolidasyon fallback eşiği (OB_HYBRID True ise)
 OB_CONS_ATR_THR = 0.50
 OB_CONS_VOL_THR = 1.80
 # R/ATR alt sınırı (OB için)
-OB_MIN_R_OVER_ATR = 0.80 # 0.8–1.0 arası sıkı
+OB_MIN_R_OVER_ATR = 0.60 # 0.6 yeterli (eskisi 0.8 çok katıydı)
 # ---- SAFE DEFAULTS (config sabitlerinin hemen ALTINA koy) ----
 ONLY_OB_MODE      = bool(globals().get("ONLY_OB_MODE", False))
 SEND_REJECT_MSG   = bool(globals().get("SEND_REJECT_MSG", False))   # "SELL reddedildi" vb. mesajları kapatır
-OB_HYBRID         = bool(globals().get("OB_HYBRID", False))         # konsolidasyon fallback aktif/pasif
-OB_REQUIRE_SMI    = bool(globals().get("OB_REQUIRE_SMI", False))    # OB için SMI şartı
-OB_REQUIRE_G3_GATE= bool(globals().get("OB_REQUIRE_G3_GATE", False))# OB için Gate şartı
+OB_HYBRID         = True   # konsolidasyon fallback aktif
+# NOT: OB_REQUIRE_SMI ve OB_REQUIRE_G3_GATE yukarıda True tanımlı - OVERRIDE ETME!
 # ==== Dynamic mode & profil ====
 DYNAMIC_MODE = True
 FF_ACTIVE_PROFILE = os.getenv("FF_PROFILE", "garantici")
@@ -443,7 +442,7 @@ def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: f
     RR guard: R/ATR eşiği ve minimal TP1 gap kontrolü.
     - Trend: R/ATR >= 1.0
     - Range: R/ATR >= 0.9
-    - OB: R/ATR >= 0.6 (OB'lerde SL çoğu zaman dar)
+    - OB: R/ATR >= OB_MIN_R_OVER_ATR (config'den, default 0.60)
     Not: TP1_gap>=…*ATR kontrolü matematiksel olarak R>=ATR'a indirgeniyordu; onu kaldırıp sadece R/ATR eşiklerine baktık.
     """
     # NaN guard
@@ -452,7 +451,7 @@ def r_plan_guards_ok(mode: str, R: float, atr: float, entry: float, tp1_price: f
     r_over_atr = R / atr
     # Rejim bazlı minimumlar
     if is_ob:
-        r_min = 0.80
+        r_min = OB_MIN_R_OVER_ATR  # DEĞİŞTİRİLDİ: 0.80 sabit yerine config'den (0.60)
     else:
         if mode == "trend":
             r_min = 1.00
@@ -492,13 +491,14 @@ def build_reason_text(side: str,
         if top_recent: tags.append("Tepe onaylı")
     return " + ".join(tags) if tags else "N/A"
 # --- Regime bucket helper ---
+# DEĞİŞİKLİK: ADX eşiği 20 → 23 yapıldı (range tespiti daha gerçekçi)
 def get_regime_bucket(adx_last: float) -> str:
     if np.isfinite(adx_last):
         if adx_last >= 28:
             return "strong" # güçlü trend
-        elif adx_last >= 20:
+        elif adx_last >= 23:  # ESKİ: 20, YENİ: 23
             return "neutral" # erken/nötr trend
-    return "range" # chop/range
+    return "range" # chop/range (artık ADX < 23 ise range)
 # --- Simple Dip/Tepe detector (lightweight) ---
 def _is_local_low(df: pd.DataFrame, i: int, win: int = DIPTEPE_SEQ_WIN) -> bool:
     if i - win < 0 or i + win >= len(df): return False
@@ -955,16 +955,28 @@ def _recent_sqz_off(df: pd.DataFrame, lookback=SQZ_OFF_LOOKBACK) -> bool:
     window = df['lb_sqz_off'].iloc[-(lookback+1):-1]
     return bool(window.any())
 def _lb_val_momentum(df: pd.DataFrame, side: str, win=SQZ_MOM_SLOPE_WIN) -> bool:
+    """
+    SQZ momentum kontrolü - DEĞİŞTİRİLDİ
+    Artık gerçekten 'win' kadar bar'a bakıyor (eskisi sadece 2 bar'a bakıyordu)
+    Eğim + pozitif/negatif oran kontrolü eklendi
+    """
     if 'lb_sqz_val' not in df.columns or len(df) < win + 3:
         return False
-    v_now = float(df['lb_sqz_val'].iloc[-2])
-    v_prev = float(df['lb_sqz_val'].iloc[-3])
-    if not (np.isfinite(v_now) and np.isfinite(v_prev)):
+    v = pd.to_numeric(df['lb_sqz_val'], errors='coerce').iloc[-(win+2):-1].dropna()
+    if len(v) < win + 1:
         return False
+    
+    diffs = np.diff(v.values)
+    slope = v.iloc[-1] - v.iloc[0]
+    pos_ratio = (diffs > 0).mean() if diffs.size else 0.0
+    neg_ratio = (diffs < 0).mean() if diffs.size else 0.0
+    
     if side == "long":
-        return (v_now > 0) and (v_now > v_prev)
+        # Long: son değer pozitif, eğim yukarı, barların %66'sı yukarı
+        return (v.iloc[-1] > 0) and (slope > 0) and (pos_ratio >= 0.66)
     else:
-        return (v_now < 0) and (v_now < v_prev)
+        # Short: son değer negatif, eğim aşağı, barların %66'sı aşağı
+        return (v.iloc[-1] < 0) and (slope < 0) and (neg_ratio >= 0.66)
 def _range_retest_ok(df: pd.DataFrame, side: str, max_bars=SQZ_RETEST_MAX_BARS) -> bool:
     """SQZ 'off' olduktan hemen sonra bb_mid civarı hafif geri çekilip yeniden yön alma."""
     if not SQZ_RANGE_REQUIRE_RETEST:
@@ -982,8 +994,8 @@ def _range_retest_ok(df: pd.DataFrame, side: str, max_bars=SQZ_RETEST_MAX_BARS) 
         if not (np.isfinite(mid) and np.isfinite(c)):
             continue
         prox = abs(c - mid) / max(abs(mid), 1e-12)
-        # çok gevşek: %0.5 yakınlık eşik gibi
-        if prox <= 0.005:
+        # %2 yakınlık eşiği (eskisi %0.5 çok dardı)
+        if prox <= 0.02:
             # retest mumundan sonra yön teyidi (kapanış rengi)
             next_row = df.iloc[-2] # son mum
             if side == "long":
@@ -1095,7 +1107,7 @@ def _trend_ok(df, side, band_k, slope_win, slope_thr_pct):
     return (band_ok and slope_ok), f"band={band_ok},slope={pct_slope*100:.2f}%"
 def _ob_trend_filter(df: pd.DataFrame, side: str) -> bool:
     adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
-    if not np.isfinite(adx_last) or adx_last < 23: # ADX≥23
+    if not np.isfinite(adx_last) or adx_last < 20: # ADX≥20 (eskisi 23 çok katıydı)
         return False
     band_k = compute_dynamic_band_k(df, adx_last)
     c2 = float(df['close'].iloc[-2]); e89 = float(df['ema89'].iloc[-2]); atr2 = float(df['atr'].iloc[-2])
@@ -1254,9 +1266,8 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
         # 1) Güçlü displacement + gövde oranı
         if not _displacement_candle_ok(df, k, side):
             continue
-        # 2) Displacement SONRASI FVG var mı?
-        if not _has_fvg_after(df, k, side):
-            continue
+        # 2) FVG kontrolü - ARTIK OPSIYONEL (sadece debug için kaydediyoruz)
+        has_fvg = _has_fvg_after(df, k, side)
         # 3) BOS onayı (k’dan sonra)
         if not _bos_after_displacement(df, side, k):
             continue
@@ -1264,9 +1275,9 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
         z_high, z_low, opp_idx = _last_opposite_body_zone(df, k, side)
         if z_high is None:
             continue
-        # 5) Zone genişliğini sınırla (too wide -> çöp)
+        # 5) Zone genişliğini sınırla - 0.80*ATR'a kadar kabul (eskisi 0.60)
         atrv_k = float(atr_series.iloc[k]) if pd.notna(atr_series.iloc[k]) else np.nan
-        if _zone_too_wide(z_high, z_low, atrv_k, max_atr_mult=0.60):
+        if _zone_too_wide(z_high, z_low, atrv_k, max_atr_mult=0.80):
             continue
         # 6) Retest şartı: son bar (idx_last) zone’a dokunup zıt yönde net kapanış (reject)
         if not _ob_first_touch_reject(df, idx_last, side, z_high, z_low):
@@ -1280,7 +1291,8 @@ def _find_displacement_ob(df: pd.DataFrame, side: str):
             if side == 'short' and ((post['high'] >= z_low) & (post['low'] <= z_high)).any():
                 continue
         ob_id = f"{int(df.index[k].value)}_{side}_{round(z_high,6)}_{round(z_low,6)}"
-        dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}] FVG+BOS+retest+first_touch"
+        fvg_tag = "FVG+" if has_fvg else ""
+        dbg = f"disp_idx={k}, opp_idx={opp_idx}, zone=[{z_low:.6f},{z_high:.6f}] {fvg_tag}BOS+retest"
         return True, dbg, z_high, z_low, ob_id
     return False, "no_strict_ob", None, None, None
 def _has_fvg_after(df: pd.DataFrame, k: int, side: str) -> bool:
@@ -1297,7 +1309,8 @@ def _has_fvg_after(df: pd.DataFrame, k: int, side: str) -> bool:
         return np.isfinite(l_next) and np.isfinite(h_prev) and (l_next > h_prev)
     else:
         return np.isfinite(h_next) and np.isfinite(l_prev) and (h_next < l_prev)
-def _zone_too_wide(z_high: float, z_low: float, atrv: float, max_atr_mult: float = 0.60) -> bool:
+def _zone_too_wide(z_high: float, z_low: float, atrv: float, max_atr_mult: float = 0.80) -> bool:
+    """Zone genişliği kontrolü - 0.80*ATR'a kadar kabul (eskisi 0.60 çok dardı)"""
     if not all(map(np.isfinite, [z_high, z_low, atrv])) or atrv <= 0:
         return True
     return (abs(z_high - z_low) > max_atr_mult * atrv)
@@ -1499,13 +1512,22 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"Geçersiz ATR ({symbol} {timeframe}), skip.")
             return
         adx_last = float(df['adx'].iloc[-2]) if pd.notna(df['adx'].iloc[-2]) else np.nan
-        regime = get_regime_bucket(adx_last) # "strong" | "neutral" | "range"
+        # NOT: regime artık aşağıda bull_mode hesaplandıktan sonra belirleniyor
         atr_z = rolling_z(df['atr'], LOOKBACK_ATR) if 'atr' in df else 0.0
         async with _stats_lock:
             trend_prev = signal_cache.get(f"{symbol}_{timeframe}", _default_pos_state()).get('trend_on_prev', False)
         trend_on = (np.isfinite(adx_last) and ((adx_last >= BEAR_ADX_ON) or (trend_prev and adx_last > BEAR_ADX_OFF)))
         bull_mode = bool(trend_on)
         bear_mode = not bull_mode
+        
+        # DEĞİŞİKLİK: regime artık bull_mode'a (histerezis) bağlı
+        # Bu sayede trend içinde ADX 22'ye düşse bile "range" zıplaması olmaz
+        # Kasım gibi trend aylarında iyi sinyaller korunur
+        if bull_mode:
+            regime = "strong" if (np.isfinite(adx_last) and adx_last >= 28) else "neutral"
+        else:
+            regime = "range"
+        
         cur_key = f"{symbol}_{timeframe}"
         async with _stats_lock:
             st = signal_cache.setdefault(cur_key, _default_pos_state())
@@ -1569,8 +1591,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         obL_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "long")
         obS_trend_ok = (not OB_TREND_FILTER) or _ob_trend_filter(df, "short")
         # SMI, Gate, Touch doğrulaması
-        obL_smi_ok = (not ob_req_smi) or (smi_open_green and is_green)
-        obS_smi_ok = (not ob_req_smi) or (smi_open_red and is_red)
+        # SMI için gevşetildi: sadece yön kontrolü (pozitif VEYA yükseliyor yeterli)
+        obL_smi_ok = (not ob_req_smi) or (smi_positive or smi_up) and is_green
+        obS_smi_ok = (not ob_req_smi) or (smi_negative or smi_down) and is_red
         obL_gate_ok = (not ob_req_gate) or okL
         obS_gate_ok = (not ob_req_gate) or okS
         obL_touch_ok = (not OB_FIRST_TOUCH_ONLY) or (obL_id and (obL_id not in used_set))
@@ -1580,6 +1603,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             logger.debug(f"{symbol} {timeframe} FK_SHORT {fk_ok_S} | {fk_dbg_S}")
             logger.debug(f"{symbol} {timeframe} OB_LONG {obL_ok} | {obL_dbg} | rr_ok={obL_rr_ok} | smi_ok={obL_smi_ok} | gate_ok={obL_gate_ok} | touch_ok={obL_touch_ok} | trend_ok={obL_trend_ok}")
             logger.debug(f"{symbol} {timeframe} OB_SHORT {obS_ok} | {obS_dbg} | rr_ok={obS_rr_ok} | smi_ok={obS_smi_ok} | gate_ok={obS_gate_ok} | touch_ok={obS_touch_ok} | trend_ok={obS_trend_ok}")
+        # === OB DETECT LOG (INFO) ===
+        if obL_ok or obS_ok:
+            logger.info(f"🔶 OB DETECT: {symbol} L={obL_ok}(rr={obL_rr_ok},smi={obL_smi_ok},gate={obL_gate_ok},trend={obL_trend_ok}) S={obS_ok}(rr={obS_rr_ok},smi={obS_smi_ok},gate={obS_gate_ok},trend={obS_trend_ok})")
         ob_buy_standalone = USE_OB_STANDALONE and obL_ok and obL_rr_ok and obL_smi_ok and obL_gate_ok and obL_touch_ok and obL_trend_ok
         ob_sell_standalone = USE_OB_STANDALONE and obS_ok and obS_rr_ok and obS_smi_ok and obS_gate_ok and obS_touch_ok and obS_trend_ok
         # === SQZ Breakout tespiti ===
@@ -1588,6 +1614,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
         if VERBOSE_LOG:
             logger.debug(f"{symbol} {timeframe} SQZ_LONG {sqzL_ok} | {sqzL_dbg}")
             logger.debug(f"{symbol} {timeframe} SQZ_SHORT {sqzS_ok} | {sqzS_dbg}")
+        # === SQZ DETECT LOG (INFO) ===
+        if sqzL_ok or sqzS_ok:
+            logger.info(f"🔷 SQZ DETECT: {symbol} L={sqzL_ok}({sqzL_dbg}) S={sqzS_ok}({sqzS_dbg})")
         if REGIME1_ADX_ADAPTIVE_BAND and np.isfinite(adx_last):
             band_k = 0.20 if adx_last >= 25 else (0.30 if adx_last < 18 else REGIME1_BAND_K_DEFAULT)
         else:
@@ -1652,13 +1681,17 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
             dip_gate_ok = bool(dip_ok) # long için AND
             top_gate_ok = bool(top_ok) # short için AND
         # --- EMA Classic gate (EMA Cross/Grace + kalite + trend bandı + RR) ---
+        # DEĞİŞİKLİK: dip_gate_ok ve top_gate_ok artık EMA sinyaline bağlı
+        # Range'de dip/top onayı olmadan sinyal üretilmeyecek
         buy_classic = (
             allow_long and smi_open_green and is_green and okL and
-            fk_ok_L and long_band_ok and (pct_slope > slope_thr)
+            fk_ok_L and long_band_ok and (pct_slope > slope_thr) and
+            dip_gate_ok  # YENİ: Range'de dip onayı şart
         )
         sell_classic = (
             allow_short and smi_open_red and is_red and okS and
-            fk_ok_S and short_band_ok and (pct_slope < -slope_thr)
+            fk_ok_S and short_band_ok and (pct_slope < -slope_thr) and
+            top_gate_ok  # YENİ: Range'de top onayı şart
         )
         # === ÖNCELİK: OB > SQZ > EMA ===
         # 1) OB standalone
