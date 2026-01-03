@@ -24,9 +24,47 @@ import uuid
 import signal
 from dataclasses import dataclass, field
 from typing import Optional
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 # ================== Sabitler ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
+# ================== Email Ayarları ==================
+EMAIL_ENABLED = True  # Haftalık rapor maili aktif/pasif
+EMAIL_SMTP_SERVER = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com")
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_SENDER = os.getenv("EMAIL_SENDER", "")  # örn: botmail@gmail.com
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")  # Gmail App Password
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "")  # örn: senin@mail.com
+WEEKLY_REPORT_DAY = 6  # 0=Pazartesi, 6=Pazar
+WEEKLY_REPORT_HOUR = 21  # Saat 21:00'de gönder
+
+# ================== Haftalık İstatistikler ==================
+weekly_stats = {
+    "start_date": None,
+    "total_signals": 0,
+    "long_signals": 0,
+    "short_signals": 0,
+    "ema_signals": 0,
+    "sqz_signals": 0,
+    "ob_signals": 0,
+    "regime_strong": 0,
+    "regime_neutral": 0,
+    "regime_range": 0,
+    "adx_values": [],
+    "rejected_by_range": 0,
+    "rejected_by_dip_top": 0,
+    "rejected_by_fake_filter": 0,
+    "rejected_by_adx_low": 0,
+    "active_coins": [],
+    "trend_long_pct": 0,
+    "trend_short_pct": 0,
+}
+weekly_stats_lock = threading.Lock()
+last_weekly_report_date = None
+
 TEST_MODE = False
 VERBOSE_LOG = True
 STARTUP_MSG_ENABLED = True
@@ -1428,6 +1466,224 @@ def _log_false_breakdown():
         f = crit_false_counts[name]
         pct = (f / total * 100.0) if total else 0.0
         logger.info(f" - {name}: {f}/{total} ({pct:.1f}%)")
+
+# ================== Haftalık Rapor Sistemi ==================
+def reset_weekly_stats():
+    """Haftalık istatistikleri sıfırla"""
+    global weekly_stats
+    with weekly_stats_lock:
+        weekly_stats = {
+            "start_date": datetime.now(_safe_tz()).strftime("%Y-%m-%d %H:%M"),
+            "total_signals": 0,
+            "long_signals": 0,
+            "short_signals": 0,
+            "ema_signals": 0,
+            "sqz_signals": 0,
+            "ob_signals": 0,
+            "regime_strong": 0,
+            "regime_neutral": 0,
+            "regime_range": 0,
+            "adx_values": [],
+            "rejected_by_range": 0,
+            "rejected_by_dip_top": 0,
+            "rejected_by_fake_filter": 0,
+            "rejected_by_adx_low": 0,
+            "active_coins": [],
+            "trend_long_pct": 0,
+            "trend_short_pct": 0,
+        }
+    logger.info("Haftalık istatistikler sıfırlandı.")
+
+def record_signal_stats(signal_type: str, reason: str, regime: str, adx_value: float, symbol: str):
+    """Sinyal istatistiklerini kaydet"""
+    with weekly_stats_lock:
+        weekly_stats["total_signals"] += 1
+        
+        # Long/Short
+        if signal_type == "buy":
+            weekly_stats["long_signals"] += 1
+        else:
+            weekly_stats["short_signals"] += 1
+        
+        # Reason (EMA/SQZ/OB)
+        if "EMA" in reason or "Grace" in reason:
+            weekly_stats["ema_signals"] += 1
+        elif "SQZ" in reason:
+            weekly_stats["sqz_signals"] += 1
+        elif "Order Block" in reason or "OB" in reason:
+            weekly_stats["ob_signals"] += 1
+        
+        # Regime
+        if regime == "strong":
+            weekly_stats["regime_strong"] += 1
+        elif regime == "neutral":
+            weekly_stats["regime_neutral"] += 1
+        else:
+            weekly_stats["regime_range"] += 1
+        
+        # ADX
+        if np.isfinite(adx_value):
+            weekly_stats["adx_values"].append(adx_value)
+        
+        # Active coins
+        if symbol not in weekly_stats["active_coins"]:
+            weekly_stats["active_coins"].append(symbol)
+
+def record_rejection_stats(reason: str):
+    """Reddedilen sinyal istatistiklerini kaydet"""
+    with weekly_stats_lock:
+        if "range" in reason.lower():
+            weekly_stats["rejected_by_range"] += 1
+        elif "dip" in reason.lower() or "top" in reason.lower() or "gate" in reason.lower():
+            weekly_stats["rejected_by_dip_top"] += 1
+        elif "fake" in reason.lower() or "filter" in reason.lower() or "ff" in reason.lower():
+            weekly_stats["rejected_by_fake_filter"] += 1
+        elif "adx" in reason.lower():
+            weekly_stats["rejected_by_adx_low"] += 1
+
+def generate_weekly_report() -> str:
+    """Haftalık rapor metni oluştur"""
+    with weekly_stats_lock:
+        stats = weekly_stats.copy()
+    
+    # ADX ortalaması
+    avg_adx = np.mean(stats["adx_values"]) if stats["adx_values"] else 0
+    
+    # Trend yönü yüzdesi
+    total_signals = stats["total_signals"] or 1
+    long_pct = (stats["long_signals"] / total_signals) * 100
+    short_pct = (stats["short_signals"] / total_signals) * 100
+    
+    # Regime yüzdeleri
+    regime_total = stats["regime_strong"] + stats["regime_neutral"] + stats["regime_range"] or 1
+    strong_pct = (stats["regime_strong"] / regime_total) * 100
+    neutral_pct = (stats["regime_neutral"] / regime_total) * 100
+    range_pct = (stats["regime_range"] / regime_total) * 100
+    
+    # Toplam reddedilen
+    total_rejected = (stats["rejected_by_range"] + stats["rejected_by_dip_top"] + 
+                      stats["rejected_by_fake_filter"] + stats["rejected_by_adx_low"])
+    
+    # En aktif coinler (ilk 5)
+    top_coins = stats["active_coins"][:5] if stats["active_coins"] else ["Yok"]
+    
+    report = f"""
+📊 HAFTALIK RAPOR - Kripto Sinyal Kanalı
+{'='*50}
+
+📅 Dönem: {stats["start_date"]} - {datetime.now(_safe_tz()).strftime("%Y-%m-%d %H:%M")}
+
+{'─'*50}
+📈 SİNYAL ÖZETİ
+{'─'*50}
+├── Toplam sinyal: {stats["total_signals"]}
+├── Long: {stats["long_signals"]} ({long_pct:.0f}%)
+├── Short: {stats["short_signals"]} ({short_pct:.0f}%)
+│
+├── EMA Cross/Grace: {stats["ema_signals"]}
+├── SQZ Breakout: {stats["sqz_signals"]}
+└── Order Block: {stats["ob_signals"]}
+
+{'─'*50}
+🎯 REJİM DAĞILIMI
+{'─'*50}
+├── Strong (ADX≥28): {stats["regime_strong"]} ({strong_pct:.0f}%)
+├── Neutral (ADX 23-28): {stats["regime_neutral"]} ({neutral_pct:.0f}%)
+└── Range (ADX<23): {stats["regime_range"]} ({range_pct:.0f}%)
+
+{'─'*50}
+📉 ADX İSTATİSTİKLERİ
+{'─'*50}
+├── Ortalama ADX (sinyal anı): {avg_adx:.1f}
+├── Min ADX: {min(stats["adx_values"]) if stats["adx_values"] else 0:.1f}
+└── Max ADX: {max(stats["adx_values"]) if stats["adx_values"] else 0:.1f}
+
+{'─'*50}
+🚫 FİLTRE ETKİSİ (Reddedilen Sinyaller)
+{'─'*50}
+├── Range modu nedeniyle: {stats["rejected_by_range"]}
+├── Dip/Top gate nedeniyle: {stats["rejected_by_dip_top"]}
+├── Fake filter nedeniyle: {stats["rejected_by_fake_filter"]}
+├── Düşük ADX nedeniyle: {stats["rejected_by_adx_low"]}
+└── TOPLAM ENGELLENENİ: {total_rejected}
+
+{'─'*50}
+🪙 AKTİF COİNLER (İlk 5)
+{'─'*50}
+└── {', '.join(top_coins)}
+
+{'─'*50}
+📊 TREND YÖNÜ
+{'─'*50}
+├── Long ağırlıklı: {long_pct:.0f}%
+└── Short ağırlıklı: {short_pct:.0f}%
+
+{'='*50}
+🤖 Kripto Sinyal Kanalı Botu v4
+"""
+    return report
+
+def send_weekly_email(report: str) -> bool:
+    """Haftalık raporu email olarak gönder"""
+    if not EMAIL_ENABLED:
+        logger.info("Email gönderimi devre dışı.")
+        return False
+    
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
+        logger.warning("Email ayarları eksik! EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER kontrol edin.")
+        return False
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECEIVER
+        msg['Subject'] = f"📊 Haftalık Kripto Sinyal Raporu - {datetime.now(_safe_tz()).strftime('%d/%m/%Y')}"
+        
+        msg.attach(MIMEText(report, 'plain', 'utf-8'))
+        
+        server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        server.quit()
+        
+        logger.info(f"Haftalık rapor emaili gönderildi: {EMAIL_RECEIVER}")
+        return True
+    except Exception as e:
+        logger.error(f"Email gönderimi başarısız: {e}")
+        return False
+
+async def check_and_send_weekly_report():
+    """Pazar günü saat 21:00'de haftalık rapor gönder"""
+    global last_weekly_report_date
+    
+    tz = _safe_tz()
+    now = datetime.now(tz)
+    
+    # Pazar günü mü ve saat 21:00'i geçti mi?
+    if now.weekday() == WEEKLY_REPORT_DAY and now.hour >= WEEKLY_REPORT_HOUR:
+        today = now.strftime("%Y-%m-%d")
+        
+        # Bugün zaten gönderildi mi?
+        if last_weekly_report_date != today:
+            logger.info("Haftalık rapor hazırlanıyor...")
+            
+            report = generate_weekly_report()
+            
+            # Email gönder
+            email_sent = send_weekly_email(report)
+            
+            # Telegram'a da gönder (opsiyonel)
+            await enqueue_message(f"📊 Haftalık Rapor Hazır!\n\nEmail gönderildi: {'✅' if email_sent else '❌'}\n\nDetaylar email'de.")
+            
+            # İstatistikleri sıfırla
+            reset_weekly_stats()
+            
+            # Bugün gönderildi olarak işaretle
+            last_weekly_report_date = today
+            
+            logger.info("Haftalık rapor gönderildi ve istatistikler sıfırlandı.")
+
 # ================== Sinyal Döngüsü ==================
 async def entry_gate_v3(df, side, adx_last, vote_ntx, ntx_thr, bear_mode, symbol=None, regime: str = None):
     band_k = G3_BAND_K
@@ -1894,6 +2150,8 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                                       tp1_price, tp2_price,
                                       reason_line=reason, tz_name=DEFAULT_TZ)
                 )
+                # Haftalık istatistik kaydı
+                record_signal_stats("buy", reason, regime, adx_last, symbol)
                 save_state()
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
@@ -1981,6 +2239,8 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                                       tp1_price, tp2_price,
                                       reason_line=reason, tz_name=DEFAULT_TZ)
                 )
+                # Haftalık istatistik kaydı
+                record_signal_stats("sell", reason, regime, adx_last, symbol)
                 save_state()
         if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
@@ -2126,11 +2386,18 @@ async def main():
     except NotImplementedError:
         pass
     asyncio.create_task(message_sender())
+    
+    # Haftalık istatistikleri başlat
+    reset_weekly_stats()
+    
     if STARTUP_MSG_ENABLED:
         await enqueue_message("Bot başlatıldı! 🚀")
     await load_markets()
     while not _stop.is_set():
         try:
+            # Haftalık rapor kontrolü (Pazar 21:00)
+            await check_and_send_weekly_report()
+            
             async with _stats_lock:
                 scan_status.clear()
             crit_false_counts.clear()
