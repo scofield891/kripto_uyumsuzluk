@@ -58,6 +58,8 @@ weekly_stats = {
     "rejected_by_dip_top": 0,
     "rejected_by_fake_filter": 0,
     "rejected_by_adx_low": 0,
+    "rejected_late_tp1": 0,      # YENİ: Fiyat TP1'i geçmiş (geç sinyal)
+    "rejected_late_dist": 0,     # YENİ: Entry'den çok uzak (1.5 ATR+)
     "active_coins": [],
     "trend_long_pct": 0,
     "trend_short_pct": 0,
@@ -1488,6 +1490,8 @@ def reset_weekly_stats():
             "rejected_by_dip_top": 0,
             "rejected_by_fake_filter": 0,
             "rejected_by_adx_low": 0,
+            "rejected_late_tp1": 0,      # v6: Geç sinyal (TP1 geçmiş)
+            "rejected_late_dist": 0,     # v6: Geç sinyal (entry uzak)
             "active_coins": [],
             "trend_long_pct": 0,
             "trend_short_pct": 0,
@@ -1562,7 +1566,8 @@ def generate_weekly_report() -> str:
     
     # Toplam reddedilen
     total_rejected = (stats["rejected_by_range"] + stats["rejected_by_dip_top"] + 
-                      stats["rejected_by_fake_filter"] + stats["rejected_by_adx_low"])
+                      stats["rejected_by_fake_filter"] + stats["rejected_by_adx_low"] +
+                      stats.get("rejected_late_tp1", 0) + stats.get("rejected_late_dist", 0))
     
     # En aktif coinler (ilk 5)
     top_coins = stats["active_coins"][:5] if stats["active_coins"] else ["Yok"]
@@ -1605,6 +1610,8 @@ def generate_weekly_report() -> str:
 ├── Dip/Top gate nedeniyle: {stats["rejected_by_dip_top"]}
 ├── Fake filter nedeniyle: {stats["rejected_by_fake_filter"]}
 ├── Düşük ADX nedeniyle: {stats["rejected_by_adx_low"]}
+├── Geç sinyal (TP1 geçmiş): {stats.get("rejected_late_tp1", 0)}
+├── Geç sinyal (entry uzak): {stats.get("rejected_late_dist", 0)}
 └── TOPLAM ENGELLENENİ: {total_rejected}
 
 {'─'*50}
@@ -1619,7 +1626,7 @@ def generate_weekly_report() -> str:
 └── Short ağırlıklı: {short_pct:.0f}%
 
 {'='*50}
-🤖 Kripto Sinyal Kanalı Botu v4
+🤖 Kripto Sinyal Kanalı Botu v6
 """
     return report
 
@@ -2107,6 +2114,28 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     await mark_status(symbol, "skip", "invalid_current_price")
                     logger.debug(f"Geçersiz mevcut fiyat ({symbol} {timeframe}), skip.")
                     return
+                
+                # HOTFIX v6: Geç sinyal kontrolü (OB bug fix)
+                # 1. Fiyat zaten TP1'i geçtiyse = MISSED, trade açma
+                if current_price >= tp1_price:
+                    if VERBOSE_LOG:
+                        logger.debug(f"{symbol} {timeframe}: BUY MISSED (fiyat TP1 üstünde: {current_price:.6f} >= {tp1_price:.6f}) 🚫")
+                    await mark_status(symbol, "skip", "late_signal_past_tp1")
+                    with weekly_stats_lock:
+                        weekly_stats["rejected_late_tp1"] = weekly_stats.get("rejected_late_tp1", 0) + 1
+                    return
+                
+                # 2. Entry'den 1.5 ATR'den fazla uzaksa = çok geç, trade açma
+                max_entry_dist = 1.5 * atr_value
+                entry_dist = abs(current_price - entry_price)
+                if entry_dist > max_entry_dist:
+                    if VERBOSE_LOG:
+                        logger.debug(f"{symbol} {timeframe}: BUY MISSED (entry uzak: {entry_dist:.6f} > {max_entry_dist:.6f} ATR) 🚫")
+                    await mark_status(symbol, "skip", "late_signal_entry_far")
+                    with weekly_stats_lock:
+                        weekly_stats["rejected_late_dist"] = weekly_stats.get("rejected_late_dist", 0) + 1
+                    return
+                
                 tr_med = _tr_series(df).rolling(20).median().iloc[-2]
                 instant_pad = max(INSTANT_SL_BUFFER * atr_value, 0.4 * tr_med)
                 if current_price <= sl_price + instant_pad:
@@ -2196,6 +2225,28 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     await mark_status(symbol, "skip", "invalid_current_price")
                     logger.debug(f"Geçersiz mevcut fiyat ({symbol} {timeframe}), skip.")
                     return
+                
+                # HOTFIX v6: Geç sinyal kontrolü (OB bug fix)
+                # 1. Fiyat zaten TP1'i geçtiyse = MISSED, trade açma
+                if current_price <= tp1_price:
+                    if VERBOSE_LOG:
+                        logger.debug(f"{symbol} {timeframe}: SELL MISSED (fiyat TP1 altında: {current_price:.6f} <= {tp1_price:.6f}) 🚫")
+                    await mark_status(symbol, "skip", "late_signal_past_tp1")
+                    with weekly_stats_lock:
+                        weekly_stats["rejected_late_tp1"] = weekly_stats.get("rejected_late_tp1", 0) + 1
+                    return
+                
+                # 2. Entry'den 1.5 ATR'den fazla uzaksa = çok geç, trade açma
+                max_entry_dist = 1.5 * atr_value
+                entry_dist = abs(current_price - entry_price)
+                if entry_dist > max_entry_dist:
+                    if VERBOSE_LOG:
+                        logger.debug(f"{symbol} {timeframe}: SELL MISSED (entry uzak: {entry_dist:.6f} > {max_entry_dist:.6f} ATR) 🚫")
+                    await mark_status(symbol, "skip", "late_signal_entry_far")
+                    with weekly_stats_lock:
+                        weekly_stats["rejected_late_dist"] = weekly_stats.get("rejected_late_dist", 0) + 1
+                    return
+                
                 tr_med = _tr_series(df).rolling(20).median().iloc[-2]
                 instant_pad = max(INSTANT_SL_BUFFER * atr_value, 0.4 * tr_med)
                 if current_price >= sl_price - instant_pad:
