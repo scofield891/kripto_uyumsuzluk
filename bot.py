@@ -33,23 +33,16 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 # ================== Execution Engine ==================
 EXEC_ENABLED = os.getenv("EXEC_ENABLED", "false").lower() == "true"
-EXEC_TESTNET = os.getenv("EXEC_TESTNET", "false").lower() == "true"
-EXEC_MAX_POS = int(os.getenv("EXEC_MAX_POS", "4"))
-
 exec_engine = None
 if EXEC_ENABLED:
     from execution_engine import ExecutionEngine, ExecConfig
-    exec_config = ExecConfig(
-        testnet=EXEC_TESTNET,
+    exec_engine = ExecutionEngine(ExecConfig(
+        testnet=os.getenv("EXEC_TESTNET", "false").lower() == "true",
         position_size_pct=float(os.getenv("EXEC_SIZE_PCT", "10.0")),
         default_leverage=int(os.getenv("EXEC_LEVERAGE", "5")),
-        max_open_positions=EXEC_MAX_POS,
-        max_daily_loss_pct=15.0,
-        max_consecutive_losses=3,
-        tp1_close_pct=0.30,
-        tp2_close_pct=0.30,
-    )
-    exec_engine = ExecutionEngine(exec_config)
+        max_open_positions=int(os.getenv("EXEC_MAX_POS", "4")),
+        tp1_close_pct=0.30, tp2_close_pct=0.30,
+    ))
 
 # ================== Email Ayarları ==================
 EMAIL_ENABLED = True  # Haftalık rapor maili aktif/pasif
@@ -2202,22 +2195,16 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 # Haftalık istatistik kaydı
                 record_signal_stats("buy", reason, regime, adx_last, symbol)
                 save_state()
-                # === EXECUTION: LONG AÇ ===
                 if exec_engine and EXEC_ENABLED:
                     try:
-                        exec_ok = await exec_engine.open_long(
-                            symbol=symbol, entry=entry_price, sl=sl_price,
-                            tp1=tp1_price, tp2=tp2_price, reason=reason,
-                            plan_desc=plan.get('desc', 'trend'),
-                            tp1_pct=plan.get('tp1_pct', 0.40),
-                            tp2_pct=plan.get('tp2_pct', 0.30),
-                        )
-                        if exec_ok:
+                        _eok = await exec_engine.open_long(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
+                        if _eok:
                             await enqueue_message(f"🤖 {symbol}: LONG EMİR AÇILDI ✅")
                         else:
                             await enqueue_message(f"⚠️ {symbol}: LONG emir açılamadı")
                     except Exception as ex:
-                        logger.error(f"Execution hatası (BUY): {ex}")
+                        logger.error(f"Exec BUY hatası: {ex}")
+                        await enqueue_message(f"❌ {symbol}: Exec hata: {str(ex)[:100]}")
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
                 current_pos['last_signal_time'] and
@@ -2329,29 +2316,23 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 # Haftalık istatistik kaydı
                 record_signal_stats("sell", reason, regime, adx_last, symbol)
                 save_state()
-                # === EXECUTION: SHORT AÇ ===
                 if exec_engine and EXEC_ENABLED:
                     try:
-                        exec_ok = await exec_engine.open_short(
-                            symbol=symbol, entry=entry_price, sl=sl_price,
-                            tp1=tp1_price, tp2=tp2_price, reason=reason,
-                            plan_desc=plan.get('desc', 'trend'),
-                            tp1_pct=plan.get('tp1_pct', 0.40),
-                            tp2_pct=plan.get('tp2_pct', 0.30),
-                        )
-                        if exec_ok:
+                        _eok = await exec_engine.open_short(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
+                        if _eok:
                             await enqueue_message(f"🤖 {symbol}: SHORT EMİR AÇILDI ✅")
                         else:
                             await enqueue_message(f"⚠️ {symbol}: SHORT emir açılamadı")
                     except Exception as ex:
-                        logger.error(f"Execution hatası (SELL): {ex}")
-
+                        logger.error(f"Exec SELL hatası: {ex}")
+                        await enqueue_message(f"❌ {symbol}: Exec hata: {str(ex)[:100]}")
+        if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
             if current_pos['highest_price'] is None or (np.isfinite(current_price) and current_price > current_pos['highest_price']):
                 async with _stats_lock:
                     current_pos['highest_price'] = current_price
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-            if not current_pos['tp1_hit'] and np.isfinite(current_price) and current_price >= current_pos['tp1_price']:
+            if not current_pos['tp1_hit'] and current_pos['tp1_price'] is not None and np.isfinite(current_price) and current_price >= current_pos['tp1_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec = current_pos.get('tp1_pct', 0.30)
                 async with _stats_lock:
@@ -2366,9 +2347,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     f"Kalan: %{int(current_pos['remaining_ratio']*100)}"
                 )
                 save_state()
-                # === EXECUTION: TP1 HIT (LONG) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_tp1_hit(symbol)
+                    try: await exec_engine.handle_tp1_hit(symbol)
+                    except Exception as ex: logger.error(f"Exec TP1 LONG: {ex}")
             if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and np.isfinite(current_price) and current_price >= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec2 = current_pos.get('tp2_pct', 0.30)
@@ -2382,9 +2363,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     f"P/L: {profit_percent:+.2f}% | %{int(dec2*100)} kapandı, kalan %{int(current_pos['remaining_ratio']*100)} açık."
                 )
                 save_state()
-                # === EXECUTION: TP2 HIT (LONG) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_tp2_hit(symbol)
+                    try: await exec_engine.handle_tp2_hit(symbol)
+                    except Exception as ex: logger.error(f"Exec TP2 LONG: {ex}")
             if exit_cross_long:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
@@ -2398,11 +2379,11 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: EMA EXIT (LONG) 🔁 Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
-                # === EXECUTION: EMA EXIT (LONG) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_ema_exit(symbol, current_price)
+                    try: await exec_engine.handle_ema_exit(symbol, current_price)
+                    except Exception as ex: logger.error(f"Exec EMA LONG: {ex}")
                 return
-            if np.isfinite(current_price) and current_price <= current_pos['sl_price']:
+            if np.isfinite(current_price) and current_pos['sl_price'] is not None and current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
@@ -2415,9 +2396,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: STOP LONG ⛔ Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
-                # === EXECUTION: SL HIT (LONG) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_sl_hit(symbol, current_price)
+                    try: await exec_engine.handle_sl_hit(symbol, current_price)
+                    except Exception as ex: logger.error(f"Exec SL LONG: {ex}")
                 return
             async with _stats_lock:
                 signal_cache[f"{symbol}_{timeframe}"] = current_pos
@@ -2427,7 +2408,7 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 async with _stats_lock:
                     current_pos['lowest_price'] = current_price
                     signal_cache[f"{symbol}_{timeframe}"] = current_pos
-            if not current_pos['tp1_hit'] and np.isfinite(current_price) and current_price <= current_pos['tp1_price']:
+            if not current_pos['tp1_hit'] and current_pos['tp1_price'] is not None and np.isfinite(current_price) and current_price <= current_pos['tp1_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec = current_pos.get('tp1_pct', 0.30)
                 async with _stats_lock:
@@ -2442,9 +2423,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     f"Kalan: %{int(current_pos['remaining_ratio']*100)}"
                 )
                 save_state()
-                # === EXECUTION: TP1 HIT (SHORT) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_tp1_hit(symbol)
+                    try: await exec_engine.handle_tp1_hit(symbol)
+                    except Exception as ex: logger.error(f"Exec TP1 SHORT: {ex}")
             if current_pos['tp2_price'] is not None and (not current_pos['tp2_hit']) and np.isfinite(current_price) and current_price <= current_pos['tp2_price'] and current_pos['tp1_hit']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 dec2 = current_pos.get('tp2_pct', 0.30)
@@ -2458,9 +2439,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     f"P/L: {profit_percent:+.2f}% | %{int(dec2*100)} kapandı, kalan %{int(current_pos['remaining_ratio']*100)} açık."
                 )
                 save_state()
-                # === EXECUTION: TP2 HIT (SHORT) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_tp2_hit(symbol)
+                    try: await exec_engine.handle_tp2_hit(symbol)
+                    except Exception as ex: logger.error(f"Exec TP2 SHORT: {ex}")
             if exit_cross_short:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
@@ -2474,11 +2455,11 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: EMA EXIT (SHORT) 🔁 Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
-                # === EXECUTION: EMA EXIT (SHORT) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_ema_exit(symbol, current_price)
+                    try: await exec_engine.handle_ema_exit(symbol, current_price)
+                    except Exception as ex: logger.error(f"Exec EMA SHORT: {ex}")
                 return
-            if np.isfinite(current_price) and current_price >= current_pos['sl_price']:
+            if np.isfinite(current_price) and current_pos['sl_price'] is not None and current_price >= current_pos['sl_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 async with _stats_lock:
                     current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
@@ -2491,9 +2472,9 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                     signal_cache[f"{symbol}_{timeframe}"]['used_ob_ids'] = used_set
                 await enqueue_message(f"{symbol} {timeframe}: STOP SHORT ⛔ Price: {fmt_sym(symbol, current_price)} P/L: {profit_percent:+.2f}% Kalan: %{current_pos['remaining_ratio']*100:.0f}")
                 save_state()
-                # === EXECUTION: SL HIT (SHORT) ===
                 if exec_engine and EXEC_ENABLED:
-                    await exec_engine.handle_sl_hit(symbol, current_price)
+                    try: await exec_engine.handle_sl_hit(symbol, current_price)
+                    except Exception as ex: logger.error(f"Exec SL SHORT: {ex}")
                 return
             async with _stats_lock:
                 signal_cache[f"{symbol}_{timeframe}"] = current_pos
@@ -2544,12 +2525,9 @@ async def main():
                 "skip={skip} | error={error} | missing={missing}".format(**cov)
             )
             _log_false_breakdown()
-            # === EXECUTION: Pozisyon Senkronizasyonu ===
             if exec_engine and EXEC_ENABLED:
-                try:
-                    await exec_engine.sync_positions()
-                except Exception as ex:
-                    logger.error(f"Execution sync hatası: {ex}")
+                try: await exec_engine.sync_positions()
+                except Exception as ex: logger.error(f"Exec sync: {ex}")
             elapsed = time.time() - t_start
             logger.debug(
                 "Tur bitti | total={total} | ok={ok} | cooldown={cooldown} | min_bars={min_bars} | "
