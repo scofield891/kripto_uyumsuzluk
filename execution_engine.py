@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger("execution_engine")
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_h)
 
 
 @dataclass
@@ -164,9 +169,11 @@ class ExecutionEngine:
                 logger.warning(f"Margin hatasi: {e}")
 
     async def open_long(self, symbol, entry, sl, tp1, tp2=None, reason="", plan_desc="trend", tp1_pct=None, tp2_pct=None):
+        """Returns (success: bool, reason: str)"""
         return await self._open_position(symbol, "long", entry, sl, tp1, tp2, reason, plan_desc, tp1_pct, tp2_pct)
 
     async def open_short(self, symbol, entry, sl, tp1, tp2=None, reason="", plan_desc="trend", tp1_pct=None, tp2_pct=None):
+        """Returns (success: bool, reason: str)"""
         return await self._open_position(symbol, "short", entry, sl, tp1, tp2, reason, plan_desc, tp1_pct, tp2_pct)
 
     async def _open_position(self, symbol, side, entry, sl, tp1, tp2=None, reason="", plan_desc="trend", tp1_pct=None, tp2_pct=None):
@@ -174,21 +181,21 @@ class ExecutionEngine:
             ok, why = self._circuit_breaker_ok()
             if not ok:
                 logger.warning(f"BLOCK {symbol}: {why}")
-                return False
+                return False, f"circuit_breaker: {why}"
             if symbol in self.positions:
                 logger.warning(f"{symbol}: zaten acik")
-                return False
+                return False, "zaten acik pozisyon var"
             try:
                 balance = await self.get_balance()
                 if balance <= 0:
-                    return False
+                    return False, f"bakiye yetersiz: {balance}"
                 await asyncio.to_thread(self.exchange.load_markets)
                 await self.set_margin_mode(symbol, "isolated")
                 await self.set_leverage(symbol)
                 qty, margin_used = self.calculate_position_size(balance, entry)
                 qty = self._round_qty(symbol, qty)
                 if qty <= 0:
-                    return False
+                    return False, f"qty=0 (margin={margin_used:.2f}$, entry={entry})"
 
                 order_side = "buy" if side == "long" else "sell"
                 logger.info(f"OPEN {symbol} {side.upper()} qty={qty} entry~{entry} SL={sl} TP1={tp1} TP2={tp2}")
@@ -234,11 +241,11 @@ class ExecutionEngine:
                     opened_at=datetime.now().isoformat(), signal_reason=reason,
                     plan_desc=plan_desc, tp1_close_pct=_tp1p, tp2_close_pct=_tp2p)
                 self._save_state()
-                return True
+                return True, "ok"
             except Exception as e:
                 logger.exception(f"OPEN FAIL {symbol}: {e}")
                 await self._emergency_cleanup(symbol)
-                return False
+                return False, str(e)[:150]
 
     async def handle_tp1_hit(self, symbol):
         async with self._lock:
