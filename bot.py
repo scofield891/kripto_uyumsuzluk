@@ -2197,14 +2197,15 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 save_state()
                 if exec_engine and EXEC_ENABLED:
                     try:
-                        _eok = await exec_engine.open_long(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
+                        _eok, _ereason = await exec_engine.open_long(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
                         if _eok:
                             await enqueue_message(f"🤖 {symbol}: LONG EMİR AÇILDI ✅")
                         else:
-                            await enqueue_message(f"⚠️ {symbol}: LONG emir açılamadı")
+                            await enqueue_message(f"⚠️ {symbol}: LONG açılamadı → {_ereason}")
                     except Exception as ex:
                         logger.error(f"Exec BUY hatası: {ex}")
                         await enqueue_message(f"❌ {symbol}: Exec hata: {str(ex)[:100]}")
+                return  # Sinyal oluşturuldu, TP/SL kontrolü sonraki döngüde yapılsın
         elif sell_condition and current_pos['signal'] != 'sell':
             cooldown_active = (
                 current_pos['last_signal_time'] and
@@ -2318,14 +2319,15 @@ async def check_signals(symbol: str, timeframe: str = '4h') -> None:
                 save_state()
                 if exec_engine and EXEC_ENABLED:
                     try:
-                        _eok = await exec_engine.open_short(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
+                        _eok, _ereason = await exec_engine.open_short(symbol=symbol, entry=entry_price, sl=sl_price, tp1=tp1_price, tp2=tp2_price, reason=reason, plan_desc=plan.get('desc','trend'), tp1_pct=plan.get('tp1_pct',0.30), tp2_pct=plan.get('tp2_pct',0.30))
                         if _eok:
                             await enqueue_message(f"🤖 {symbol}: SHORT EMİR AÇILDI ✅")
                         else:
-                            await enqueue_message(f"⚠️ {symbol}: SHORT emir açılamadı")
+                            await enqueue_message(f"⚠️ {symbol}: SHORT açılamadı → {_ereason}")
                     except Exception as ex:
                         logger.error(f"Exec SELL hatası: {ex}")
                         await enqueue_message(f"❌ {symbol}: Exec hata: {str(ex)[:100]}")
+                return  # Sinyal oluşturuldu, TP/SL kontrolü sonraki döngüde yapılsın
         if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
             if current_pos['highest_price'] is None or (np.isfinite(current_price) and current_price > current_pos['highest_price']):
