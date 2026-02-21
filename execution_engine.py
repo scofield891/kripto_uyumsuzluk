@@ -228,9 +228,12 @@ class ExecutionEngine:
                 tp1_qty = self._round_qty(symbol, actual_qty * _tp1p)
                 tp1_pr = self._round_price(symbol, tp1)
                 tp1_oid = None
+                # LONG TP: fiyat yükselince tetiklen (1=ascending), SHORT TP: fiyat düşünce (2=descending)
+                tp_trigger_dir = 1 if side == "long" else 2
                 if tp1_qty > 0:
                     try:
-                        r = await asyncio.to_thread(self.exchange.create_order, symbol, "limit", sl_side, tp1_qty, tp1_pr, {'reduceOnly': True})
+                        r = await asyncio.to_thread(self.exchange.create_order, symbol, "market", sl_side, tp1_qty, tp1_pr,
+                            {'stopPrice': tp1_pr, 'triggerPrice': tp1_pr, 'triggerDirection': tp_trigger_dir, 'reduceOnly': True})
                         tp1_oid = r.get('id', '')
                     except Exception as e:
                         logger.warning(f"TP1 emir hatasi: {e}")
@@ -242,7 +245,8 @@ class ExecutionEngine:
                     tp2_pr = self._round_price(symbol, tp2)
                     if tp2_qty > 0:
                         try:
-                            r = await asyncio.to_thread(self.exchange.create_order, symbol, "limit", sl_side, tp2_qty, tp2_pr, {'reduceOnly': True})
+                            r = await asyncio.to_thread(self.exchange.create_order, symbol, "market", sl_side, tp2_qty, tp2_pr,
+                                {'stopPrice': tp2_pr, 'triggerPrice': tp2_pr, 'triggerDirection': tp_trigger_dir, 'reduceOnly': True})
                             tp2_oid = r.get('id', '')
                         except Exception as e:
                             logger.warning(f"TP2 emir hatasi: {e}")
