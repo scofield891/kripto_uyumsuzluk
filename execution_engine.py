@@ -119,8 +119,10 @@ class ExecutionEngine:
     async def get_balance(self):
         try:
             bal = await asyncio.to_thread(self.exchange.fetch_balance)
-            free = float(bal.get('USDT', {}).get('free', 0))
-            logger.info(f"Bakiye: {free:.2f} USDT")
+            usdt = bal.get('USDT', {})
+            free = float(usdt.get('free', 0) or 0)
+            total = float(usdt.get('total', 0) or 0)
+            logger.info(f"Bakiye: free={free:.2f} total={total:.2f} USDT")
             return free
         except Exception as e:
             logger.error(f"Bakiye hatasi: {e}")
@@ -178,6 +180,16 @@ class ExecutionEngine:
 
     async def _open_position(self, symbol, side, entry, sl, tp1, tp2=None, reason="", plan_desc="trend", tp1_pct=None, tp2_pct=None):
         async with self._lock:
+            # None/NaN guard
+            try:
+                entry = float(entry) if entry is not None else 0.0
+                sl = float(sl) if sl is not None else 0.0
+                tp1 = float(tp1) if tp1 is not None else 0.0
+                tp2 = float(tp2) if tp2 is not None else None
+            except (TypeError, ValueError) as e:
+                return False, f"gecersiz fiyat: {e}"
+            if entry <= 0 or sl <= 0 or tp1 <= 0:
+                return False, f"fiyat 0/None (entry={entry}, sl={sl}, tp1={tp1})"
             ok, why = self._circuit_breaker_ok()
             if not ok:
                 logger.warning(f"BLOCK {symbol}: {why}")
@@ -200,8 +212,8 @@ class ExecutionEngine:
                 order_side = "buy" if side == "long" else "sell"
                 logger.info(f"OPEN {symbol} {side.upper()} qty={qty} entry~{entry} SL={sl} TP1={tp1} TP2={tp2}")
                 entry_order = await asyncio.to_thread(self.exchange.create_order, symbol, "market", order_side, qty)
-                actual_entry = float(entry_order.get('average', entry_order.get('price', entry)))
-                actual_qty = float(entry_order.get('filled', qty))
+                actual_entry = float(entry_order.get('average') or entry_order.get('price') or entry)
+                actual_qty = float(entry_order.get('filled') or qty)
 
                 sl_price = self._round_price(symbol, sl)
                 sl_side = "sell" if side == "long" else "buy"
