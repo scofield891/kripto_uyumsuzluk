@@ -217,9 +217,11 @@ class ExecutionEngine:
 
                 sl_price = self._round_price(symbol, sl)
                 sl_side = "sell" if side == "long" else "buy"
+                # LONG SL: fiyat düşünce tetiklen (2=descending), SHORT SL: fiyat yükselince (1=ascending)
+                trigger_dir = 2 if side == "long" else 1
                 sl_order = await asyncio.to_thread(
                     self.exchange.create_order, symbol, "market", sl_side, actual_qty, sl_price,
-                    {'stopPrice': sl_price, 'triggerPrice': sl_price, 'reduceOnly': True, 'stopLoss': sl_price})
+                    {'stopPrice': sl_price, 'triggerPrice': sl_price, 'triggerDirection': trigger_dir, 'reduceOnly': True})
                 sl_oid = sl_order.get('id', '')
 
                 _tp1p = tp1_pct or self.config.tp1_close_pct
@@ -276,9 +278,10 @@ class ExecutionEngine:
                 if pos.remaining_qty > 0:
                     new_sl = self._round_price(symbol, pos.entry_price)
                     sl_side = "sell" if pos.side == "long" else "buy"
+                    trigger_dir = 2 if pos.side == "long" else 1
                     r = await asyncio.to_thread(
                         self.exchange.create_order, symbol, "market", sl_side, pos.remaining_qty, new_sl,
-                        {'stopPrice': new_sl, 'triggerPrice': new_sl, 'reduceOnly': True, 'stopLoss': new_sl})
+                        {'stopPrice': new_sl, 'triggerPrice': new_sl, 'triggerDirection': trigger_dir, 'reduceOnly': True})
                     pos.sl_order_id = r.get('id', '')
                     pos.sl_price = new_sl
                     logger.info(f"TP1 {symbol}: SL girise cekildi @ {new_sl}")
@@ -304,9 +307,10 @@ class ExecutionEngine:
                         await asyncio.to_thread(self.exchange.cancel_order, pos.sl_order_id, symbol)
                         sl_side = "sell" if pos.side == "long" else "buy"
                         new_sl = self._round_price(symbol, pos.entry_price)
+                        trigger_dir = 2 if pos.side == "long" else 1
                         r = await asyncio.to_thread(
                             self.exchange.create_order, symbol, "market", sl_side, pos.remaining_qty, new_sl,
-                            {'stopPrice': new_sl, 'triggerPrice': new_sl, 'reduceOnly': True, 'stopLoss': new_sl})
+                            {'stopPrice': new_sl, 'triggerPrice': new_sl, 'triggerDirection': trigger_dir, 'reduceOnly': True})
                         pos.sl_order_id = r.get('id', '')
                     except Exception:
                         pass
