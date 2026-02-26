@@ -38,6 +38,15 @@ def get_balance():
         bal = exchange.fetch_balance()
         free = float(bal.get('USDT', {}).get('free', 0) or 0)
         total = float(bal.get('USDT', {}).get('total', 0) or 0)
+        try:
+            wb = exchange.private_get_v5_account_wallet_balance({'accountType': 'UNIFIED'})
+            coins = wb.get('result',{}).get('list',[{}])[0].get('coin',[])
+            for c in coins:
+                if c.get('coin') == 'USDT':
+                    total = float(c.get('equity', total))
+                    break
+        except:
+            pass
         return free, total
     except:
         return None, None
